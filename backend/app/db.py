@@ -55,6 +55,11 @@ def init_db() -> None:
                     value TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS llm_config (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS scheduled_jobs (
                     job_id      TEXT PRIMARY KEY,
                     directory   TEXT NOT NULL,
@@ -128,6 +133,29 @@ def all_preferences() -> List[Preference]:
     with _conn() as c:
         rows = c.execute("SELECT key, value FROM preferences").fetchall()
     return [Preference(key=r["key"], value=r["value"]) for r in rows]
+
+
+# ---------- 模型配置（前端可写，覆盖 .env 默认值） ----------
+
+def get_llm_config() -> dict[str, str]:
+    """返回所有已保存的模型配置覆盖项（键值对）。"""
+    with _conn() as c:
+        rows = c.execute("SELECT key, value FROM llm_config").fetchall()
+    return {r["key"]: r["value"] for r in rows}
+
+
+def set_llm_config(values: dict[str, str]) -> None:
+    """批量写入 / 更新模型配置覆盖项。值为空字符串表示清除该覆盖。"""
+    with _conn() as c:
+        for key, value in values.items():
+            if value == "":
+                c.execute("DELETE FROM llm_config WHERE key=?", (key,))
+            else:
+                c.execute(
+                    "INSERT INTO llm_config (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key, value),
+                )
 
 
 # ---------- 定时任务 ----------

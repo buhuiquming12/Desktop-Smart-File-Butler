@@ -26,6 +26,26 @@ class JobCreate(BaseModel):
     enabled: bool = True
 
 
+class LLMSettingsUpdate(BaseModel):
+    """前端保存模型配置。字段留空表示不修改；显式传空字符串表示清除覆盖、回退 .env。"""
+    provider: Optional[str] = None
+    openai_base_url: Optional[str] = Field(default=None, max_length=500)
+    openai_model: Optional[str] = Field(default=None, max_length=200)
+    openai_api_key: Optional[str] = Field(default=None, max_length=500)
+    ollama_base_url: Optional[str] = Field(default=None, max_length=500)
+    ollama_model: Optional[str] = Field(default=None, max_length=200)
+
+
+class LLMModelsRequest(BaseModel):
+    """探测某个 OpenAI 兼容 / Ollama 服务的可用模型列表。
+
+    留空则使用当前已保存的配置；密钥留空则使用已保存的密钥。
+    """
+    provider: Optional[str] = None
+    base_url: Optional[str] = Field(default=None, max_length=500)
+    api_key: Optional[str] = Field(default=None, max_length=500)
+
+
 class ApprovalDecision(str, Enum):
     approve = "approve"
     reject = "reject"

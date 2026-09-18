@@ -3,6 +3,10 @@ import type {
   BackendConfig,
   ChatRequest,
   HealthResponse,
+  LLMModelsRequest,
+  LLMModelsResponse,
+  LLMSettings,
+  LLMSettingsUpdate,
   OperationLog,
   Preference,
   ScheduledJob,
@@ -110,6 +114,18 @@ export class ApiClient {
 
   deleteJob(jobId: string): Promise<{ job_id: string; status: string }> {
     return this.request(`/api/jobs/${encodeURIComponent(jobId)}`, { method: 'DELETE' });
+  }
+
+  getLLMSettings(): Promise<LLMSettings> {
+    return this.request('/api/settings/llm');
+  }
+
+  updateLLMSettings(update: LLMSettingsUpdate): Promise<LLMSettings> {
+    return this.request('/api/settings/llm', { method: 'PUT', body: JSON.stringify(update) });
+  }
+
+  listLLMModels(request: LLMModelsRequest): Promise<LLMModelsResponse> {
+    return this.request('/api/settings/llm/models', { method: 'POST', body: JSON.stringify(request) });
   }
 }
 

@@ -13,7 +13,9 @@ from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnec
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import ValidationError
 
-from . import db
+import httpx
+
+from . import db, llm_config
 from .agent.graph import AgentRuntime
 from .config import get_settings
 from .logging_conf import get_logger, setup_logging
@@ -21,6 +23,8 @@ from .models import (
     ApprovalResponse,
     ChatRequest,
     JobCreate,
+    LLMModelsRequest,
+    LLMSettingsUpdate,
     PreferenceUpdate,
     ScheduledJob,
     WSEvent,
@@ -46,6 +50,13 @@ def get_runtime() -> AgentRuntime:
             if _runtime is None:
                 _runtime = AgentRuntime()
     return _runtime
+
+
+def reset_runtime() -> None:
+    """丢弃已构造的运行时，使下一次会话按最新模型配置重建 LLM。"""
+    global _runtime
+    with _runtime_lock:
+        _runtime = None
 
 
 class ConnectionManager:
@@ -305,9 +316,10 @@ async def _resume_approval(
 
 @app.get("/api/health")
 def health() -> Dict[str, Any]:
+    config = llm_config.get_effective_config()
     return {
         "status": "ok",
-        "model_provider": settings.model_provider,
+        "model_provider": config.provider,
         "sandbox_configured": bool(settings.sandbox_root_paths),
     }
 
@@ -315,14 +327,88 @@ def health() -> Dict[str, Any]:
 @app.get("/api/config")
 def public_config() -> Dict[str, Any]:
     """仅返回非敏感配置；API key 永不暴露给渲染进程。"""
+    config = llm_config.get_effective_config()
     return {
-        "model_provider": settings.model_provider,
-        "openai_model": settings.openai_model,
-        "ollama_model": settings.ollama_model,
-        "ollama_base_url": settings.ollama_base_url,
+        "model_provider": config.provider,
+        "openai_model": config.openai_model,
+        "ollama_model": config.ollama_model,
+        "ollama_base_url": config.ollama_base_url,
         "sandbox_roots": [str(path) for path in settings.sandbox_root_paths],
         "ocr_enabled": bool(settings.tesseract_cmd),
     }
+
+
+# ---------------- 模型配置 ----------------
+
+
+@app.get("/api/settings/llm")
+def get_llm_settings() -> Dict[str, Any]:
+    """返回当前生效的模型配置。API Key 不回传，仅以布尔标记是否已配置。"""
+    config = llm_config.get_effective_config()
+    return {
+        "provider": config.provider,
+        "openai_base_url": config.openai_base_url,
+        "openai_model": config.openai_model,
+        "openai_api_key_set": bool(config.openai_api_key),
+        "ollama_base_url": config.ollama_base_url,
+        "ollama_model": config.ollama_model,
+    }
+
+
+@app.put("/api/settings/llm")
+def update_llm_settings(body: LLMSettingsUpdate) -> Dict[str, Any]:
+    """保存模型配置覆盖项并立即生效（下一次会话重建 LLM）。"""
+    provided = body.model_dump(exclude_unset=True)
+    if "provider" in provided and provided["provider"]:
+        provider = str(provided["provider"]).lower()
+        if provider not in ("openai", "ollama"):
+            raise HTTPException(status_code=422, detail="provider 仅支持 openai 或 ollama")
+        provided["provider"] = provider
+
+    llm_config.save_overrides({k: (v if v is not None else "") for k, v in provided.items()})
+    reset_runtime()
+    return get_llm_settings()
+
+
+@app.post("/api/settings/llm/models")
+async def list_llm_models(body: LLMModelsRequest) -> Dict[str, Any]:
+    """探测 OpenAI 兼容 / Ollama 服务的可用模型列表。
+
+    未显式提供的字段回退到已保存配置；密钥留空则使用已保存密钥。
+    """
+    config = llm_config.get_effective_config()
+    provider = (body.provider or config.provider).lower()
+
+    try:
+        if provider == "ollama":
+            base = (body.base_url or config.ollama_base_url or "").rstrip("/")
+            if not base:
+                raise HTTPException(status_code=422, detail="缺少 Ollama Base URL")
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(f"{base}/api/tags")
+                resp.raise_for_status()
+                data = resp.json()
+            models = sorted({item.get("name", "") for item in data.get("models", []) if item.get("name")})
+            return {"provider": "ollama", "models": models}
+
+        # OpenAI 兼容协议
+        base = (body.base_url or config.openai_base_url or "https://api.openai.com/v1").rstrip("/")
+        api_key = body.api_key or config.openai_api_key
+        if not api_key:
+            raise HTTPException(status_code=422, detail="缺少 API Key")
+        headers = {"Authorization": f"Bearer {api_key}"}
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(f"{base}/models", headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+        items = data.get("data", data if isinstance(data, list) else [])
+        models = sorted({item.get("id", "") for item in items if item.get("id")})
+        return {"provider": "openai", "models": models}
+    except httpx.HTTPStatusError as exc:
+        detail = f"服务返回 {exc.response.status_code}"
+        raise HTTPException(status_code=502, detail=f"获取模型失败：{detail}") from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"无法连接模型服务：{exc}") from exc
 
 
 @app.post("/api/chat", status_code=status.HTTP_202_ACCEPTED)

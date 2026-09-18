@@ -1,13 +1,23 @@
 import { useEffect, useState, type FormEvent } from 'react';
-import type { OperationLog, Preference, ScheduledJob } from '../types';
+import type {
+  LLMModelsRequest,
+  LLMModelsResponse,
+  LLMProvider,
+  LLMSettings,
+  LLMSettingsUpdate,
+  OperationLog,
+  Preference,
+  ScheduledJob,
+} from '../types';
 
-export type SettingsTab = 'general' | 'preferences' | 'schedules' | 'logs';
+export type SettingsTab = 'general' | 'model' | 'preferences' | 'schedules' | 'logs';
 
 interface SettingsProps {
   open: boolean;
   initialTab: SettingsTab;
   apiBase: string;
   wsBase: string;
+  llmSettings: LLMSettings | null;
   preferences: Preference[];
   jobs: ScheduledJob[];
   logs: OperationLog[];
@@ -15,6 +25,8 @@ interface SettingsProps {
   error: string | null;
   onClose: () => void;
   onSaveEndpoints: (apiBase: string, wsBase: string) => void;
+  onSaveLLM: (update: LLMSettingsUpdate) => Promise<void>;
+  onFetchModels: (request: LLMModelsRequest) => Promise<LLMModelsResponse>;
   onSavePreference: (preference: Preference) => Promise<void>;
   onCreateJob: (job: Omit<ScheduledJob, 'job_id'>) => Promise<void>;
   onDeleteJob: (jobId: string) => Promise<void>;
@@ -23,6 +35,7 @@ interface SettingsProps {
 
 const tabs: Array<{ id: SettingsTab; label: string }> = [
   { id: 'general', label: '常规' },
+  { id: 'model', label: '模型' },
   { id: 'preferences', label: '偏好' },
   { id: 'schedules', label: '定时任务' },
   { id: 'logs', label: '操作日志' },
@@ -37,13 +50,85 @@ export function Settings(props: SettingsProps) {
   const [job, setJob] = useState({ directory: '', instruction: '', cron: '0 9 * * *' });
   const [saving, setSaving] = useState(false);
 
+  // 模型配置本地状态
+  const [provider, setProvider] = useState<LLMProvider>('openai');
+  const [openaiBaseUrl, setOpenaiBaseUrl] = useState('');
+  const [openaiModel, setOpenaiModel] = useState('');
+  const [openaiApiKey, setOpenaiApiKey] = useState('');
+  const [ollamaBaseUrl, setOllamaBaseUrl] = useState('');
+  const [ollamaModel, setOllamaModel] = useState('');
+  const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const [fetchingModels, setFetchingModels] = useState(false);
+  const [modelStatus, setModelStatus] = useState<string | null>(null);
+  const [savingLLM, setSavingLLM] = useState(false);
+
   useEffect(() => setTab(props.initialTab), [props.initialTab, props.open]);
   useEffect(() => {
     setApiBase(props.apiBase);
     setWsBase(props.wsBase);
   }, [props.apiBase, props.wsBase, props.open]);
+  useEffect(() => {
+    const s = props.llmSettings;
+    if (!s) return;
+    setProvider(s.provider);
+    setOpenaiBaseUrl(s.openai_base_url);
+    setOpenaiModel(s.openai_model);
+    setOpenaiApiKey('');
+    setOllamaBaseUrl(s.ollama_base_url);
+    setOllamaModel(s.ollama_model);
+    setAvailableModels([]);
+    setModelStatus(null);
+  }, [props.llmSettings, props.open]);
 
   if (!props.open) return null;
+
+  const apiKeySet = props.llmSettings?.openai_api_key_set ?? false;
+
+  const fetchModels = async (): Promise<void> => {
+    setFetchingModels(true);
+    setModelStatus(null);
+    try {
+      const request: LLMModelsRequest =
+        provider === 'ollama'
+          ? { provider, ...(ollamaBaseUrl.trim() ? { base_url: ollamaBaseUrl.trim() } : {}) }
+          : {
+              provider,
+              ...(openaiBaseUrl.trim() ? { base_url: openaiBaseUrl.trim() } : {}),
+              ...(openaiApiKey.trim() ? { api_key: openaiApiKey.trim() } : {}),
+            };
+      const result = await props.onFetchModels(request);
+      setAvailableModels(result.models);
+      setModelStatus(result.models.length ? `找到 ${result.models.length} 个模型` : '未返回任何模型');
+    } catch (error) {
+      setModelStatus(error instanceof Error ? error.message : '获取模型失败');
+    } finally {
+      setFetchingModels(false);
+    }
+  };
+
+  const saveLLM = async (): Promise<void> => {
+    setSavingLLM(true);
+    setModelStatus(null);
+    try {
+      const update: LLMSettingsUpdate =
+        provider === 'ollama'
+          ? { provider, ollama_base_url: ollamaBaseUrl.trim(), ollama_model: ollamaModel.trim() }
+          : {
+              provider,
+              openai_base_url: openaiBaseUrl.trim(),
+              openai_model: openaiModel.trim(),
+              // 仅在用户输入了新密钥时提交；留空表示保留已有密钥。
+              ...(openaiApiKey.trim() ? { openai_api_key: openaiApiKey.trim() } : {}),
+            };
+      await props.onSaveLLM(update);
+      setOpenaiApiKey('');
+      setModelStatus('已保存，下一次对话生效');
+    } catch (error) {
+      setModelStatus(error instanceof Error ? error.message : '保存失败');
+    } finally {
+      setSavingLLM(false);
+    }
+  };
 
   const savePreference = async (event: FormEvent): Promise<void> => {
     event.preventDefault();
@@ -97,6 +182,55 @@ export function Settings(props: SettingsProps) {
               <label>本地 WebSocket 地址<input value={wsBase} onChange={(event) => setWsBase(event.target.value)} placeholder="ws://127.0.0.1:8000" /></label>
               <button className="primary-button" type="button" onClick={() => props.onSaveEndpoints(apiBase.trim(), wsBase.trim())}>保存并重连</button>
               {window.desktop && <p className="version-note">Electron {window.desktop.versions.electron} · {window.desktop.platform}</p>}
+            </div>
+          )}
+
+          {tab === 'model' && (
+            <div className="settings-section">
+              <div><h3>模型配置</h3><p>选择服务商，填写 API 地址与密钥，拉取可用模型后选择并保存。密钥仅保存在本地，不会显示。</p></div>
+
+              <label>服务商
+                <select value={provider} onChange={(event) => { setProvider(event.target.value as LLMProvider); setAvailableModels([]); setModelStatus(null); }}>
+                  <option value="openai">OpenAI 兼容 API</option>
+                  <option value="ollama">Ollama（本地）</option>
+                </select>
+              </label>
+
+              {provider === 'openai' ? (
+                <>
+                  <label>API 地址 (Base URL)<input value={openaiBaseUrl} onChange={(event) => setOpenaiBaseUrl(event.target.value)} placeholder="https://api.openai.com/v1" /></label>
+                  <label>API Key<input type="password" value={openaiApiKey} onChange={(event) => setOpenaiApiKey(event.target.value)} placeholder={apiKeySet ? '已配置（留空则保留）' : 'sk-...'} /></label>
+                  <button className="secondary-button" type="button" disabled={fetchingModels} onClick={() => void fetchModels()}>{fetchingModels ? '获取中…' : '获取模型列表'}</button>
+                  <label>模型
+                    {availableModels.length > 0 ? (
+                      <select value={openaiModel} onChange={(event) => setOpenaiModel(event.target.value)}>
+                        {!availableModels.includes(openaiModel) && openaiModel && <option value={openaiModel}>{openaiModel}（当前）</option>}
+                        {availableModels.map((name) => <option key={name} value={name}>{name}</option>)}
+                      </select>
+                    ) : (
+                      <input value={openaiModel} onChange={(event) => setOpenaiModel(event.target.value)} placeholder="gpt-4o-mini" />
+                    )}
+                  </label>
+                </>
+              ) : (
+                <>
+                  <label>Ollama 地址<input value={ollamaBaseUrl} onChange={(event) => setOllamaBaseUrl(event.target.value)} placeholder="http://127.0.0.1:11434" /></label>
+                  <button className="secondary-button" type="button" disabled={fetchingModels} onClick={() => void fetchModels()}>{fetchingModels ? '获取中…' : '获取模型列表'}</button>
+                  <label>模型
+                    {availableModels.length > 0 ? (
+                      <select value={ollamaModel} onChange={(event) => setOllamaModel(event.target.value)}>
+                        {!availableModels.includes(ollamaModel) && ollamaModel && <option value={ollamaModel}>{ollamaModel}（当前）</option>}
+                        {availableModels.map((name) => <option key={name} value={name}>{name}</option>)}
+                      </select>
+                    ) : (
+                      <input value={ollamaModel} onChange={(event) => setOllamaModel(event.target.value)} placeholder="qwen2.5" />
+                    )}
+                  </label>
+                </>
+              )}
+
+              {modelStatus && <p className="muted">{modelStatus}</p>}
+              <button className="primary-button" type="button" disabled={savingLLM} onClick={() => void saveLLM()}>{savingLLM ? '保存中…' : '保存模型配置'}</button>
             </div>
           )}
 

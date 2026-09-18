@@ -8,6 +8,10 @@ import type {
   ApprovalDecision,
   ChatMessage,
   ConnectionState,
+  LLMModelsRequest,
+  LLMModelsResponse,
+  LLMSettings,
+  LLMSettingsUpdate,
   OperationLog,
   PendingApproval,
   Preference,
@@ -76,6 +80,7 @@ export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('general');
   const [preferences, setPreferences] = useState<Preference[]>([]);
+  const [llmSettings, setLLMSettings] = useState<LLMSettings | null>(null);
   const [jobs, setJobs] = useState<ScheduledJob[]>([]);
   const [logs, setLogs] = useState<OperationLog[]>([]);
   const [settingsLoading, setSettingsLoading] = useState(false);
@@ -232,11 +237,12 @@ export function App() {
   const loadSettingsData = useCallback(async () => {
     setSettingsLoading(true);
     setSettingsError(null);
-    const results = await Promise.allSettled([api.getPreferences(), api.getJobs(), api.getOperations()]);
-    const [preferenceResult, jobResult, logResult] = results;
+    const results = await Promise.allSettled([api.getPreferences(), api.getJobs(), api.getOperations(), api.getLLMSettings()]);
+    const [preferenceResult, jobResult, logResult, llmResult] = results;
     if (preferenceResult.status === 'fulfilled') setPreferences(preferenceResult.value);
     if (jobResult.status === 'fulfilled') setJobs(jobResult.value);
     if (logResult.status === 'fulfilled') setLogs(logResult.value);
+    if (llmResult.status === 'fulfilled') setLLMSettings(llmResult.value);
     const rejected = results.find((result) => result.status === 'rejected');
     if (rejected?.status === 'rejected') setSettingsError(rejected.reason instanceof Error ? rejected.reason.message : '部分数据加载失败');
     setSettingsLoading(false);
@@ -258,6 +264,19 @@ export function App() {
     setApiBase(newApiBase);
     setWsBase(newWsBase);
   };
+
+  const saveLLM = async (update: LLMSettingsUpdate): Promise<void> => {
+    setSettingsError(null);
+    try {
+      const saved = await api.updateLLMSettings(update);
+      setLLMSettings(saved);
+    } catch (error) {
+      setSettingsError(error instanceof Error ? error.message : '保存模型配置失败');
+      throw error;
+    }
+  };
+
+  const fetchModels = (request: LLMModelsRequest): Promise<LLMModelsResponse> => api.listLLMModels(request);
 
   const savePreference = async (preference: Preference): Promise<void> => {
     setSettingsError(null);
@@ -304,6 +323,7 @@ export function App() {
           <button type="button" onClick={() => openSettings('schedules')}><span aria-hidden="true">◷</span>定时任务</button>
           <button type="button" onClick={() => openSettings('logs')}><span aria-hidden="true">≡</span>操作日志</button>
           <button type="button" onClick={() => openSettings('preferences')}><span aria-hidden="true">◇</span>偏好设置</button>
+          <button type="button" onClick={() => openSettings('model')}><span aria-hidden="true">✦</span>模型配置</button>
         </nav>
         <div className="sidebar-spacer" />
         <div className="safety-card"><span aria-hidden="true">⌾</span><div><strong>安全模式已启用</strong><p>高风险操作需审批</p></div></div>
@@ -323,6 +343,7 @@ export function App() {
         initialTab={settingsTab}
         apiBase={apiBase}
         wsBase={wsBase}
+        llmSettings={llmSettings}
         preferences={preferences}
         jobs={jobs}
         logs={logs}
@@ -330,6 +351,8 @@ export function App() {
         error={settingsError}
         onClose={() => setSettingsOpen(false)}
         onSaveEndpoints={saveEndpoints}
+        onSaveLLM={saveLLM}
+        onFetchModels={fetchModels}
         onSavePreference={savePreference}
         onCreateJob={createJob}
         onDeleteJob={deleteJob}
