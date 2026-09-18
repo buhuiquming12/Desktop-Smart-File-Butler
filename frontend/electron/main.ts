@@ -4,6 +4,11 @@ import path from 'node:path';
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const developmentUrl = process.env.VITE_DEV_SERVER_URL;
+// 生产模式下前端由后端 StaticFiles 同源托管（见 P0-1），Electron 直接加载后端 URL，
+// 使渲染进程 origin 与 /api、/ws 一致，彻底摆脱 CORS 与 opaque(null) origin。
+const backendUrl = (process.env.BUTLER_BACKEND_URL ?? 'http://127.0.0.1:8000').replace(/\/+$/, '');
+// 应用实际加载的地址：开发用 Vite dev server，生产用同源后端。
+const appUrl = developmentUrl ?? backendUrl;
 
 function isTrustedExternalUrl(rawUrl: string): boolean {
   try {
@@ -41,17 +46,19 @@ function createWindow(): void {
     return { action: 'deny' };
   });
   window.webContents.on('will-navigate', (event, url) => {
-    const allowedUrl = developmentUrl ?? `file://${path.join(currentDirectory, '../dist/index.html')}`;
-    if (url !== allowedUrl && !url.startsWith(`${allowedUrl}#`)) {
+    // 仅允许在应用自身 origin 内导航；跨源导航一律拦截（外链走 openExternal）。
+    try {
+      const target = new URL(url);
+      const allowed = new URL(appUrl);
+      if (target.origin !== allowed.origin) {
+        event.preventDefault();
+      }
+    } catch {
       event.preventDefault();
     }
   });
 
-  if (developmentUrl) {
-    void window.loadURL(developmentUrl);
-  } else {
-    void window.loadFile(path.join(currentDirectory, '../dist/index.html'));
-  }
+  void window.loadURL(appUrl);
 }
 
 app.whenReady().then(() => {

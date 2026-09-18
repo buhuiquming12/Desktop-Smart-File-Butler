@@ -8,9 +8,12 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Dict, Iterable, Optional, Set, Tuple
 
+from pathlib import Path
+
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 
 import httpx
@@ -127,16 +130,18 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+# CORS 仅为开发模式服务：Vite dev server(:5173) 与后端(:8000)跨源。
+# 生产（打包）模式下前端由下方 StaticFiles 与后端同源托管，不依赖 CORS，
+# 因此这里不再保留永远不会被浏览器发送的字面量 "file://"。
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://127.0.0.1:5173",
         "http://localhost:5173",
-        "file://",
     ],
     allow_credentials=False,
     allow_methods=["GET", "POST", "PUT", "DELETE"],
-    allow_headers=["Content-Type"],
+    allow_headers=["Content-Type", "X-Butler-Token"],
 )
 
 
@@ -566,3 +571,29 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str) -> None:
     except Exception:  # noqa: BLE001
         logger.exception("WebSocket 异常 client=%s", client_id)
         connections.disconnect(client_id, websocket)
+
+
+# ---------------- 静态前端（生产模式，前后端同源） ----------------
+#
+# 打包后 Electron 直接 loadURL 到本后端，index.html 与 /api、/ws 同源，
+# 从根源消除 CORS 依赖（见 P0-1）。此挂载放在所有 API / WS 路由注册之后，
+# 因此 /api/* 与 /ws/* 仍优先匹配；其余路径回落到静态资源。
+def _frontend_dist() -> Optional[Path]:
+    """定位打包后的前端产物目录；不存在（纯后端 / 开发模式）时返回 None。"""
+    import os
+
+    override = os.environ.get("FRONTEND_DIST")
+    if override:
+        candidate = Path(override).expanduser()
+        return candidate if candidate.is_dir() else None
+    # backend/app/main.py -> parents[2] 为仓库根目录
+    candidate = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+    return candidate if candidate.is_dir() else None
+
+
+_dist = _frontend_dist()
+if _dist is not None:
+    app.mount("/", StaticFiles(directory=str(_dist), html=True), name="frontend")
+    logger.info("已挂载前端静态资源: %s", _dist)
+else:
+    logger.info("未发现前端构建产物，跳过静态托管（开发模式使用 Vite dev server）")
