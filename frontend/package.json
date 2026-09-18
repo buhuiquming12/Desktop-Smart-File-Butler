@@ -1,0 +1,48 @@
+{
+  "name": "desktop-smart-file-butler",
+  "private": true,
+  "version": "0.1.0",
+  "description": "通过自然语言安全整理、分类和摘要本地文件的桌面 AI Agent",
+  "author": "Desktop Smart File Butler Contributors",
+  "type": "module",
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "dev": "concurrently -k \"vite\" \"wait-on tcp:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
+    "build": "tsc -b && vite build && electron-builder --dir",
+    "build:web": "tsc -b && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc -b --pretty false"
+  },
+  "dependencies": {
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "6.1.1",
+    "electron": "44.4.2",
+    "@types/node": "26.6.1",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "concurrently": "10.0.5",
+    "cross-env": "10.1.0",
+    "electron-builder": "26.15.3",
+    "typescript": "7.0.2",
+    "vite": "8.3.0",
+    "wait-on": "9.1.0"
+  },
+  "build": {
+    "appId": "com.filebutler.desktop",
+    "productName": "桌面智能文件管家",
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*",
+      "package.json"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "win": {
+      "target": "portable"
+    }
+  }
+}

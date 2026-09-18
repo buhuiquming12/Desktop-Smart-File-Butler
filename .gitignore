@@ -1,0 +1,61 @@
+# ============ Python 后端 ============
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.eggs/
+*.egg-info/
+build/
+dist/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# ============ Node / 前端 ============
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/dist-electron/
+frontend/release/
+frontend/.vite/
+*.tsbuildinfo
+*.local
+package-lock.json
+
+# ============ 本地配置 / 数据 ============
+.env
+.env.*
+!.env.example
+data/
+logs/
+backend/data/
+backend/logs/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# ============ Codex / 代理工作目录 ============
+.codex/
+.agents/
+
+# ============ 编辑器 / IDE ============
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ============ 操作系统 / 杂项 ============
+.DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
