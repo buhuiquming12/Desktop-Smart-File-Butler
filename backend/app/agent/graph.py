@@ -11,8 +11,10 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterable, Literal, Optional
 
+import sqlite3
+
 from langchain_core.messages import HumanMessage, SystemMessage
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
@@ -124,6 +126,23 @@ def _summarize_observations(observations: list) -> list:
     return [_summarize_observation(o) for o in observations]
 
 
+def _build_checkpointer() -> SqliteSaver:
+    """SQLite 持久化 checkpointer（P1-6）：重启后会话、待审批、定时任务的 interrupt 都不丢。
+
+    连接开启 check_same_thread=False，因为图会在 API 线程与 APScheduler 线程间执行；
+    SqliteSaver 自带线程锁保证并发安全。
+    """
+    from ..config import get_settings
+
+    path = Path(get_settings().db_path).parent / "checkpoints.sqlite"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path), check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")  # 与 APScheduler/API 并发写更稳
+    saver = SqliteSaver(conn)
+    saver.setup()
+    return saver
+
+
 def _safe_summary_name(source: Path, output_name: Optional[str]) -> str:
     raw = output_name or f"{source.stem}_摘要.md"
     # 禁止把 output_name 当成路径逃逸；仅取文件名，并清除 Windows 非法字符。
@@ -143,7 +162,7 @@ class AgentRuntime:
         self.llm = build_llm(temperature=0.1)
         self.planner = self.llm.with_structured_output(PlanOutput)
         self.reflector = self.llm.with_structured_output(ReflectionOutput)
-        self.checkpointer = MemorySaver()
+        self.checkpointer = _build_checkpointer()
         self.graph = self._build_graph()
 
     def _build_graph(self):

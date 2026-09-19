@@ -9,6 +9,7 @@ python-multipart==0.0.9
 
 # --- Agent / LLM ---
 langgraph==0.2.57
+langgraph-checkpoint-sqlite==2.0.11
 langchain==0.3.12
 langchain-core==0.3.25
 langchain-openai==0.2.12
