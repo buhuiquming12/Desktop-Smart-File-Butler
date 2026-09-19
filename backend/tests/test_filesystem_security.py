@@ -53,3 +53,28 @@ def test_rejects_new_name_path_escape(sandbox: Path) -> None:
         filesystem.rename_file(str(source), "../escaped.txt")
 
     assert source.exists()
+
+
+# ---------------- P2 补测试：_unique_dest / _safe_child_name ----------------
+
+def test_unique_dest_returns_same_when_free(sandbox: Path) -> None:
+    dest = sandbox / "new.txt"
+    assert filesystem._unique_dest(dest) == dest
+
+
+def test_unique_dest_appends_index_on_collision(sandbox: Path) -> None:
+    (sandbox / "a.txt").write_text("1", encoding="utf-8")
+    (sandbox / "a (1).txt").write_text("2", encoding="utf-8")
+    result = filesystem._unique_dest(sandbox / "a.txt")
+    assert result.name == "a (2).txt"
+
+
+@pytest.mark.parametrize("name", ["a.txt", "报告.pdf", "with space.md"])
+def test_safe_child_name_accepts_plain_names(name: str) -> None:
+    assert filesystem._safe_child_name(name) == name
+
+
+@pytest.mark.parametrize("bad", ["", ".", "..", "../x", "a/b", "a\\b", "C:/abs.txt", "/abs.txt"])
+def test_safe_child_name_rejects_escapes(bad: str) -> None:
+    with pytest.raises(ValueError):
+        filesystem._safe_child_name(bad)
