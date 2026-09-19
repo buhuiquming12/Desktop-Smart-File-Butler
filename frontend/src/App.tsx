@@ -21,6 +21,7 @@ import type {
   TaskStatus,
   WSEvent,
 } from './types';
+import { reduceThreadEvent, type ThreadViewState } from './state';
 
 function createId(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -76,6 +77,10 @@ export function App() {
   const [tasks, setTasks] = useState<TaskItem[]>([]);
   const [approvalQueue, setApprovalQueue] = useState<PendingApproval[]>([]);
   const [threadId, setThreadId] = useState<string>();
+  const threadIdRef = useRef<string | undefined>(undefined);
+  const [activeThreadId, setActiveThreadId] = useState<string>();
+  // P1: 后台定时会话与当前聊天各自维护事件状态，事件不会覆盖活动会话。
+  const [threadViews, setThreadViews] = useState<Record<string, ThreadViewState>>({});
   const [busy, setBusy] = useState(false);
   const [approvalSubmitting, setApprovalSubmitting] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -129,7 +134,18 @@ export function App() {
   }, []);
 
   const handleSocketEvent = useCallback((event: WSEvent) => {
-    if (event.thread_id) setThreadId(event.thread_id);
+    if (event.thread_id && threadIdRef.current && event.thread_id !== threadIdRef.current) {
+      setThreadViews((current) => {
+        const view = current[event.thread_id] ?? { messages: [], tasks: [], busy: true };
+        const result = reduceThreadEvent(view, event);
+        return { ...current, [event.thread_id]: result.view };
+      });
+      return;
+    }
+    if (event.thread_id) {
+      threadIdRef.current = event.thread_id;
+      setThreadId(event.thread_id);
+    }
     const now = new Date().toISOString();
 
     switch (event.type) {
@@ -202,6 +218,7 @@ export function App() {
   }, [clientId, handleSocketEvent, wsBase]);
 
   const sendChat = useCallback((message: string) => {
+    if (threadId) setActiveThreadId(threadId);
     const userMessage: ChatMessage = { id: createId('user'), role: 'user', content: message, timestamp: new Date().toISOString() };
     setMessages((current) => [...current, userMessage]);
     setBusy(true);
@@ -369,8 +386,8 @@ export function App() {
       </aside>
 
       <main className="workspace">
-        <ChatPanel messages={messages} connectionState={connectionState} busy={busy} onSend={sendChat} onStop={stopChat} />
-        <TaskBoard tasks={tasks} onClear={clearCompleted} />
+        <ChatPanel messages={activeThreadId && threadViews[activeThreadId] ? threadViews[activeThreadId].messages : messages} connectionState={connectionState} busy={activeThreadId && threadViews[activeThreadId] ? threadViews[activeThreadId].busy : busy} onSend={sendChat} onStop={stopChat} />
+        <TaskBoard tasks={activeThreadId && threadViews[activeThreadId] ? threadViews[activeThreadId].tasks : tasks} onClear={clearCompleted} />
       </main>
 
       <ApprovalModal approval={approvalQueue[0] ?? null} submitting={approvalSubmitting} onDecision={(decision) => void decideApproval(decision)} />
