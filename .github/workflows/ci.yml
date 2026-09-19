@@ -43,6 +43,9 @@ jobs:
             tail -n 80 pytest.log
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+          while IFS= read -r line; do
+            echo "::error title=pytest::$line"
+          done < pytest.log
 
   frontend:
     name: 前端类型检查 (tsc)
