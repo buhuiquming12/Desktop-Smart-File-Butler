@@ -310,6 +310,17 @@ export function App() {
     }
   };
 
+  const rollbackOperation = async (opId: number): Promise<void> => {
+    setSettingsError(null);
+    try {
+      await api.rollbackOperation(opId);
+      await loadSettingsData();
+    } catch (error) {
+      setSettingsError(error instanceof Error ? error.message : '撤销失败');
+      throw error;
+    }
+  };
+
   const clearCompleted = (): void => {
     setTasks((current) => current.filter((task) => task.status === 'running' || task.status === 'waiting' || task.status === 'pending'));
   };
@@ -356,6 +367,7 @@ export function App() {
         onSavePreference={savePreference}
         onCreateJob={createJob}
         onDeleteJob={deleteJob}
+        onRollbackOperation={rollbackOperation}
         onRefresh={() => void loadSettingsData()}
       />
     </div>

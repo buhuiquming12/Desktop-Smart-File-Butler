@@ -39,7 +39,7 @@ from .models import (
     WSEventType,
 )
 from .security import SandboxViolation, resolve_in_sandbox
-from .tools import scheduler
+from .tools import filesystem, scheduler
 
 settings = get_settings()
 setup_logging(settings.log_dir)
@@ -534,6 +534,50 @@ async def approval(response: ApprovalResponse) -> Dict[str, str]:
 @app.get("/api/operations")
 def operations(limit: int = Query(100, ge=1, le=500)) -> list[Dict[str, Any]]:
     return [item.model_dump(mode="json") for item in db.recent_operations(limit)]
+
+
+@app.post("/api/operations/{op_id}/rollback")
+def rollback_operation(op_id: int) -> Dict[str, Any]:
+    """回滚单条操作（move/rename/delete）：把文件从 dest 移回 target。"""
+    op = db.get_operation(op_id)
+    if op is None:
+        raise HTTPException(status_code=404, detail="操作记录不存在")
+    try:
+        result = filesystem.restore_operation(op)
+    except (SandboxViolation, FileNotFoundError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if result["status"] == "failed":
+        raise HTTPException(status_code=409, detail=result["detail"])
+    return {"op_id": op_id, **result}
+
+
+@app.post("/api/threads/{thread_id}/rollback")
+def rollback_thread(thread_id: str) -> Dict[str, Any]:
+    """回滚某会话的所有可逆操作（按发生顺序倒序还原）。"""
+    ops = db.operations_for_thread(thread_id)
+    reversible = [
+        op for op in ops
+        if op.action in ("move", "rename", "delete") and op.status == "ok" and op.dest
+    ]
+    if not reversible:
+        raise HTTPException(status_code=404, detail="该会话没有可回滚的操作")
+
+    results = []
+    for op in reversed(reversible):  # 后发生的先撤销，避免路径互相依赖
+        try:
+            results.append({"op_id": op.id, **filesystem.restore_operation(op)})
+        except (SandboxViolation, FileNotFoundError) as exc:
+            results.append({"op_id": op.id, "status": "failed", "detail": str(exc)})
+
+    summary = {
+        "thread_id": thread_id,
+        "total": len(results),
+        "ok": sum(1 for r in results if r["status"] == "ok"),
+        "skipped": sum(1 for r in results if r["status"] == "skipped"),
+        "failed": sum(1 for r in results if r["status"] == "failed"),
+        "results": results,
+    }
+    return summary
 
 
 @app.get("/api/preferences")

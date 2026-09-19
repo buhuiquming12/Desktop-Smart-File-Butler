@@ -82,8 +82,9 @@ class OperationLog(BaseModel):
     action: str
     target: str
     dest: Optional[str] = None
-    status: str                       # ok / failed / rejected
+    status: str                       # ok / failed / rejected / rollback
     detail: str = ""
+    thread_id: Optional[str] = None
 
 
 class Preference(BaseModel):

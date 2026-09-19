@@ -12,12 +12,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import List
 
+from .. import db
 from ..db import log_operation
 from ..logging_conf import get_logger
-from ..models import FileMeta
-from ..security import resolve_in_sandbox
+from ..models import FileMeta, OperationLog
+from ..security import SandboxViolation, resolve_in_sandbox, sandbox_root_for
 
 logger = get_logger(__name__)
+
+# 删除的文件先移入沙箱根下的回收站，使删除可撤销（见 P1-1）。
+TRASH_DIRNAME = ".butler-trash"
+
+# 可回滚的操作类型：move/rename 天然可逆，delete 通过回收站可逆。
+_REVERSIBLE_ACTIONS = {"move", "rename", "delete"}
 
 
 def scan_directory(directory: str, recursive: bool = False) -> List[FileMeta]:
@@ -29,6 +36,12 @@ def scan_directory(directory: str, recursive: bool = False) -> List[FileMeta]:
     items: List[FileMeta] = []
     iterator = root.rglob("*") if recursive else root.iterdir()
     for p in iterator:
+        # 跳过回收站，避免已删除文件污染后续分类 / 整理（见 P1-1）。
+        try:
+            if TRASH_DIRNAME in p.relative_to(root).parts:
+                continue
+        except ValueError:
+            pass
         try:
             stat = p.stat()
             items.append(
@@ -122,15 +135,64 @@ def rename_file(src: str, new_name: str) -> str:
 
 
 def delete_file(path: str) -> str:
-    """删除文件或目录（高危）。仅应在审批通过后调用。"""
+    """删除文件或目录（高危）。仅应在审批通过后调用。
+
+    不做物理删除，而是移入所在沙箱根下的 ``.butler-trash/``，使删除可撤销（P1-1）。
+    审计日志记录原路径(target)与回收站路径(dest)，回滚时据此还原。
+    """
     target = resolve_in_sandbox(path, must_exist=True)
+    root = sandbox_root_for(target)
+    trash = root / TRASH_DIRNAME
     try:
-        if target.is_dir():
-            shutil.rmtree(target)
-        else:
-            target.unlink()
-        log_operation("delete", str(target), "ok")
-        return str(target)
+        trash.mkdir(parents=True, exist_ok=True)
+        dest = _unique_dest(trash / target.name)
+        shutil.move(str(target), str(dest))
+        log_operation("delete", str(target), "ok", dest=str(dest))
+        return str(dest)
     except OSError as exc:
         log_operation("delete", str(target), "failed", detail=str(exc))
         raise
+
+
+def restore_operation(op: OperationLog) -> dict:
+    """逆转单条可回滚操作（move/rename/delete），把文件从 dest 移回 target。
+
+    - 仅处理 status=="ok" 且带 dest 的 move/rename/delete。
+    - 若原位置已被占用，还原到自动编号的新名并在结果中说明。
+    - 回滚本身写审计日志（action="rollback"），归属原操作的 thread_id。
+    返回 {status, detail, restored_to?}。status ∈ {ok, skipped, failed}。
+    """
+    if op.action not in _REVERSIBLE_ACTIONS or op.status != "ok" or not op.dest:
+        return {"status": "skipped", "detail": f"操作 #{op.id}（{op.action}/{op.status}）不可回滚"}
+
+    current = resolve_in_sandbox(op.dest)          # 文件当前所在（move 目标 / 回收站）
+    original = resolve_in_sandbox(op.target)       # 原始位置
+    if not current.exists():
+        db.log_operation(
+            "rollback", op.dest or "", "skipped",
+            detail=f"撤销 {op.action} #{op.id} 失败：源已不存在",
+            thread_id=op.thread_id,
+        )
+        return {"status": "skipped", "detail": f"源 {current} 已不存在，可能已被移动或再次删除"}
+
+    try:
+        original.parent.mkdir(parents=True, exist_ok=True)
+        final = _unique_dest(original)
+        renamed = final != original
+        shutil.move(str(current), str(final))
+        db.log_operation(
+            "rollback", str(current), "ok", dest=str(final),
+            detail=f"撤销 {op.action} #{op.id}" + ("（原位置被占用，已改名）" if renamed else ""),
+            thread_id=op.thread_id,
+        )
+        result = {"status": "ok", "detail": f"已撤销 {op.action} #{op.id}", "restored_to": str(final)}
+        if renamed:
+            result["detail"] += "；原位置被占用，已还原为新名"
+        return result
+    except OSError as exc:
+        db.log_operation(
+            "rollback", str(current), "failed",
+            detail=f"撤销 {op.action} #{op.id} 失败：{exc}",
+            thread_id=op.thread_id,
+        )
+        return {"status": "failed", "detail": f"撤销失败：{exc}"}

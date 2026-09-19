@@ -30,7 +30,13 @@ interface SettingsProps {
   onSavePreference: (preference: Preference) => Promise<void>;
   onCreateJob: (job: Omit<ScheduledJob, 'job_id'>) => Promise<void>;
   onDeleteJob: (jobId: string) => Promise<void>;
+  onRollbackOperation: (opId: number) => Promise<void>;
   onRefresh: () => void;
+}
+
+/** move/rename/delete 且成功的操作可撤销（见 P1-1）。 */
+function isReversible(log: OperationLog): boolean {
+  return (log.action === 'move' || log.action === 'rename' || log.action === 'delete') && log.status === 'ok';
 }
 
 const tabs: Array<{ id: SettingsTab; label: string }> = [
@@ -61,6 +67,16 @@ export function Settings(props: SettingsProps) {
   const [fetchingModels, setFetchingModels] = useState(false);
   const [modelStatus, setModelStatus] = useState<string | null>(null);
   const [savingLLM, setSavingLLM] = useState(false);
+  const [rollingBack, setRollingBack] = useState<number | null>(null);
+
+  const rollback = async (opId: number): Promise<void> => {
+    setRollingBack(opId);
+    try {
+      await props.onRollbackOperation(opId);
+    } finally {
+      setRollingBack(null);
+    }
+  };
 
   useEffect(() => setTab(props.initialTab), [props.initialTab, props.open]);
   useEffect(() => {
@@ -279,6 +295,11 @@ export function Settings(props: SettingsProps) {
                     <article className="log-row" key={log.id ?? `${log.ts}-${index}`}>
                       <span className={`log-status log-status--${log.status}`}>{log.status}</span>
                       <div><strong>{log.action}</strong><p>{log.target}{log.dest ? ` → ${log.dest}` : ''}</p><small>{log.detail || new Date(log.ts).toLocaleString('zh-CN')}</small></div>
+                      {isReversible(log) && typeof log.id === 'number' && (
+                        <button className="secondary-button" type="button" disabled={rollingBack !== null} onClick={() => void rollback(log.id as number)}>
+                          {rollingBack === log.id ? '撤销中…' : '撤销'}
+                        </button>
+                      )}
                     </article>
                   ))}
                 </div>

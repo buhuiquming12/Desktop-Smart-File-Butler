@@ -111,6 +111,14 @@ export class ApiClient {
     return this.request('/api/operations');
   }
 
+  rollbackOperation(opId: number): Promise<unknown> {
+    return this.request(`/api/operations/${encodeURIComponent(String(opId))}/rollback`, { method: 'POST' });
+  }
+
+  rollbackThread(threadId: string): Promise<unknown> {
+    return this.request(`/api/threads/${encodeURIComponent(threadId)}/rollback`, { method: 'POST' });
+  }
+
   getJobs(): Promise<ScheduledJob[]> {
     return this.request('/api/jobs');
   }

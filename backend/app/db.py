@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import contextvars
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -18,6 +19,22 @@ from .models import OperationLog, Preference, ScheduledJob
 logger = get_logger(__name__)
 _init_lock = threading.Lock()
 _initialized = False
+
+# 当前正在执行的 Agent 会话线程 id；由运行时在节点执行前设置，
+# log_operation 自动带上，用于按 thread_id 回滚（见 P1-1）。
+_current_thread_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "current_thread_id", default=None
+)
+
+
+@contextmanager
+def operation_thread(thread_id: Optional[str]) -> Iterator[None]:
+    """在该上下文内记录的操作都归属到给定 thread_id。"""
+    token = _current_thread_id.set(thread_id)
+    try:
+        yield
+    finally:
+        _current_thread_id.reset(token)
 
 
 @contextmanager
@@ -41,13 +58,14 @@ def init_db() -> None:
             c.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS operation_log (
-                    id      INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ts      TEXT NOT NULL,
-                    action  TEXT NOT NULL,
-                    target  TEXT NOT NULL,
-                    dest    TEXT,
-                    status  TEXT NOT NULL,
-                    detail  TEXT DEFAULT ''
+                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts        TEXT NOT NULL,
+                    action    TEXT NOT NULL,
+                    target    TEXT NOT NULL,
+                    dest      TEXT,
+                    status    TEXT NOT NULL,
+                    detail    TEXT DEFAULT '',
+                    thread_id TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS preferences (
@@ -69,6 +87,12 @@ def init_db() -> None:
                 );
                 """
             )
+            # 迁移：为老用户已存在的 operation_log 补 thread_id 列（CREATE IF NOT EXISTS
+            # 不会给旧表加列）。新增可空列对既有行安全，值为 NULL（见 P1-1）。
+            columns = {row["name"] for row in c.execute("PRAGMA table_info(operation_log)")}
+            if "thread_id" not in columns:
+                c.execute("ALTER TABLE operation_log ADD COLUMN thread_id TEXT")
+                logger.info("operation_log 迁移：已新增 thread_id 列")
         _initialized = True
         logger.info("SQLite 初始化完成: %s", get_settings().db_path)
 
@@ -81,14 +105,38 @@ def log_operation(
     status: str,
     dest: Optional[str] = None,
     detail: str = "",
+    thread_id: Optional[str] = None,
 ) -> None:
+    tid = thread_id if thread_id is not None else _current_thread_id.get()
     with _conn() as c:
         c.execute(
-            "INSERT INTO operation_log (ts, action, target, dest, status, detail)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
-            (datetime.now(timezone.utc).isoformat(), action, target, dest, status, detail),
+            "INSERT INTO operation_log (ts, action, target, dest, status, detail, thread_id)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                datetime.now(timezone.utc).isoformat(),
+                action,
+                target,
+                dest,
+                status,
+                detail,
+                tid,
+            ),
         )
-    logger.info("op=%s target=%s dest=%s status=%s", action, target, dest, status)
+    logger.info("op=%s target=%s dest=%s status=%s thread=%s", action, target, dest, status, tid)
+
+
+def _row_to_operation(r: sqlite3.Row) -> OperationLog:
+    keys = r.keys()
+    return OperationLog(
+        id=r["id"],
+        ts=datetime.fromisoformat(r["ts"]),
+        action=r["action"],
+        target=r["target"],
+        dest=r["dest"],
+        status=r["status"],
+        detail=r["detail"] or "",
+        thread_id=r["thread_id"] if "thread_id" in keys else None,
+    )
 
 
 def recent_operations(limit: int = 100) -> List[OperationLog]:
@@ -96,18 +144,25 @@ def recent_operations(limit: int = 100) -> List[OperationLog]:
         rows = c.execute(
             "SELECT * FROM operation_log ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
-    return [
-        OperationLog(
-            id=r["id"],
-            ts=datetime.fromisoformat(r["ts"]),
-            action=r["action"],
-            target=r["target"],
-            dest=r["dest"],
-            status=r["status"],
-            detail=r["detail"] or "",
-        )
-        for r in rows
-    ]
+    return [_row_to_operation(r) for r in rows]
+
+
+def get_operation(op_id: int) -> Optional[OperationLog]:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT * FROM operation_log WHERE id=?", (op_id,)
+        ).fetchone()
+    return _row_to_operation(row) if row else None
+
+
+def operations_for_thread(thread_id: str) -> List[OperationLog]:
+    """返回某会话的操作，按 id 升序（便于回滚时倒序处理）。"""
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT * FROM operation_log WHERE thread_id=? ORDER BY id ASC",
+            (thread_id,),
+        ).fetchall()
+    return [_row_to_operation(r) for r in rows]
 
 
 # ---------- 偏好记忆 ----------

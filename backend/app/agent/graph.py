@@ -226,7 +226,8 @@ class AgentRuntime:
                 "status": "waiting_approval",
             }
 
-        observation = self._execute_step(step)
+        with db.operation_thread(state.get("thread_id")):
+            observation = self._execute_step(step)
         return {
             "current_step": current,
             "observations": [*state.get("observations", []), observation],
@@ -258,11 +259,14 @@ class AgentRuntime:
             "tool": pending["tool"],
             "args": pending["args"],
         }
+        thread_id = state.get("thread_id")
         if approved:
-            observation = self._execute_step(step)
+            with db.operation_thread(thread_id):
+                observation = self._execute_step(step)
         else:
             db.log_operation(
-                pending["action"], pending["target"], "rejected", detail="用户拒绝审批"
+                pending["action"], pending["target"], "rejected",
+                detail="用户拒绝审批", thread_id=thread_id,
             )
             observation = self._observation(
                 step, "rejected", result="用户拒绝了危险操作，未修改文件"

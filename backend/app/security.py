@@ -41,6 +41,23 @@ def is_within_sandbox(path: Path, roots: List[Path] | None = None) -> bool:
     return False
 
 
+def sandbox_root_for(path: Path, roots: List[Path] | None = None) -> Path:
+    """返回包含 path 的沙箱根目录；不在任何根内则抛 SandboxViolation。"""
+    roots = roots if roots is not None else _sandbox_roots()
+    try:
+        resolved = path.expanduser().resolve()
+    except (OSError, RuntimeError) as exc:
+        raise SandboxViolation(f"无法解析路径: {path} ({exc})") from exc
+    for root in roots:
+        try:
+            resolved.relative_to(root)
+            return root
+        except ValueError:
+            continue
+    allowed = ", ".join(str(r) for r in roots) or "(未配置)"
+    raise SandboxViolation(f"路径越界，拒绝访问: {resolved}. 允许的根目录: {allowed}")
+
+
 def resolve_in_sandbox(raw_path: str, *, must_exist: bool = False) -> Path:
     """将用户/Agent 提供的路径解析为绝对路径，并校验沙箱边界。
 
