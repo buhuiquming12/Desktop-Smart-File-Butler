@@ -42,6 +42,11 @@ def _conn() -> Iterator[sqlite3.Connection]:
     settings = get_settings()
     conn = sqlite3.connect(settings.db_path, timeout=10)
     conn.row_factory = sqlite3.Row
+    # WAL 让 APScheduler 线程与 API 线程的读写并发不再互相阻塞成 "database is locked"；
+    # busy_timeout 兜底等待锁，而非立即失败（P2）。
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=10000")
     try:
         yield conn
         conn.commit()
