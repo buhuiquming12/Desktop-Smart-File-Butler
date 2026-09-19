@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from app.main import app
+from app.main import app, get_session_token
 
 _DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
 pytestmark = pytest.mark.skipif(
@@ -38,5 +38,9 @@ def test_api_route_takes_precedence_over_static(client: TestClient) -> None:
 
 
 def test_unknown_api_path_not_swallowed_as_html(client: TestClient) -> None:
-    resp = client.get("/api/definitely-not-a-route")
+    # 令牌校验通过后仍应命中路由层的 404，而不是被静态挂载吞成 index.html。
+    resp = client.get(
+        "/api/definitely-not-a-route",
+        headers={"X-Butler-Token": get_session_token()},
+    )
     assert resp.status_code == 404

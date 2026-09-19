@@ -8,13 +8,18 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Dict, Iterable, Optional, Set, Tuple
 
+import os
+import secrets
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 import httpx
 
@@ -43,6 +48,66 @@ logger = get_logger(__name__)
 _runtime: Optional[AgentRuntime] = None
 _runtime_lock = threading.Lock()
 _background_tasks: Set[asyncio.Task[Any]] = set()
+
+# ---------------- 会话令牌与来源校验（P0-2） ----------------
+#
+# 威胁：CORS 中间件不作用于 WebSocket，本机任意网页均可连上 /ws 驱动 Agent，
+# 或 PUT /api/settings/llm 把 openai_base_url 改到攻击者服务器，再触发一次对话，
+# 后端便会带着已保存的 API Key 以 Bearer 请求该地址——等于把密钥读走。
+#
+# 防线（两层，令牌为硬门槛，来源校验为纵深防御）：
+#   1. 启动时生成一次性令牌，写入用户目录下的会话文件；Electron 主进程读取后经
+#      preload 注入渲染进程。REST 用请求头 X-Butler-Token 携带，WS 用查询参数 token。
+#      跨源网页拿不到该令牌，因此无法伪造请求。
+#   2. 仅放行本机 origin（http/https + 127.0.0.1/localhost/::1）；opaque 的 "null"
+#      origin（本地任意 html 文件）一律拒绝。
+_SESSION_TOKEN = secrets.token_urlsafe(32)
+_LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def get_session_token() -> str:
+    """返回本次进程的会话令牌。"""
+    return _SESSION_TOKEN
+
+
+def _session_file_path() -> Path:
+    override = os.environ.get("BUTLER_SESSION_FILE")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".desktop-smart-file-butler" / "session.json"
+
+
+def _write_session_file() -> None:
+    """把令牌与端口写入会话文件，供 Electron 主进程读取后注入渲染进程。"""
+    path = _session_file_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"token": _SESSION_TOKEN, "host": settings.host, "port": settings.port}
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        try:
+            os.chmod(path, 0o600)  # best-effort：Windows 上权限位有限
+        except OSError:
+            pass
+        logger.info("会话令牌已写入 %s（令牌本身不记录到日志）", path)
+    except OSError:
+        logger.exception("写入会话令牌文件失败: %s", path)
+
+
+def _origin_allowed(origin: Optional[str]) -> bool:
+    """判断请求来源是否为本机。缺省 Origin（非浏览器 / 同源 GET）放行，令牌仍是硬门槛。"""
+    if not origin:
+        return True
+    if origin == "null":
+        return False
+    try:
+        parsed = urlsplit(origin)
+    except ValueError:
+        return False
+    return parsed.scheme in ("http", "https") and parsed.hostname in _LOCAL_HOSTS
+
+
+def _token_valid(token: Optional[str]) -> bool:
+    return bool(token) and secrets.compare_digest(token, _SESSION_TOKEN)
 
 
 def get_runtime() -> AgentRuntime:
@@ -114,6 +179,7 @@ def _scheduled_runner(directory: str, instruction: str) -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     db.init_db()
+    _write_session_file()
     scheduler.init_scheduler(_scheduled_runner)
     logger.info("桌面智能文件管家后端已启动")
     try:
@@ -143,6 +209,26 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["Content-Type", "X-Butler-Token"],
 )
+
+
+@app.middleware("http")
+async def _auth_guard(request: Request, call_next: Any) -> Any:
+    """对 /api/* 强制会话令牌 + 本机来源校验（/api/health 除外，供就绪探测）。
+
+    静态资源与 SPA（"/"、/assets/*）不校验，浏览器需先加载 index.html 才能取得令牌。
+    OPTIONS 预检交由 CORS 中间件处理。
+    """
+    path = request.url.path
+    if (
+        path.startswith("/api/")
+        and path != "/api/health"
+        and request.method != "OPTIONS"
+    ):
+        if not _origin_allowed(request.headers.get("origin")):
+            return JSONResponse({"detail": "非法来源，拒绝访问"}, status_code=403)
+        if not _token_valid(request.headers.get("x-butler-token")):
+            return JSONResponse({"detail": "缺少或非法的会话令牌"}, status_code=401)
+    return await call_next(request)
 
 
 def _next_update(iterator: Iterable[Dict[str, Any]]) -> Tuple[bool, Optional[Dict[str, Any]]]:
@@ -511,6 +597,13 @@ def remove_job(job_id: str) -> Dict[str, str]:
 async def websocket_endpoint(websocket: WebSocket, client_id: str) -> None:
     if not client_id or len(client_id) > 128:
         await websocket.close(code=1008, reason="非法 client_id")
+        return
+    # 握手校验：CORS 不作用于 WS，此处自行校验来源 + 令牌，非法一律 1008 关闭。
+    if not _origin_allowed(websocket.headers.get("origin")):
+        await websocket.close(code=1008, reason="非法来源")
+        return
+    if not _token_valid(websocket.query_params.get("token")):
+        await websocket.close(code=1008, reason="缺少或非法的会话令牌")
         return
     await connections.connect(client_id, websocket)
     await connections.send(

@@ -119,3 +119,17 @@ export interface HealthResponse {
   status: string;
   [key: string]: unknown;
 }
+
+/** preload 注入的桌面桥接对象（见 electron/preload.ts）。 */
+export interface DesktopBridge {
+  platform: string;
+  sessionToken: string;
+  backendUrl: string;
+  versions: { electron: string; chrome: string; node: string };
+}
+
+declare global {
+  interface Window {
+    desktop?: DesktopBridge;
+  }
+}

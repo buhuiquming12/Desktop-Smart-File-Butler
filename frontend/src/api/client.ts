@@ -30,6 +30,11 @@ function trimTrailingSlash(value: string): string {
   return value.replace(/\/+$/, '');
 }
 
+/** 读取 preload 注入的会话令牌；浏览器直连（无 preload）时为空串。 */
+function sessionToken(): string {
+  return (typeof window !== 'undefined' && window.desktop?.sessionToken) || '';
+}
+
 function getErrorMessage(value: unknown): string {
   if (typeof value === 'string') return value;
   if (value && typeof value === 'object' && 'detail' in value) {
@@ -47,11 +52,13 @@ export class ApiClient {
   }
 
   private async request<T>(path: string, init?: RequestInit): Promise<T> {
+    const token = sessionToken();
     const response = await fetch(`${this.baseUrl}${path}`, {
       ...init,
       headers: {
         Accept: 'application/json',
         ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
+        ...(token ? { 'X-Butler-Token': token } : {}),
         ...init?.headers,
       },
     });
@@ -150,7 +157,10 @@ export class AgentSocket {
   constructor(options: AgentSocketOptions) {
     this.options = options;
     const base = trimTrailingSlash(options.baseUrl ?? DEFAULT_WS_BASE);
-    this.url = `${base}/ws/${encodeURIComponent(options.clientId)}`;
+    // 浏览器 WebSocket 无法设置自定义请求头，令牌以查询参数携带（见 backend P0-2）。
+    const token = sessionToken();
+    const suffix = token ? `?token=${encodeURIComponent(token)}` : '';
+    this.url = `${base}/ws/${encodeURIComponent(options.clientId)}${suffix}`;
   }
 
   connect(): void {
