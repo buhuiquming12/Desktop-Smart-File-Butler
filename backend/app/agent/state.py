@@ -71,3 +71,5 @@ class AgentState(TypedDict, total=False):
     ]
     replan_count: int
     error: str
+    batch_approved: bool          # 本计划的批量 move/rename 已获审批（P1-2）
+    batch_rejected: bool          # 本计划的批量 move/rename 被拒绝，全部跳过

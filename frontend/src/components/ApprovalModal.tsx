@@ -31,7 +31,7 @@ export function ApprovalModal({ approval, submitting, onDecision }: ApprovalModa
         <div className="warning-icon" aria-hidden="true">!</div>
         <p className="eyebrow">需要你的确认</p>
         <h2 id="approval-title">即将执行高风险操作</h2>
-        <p id="approval-detail" className="approval-detail">{approval.detail || '该操作可能改变或移除文件，请确认后继续。'}</p>
+        <p id="approval-detail" className="approval-detail" style={{ whiteSpace: 'pre-line' }}>{approval.detail || '该操作可能改变或移除文件，请确认后继续。'}</p>
 
         <dl className="approval-summary">
           <div><dt>操作</dt><dd>{approval.action}</dd></div>

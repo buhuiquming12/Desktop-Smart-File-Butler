@@ -30,6 +30,36 @@ _MAX_REPLANS = 3
 _MAX_PLAN_STEPS = 30           # 单个计划最多步数（提示词同步约束）
 _SUPER_STEPS_PER_STEP = 2      # 移除 observe 后每步占用 act + reflecting 两个超级步
 _MAX_SCAN_RESULTS = 500
+_BATCH_TOOLS = ("move_file", "rename_file")  # 批量破坏性操作，超阈值需审批（P1-2）
+_DEFAULT_BATCH_THRESHOLD = 20
+_BATCH_PREVIEW_LIMIT = 10      # 审批弹窗最多预览的条目数
+
+
+def _batch_threshold() -> int:
+    """批量审批阈值，可用偏好 batch_approval_threshold 覆盖（默认 20）。"""
+    raw = db.get_preference("batch_approval_threshold")
+    try:
+        value = int(raw) if raw is not None else _DEFAULT_BATCH_THRESHOLD
+    except (TypeError, ValueError):
+        return _DEFAULT_BATCH_THRESHOLD
+    return value if value > 0 else _DEFAULT_BATCH_THRESHOLD
+
+
+def _batch_diff_summary(steps: list) -> str:
+    """构造批量操作的 diff 摘要：前 N 条 + 总数。"""
+    lines = []
+    for s in steps[:_BATCH_PREVIEW_LIMIT]:
+        args = s.get("args") or {}
+        if s.get("tool") == "move_file":
+            dst = args.get("dest_dir", "")
+            name = args.get("new_name")
+            lines.append(f"移动 {args.get('src', '')} → {dst}" + (f"（改名 {name}）" if name else ""))
+        else:  # rename_file
+            lines.append(f"重命名 {args.get('src', '')} → {args.get('new_name', '')}")
+    more = len(steps) - _BATCH_PREVIEW_LIMIT
+    if more > 0:
+        lines.append(f"…… 以及另外 {more} 项")
+    return "\n".join(lines)
 
 
 def _recursion_limit() -> int:
@@ -126,6 +156,8 @@ class AgentRuntime:
             "final_response": "",
             "status": "perceiving",
             "error": "",
+            "batch_approved": False,
+            "batch_rejected": False,
         }
 
     def _plan(self, state: AgentState) -> Dict[str, Any]:
@@ -173,6 +205,9 @@ class AgentRuntime:
                 "status": "planning",
                 "replan_count": replan_count + (1 if state.get("observations") else 0),
                 "final_response": result.user_message,
+                # 新计划重置批量审批决定，避免重规划出的新批量绕过审批（不得降低审批门槛）。
+                "batch_approved": False,
+                "batch_rejected": False,
             }
         except Exception as exc:  # noqa: BLE001
             logger.exception("规划失败")
@@ -197,6 +232,42 @@ class AgentRuntime:
         tool = str(step.get("tool", ""))
         args = dict(step.get("args") or {})
         current = {**step, "args": args}
+
+        # 批量破坏性操作预演审批（P1-2）：计划中 move/rename 步数超阈值时，
+        # 在执行第一个前统一审批一次。拒绝后所有批量步骤都跳过，文件一个都不动。
+        if tool in _BATCH_TOOLS:
+            if state.get("batch_rejected"):
+                observation = self._observation(
+                    step, "rejected", result="用户拒绝了批量操作，未移动该文件"
+                )
+                db.log_operation(
+                    tool, str(args.get("src", "")), "rejected",
+                    detail="用户拒绝批量操作", thread_id=state.get("thread_id"),
+                )
+                return {
+                    "current_step": current,
+                    "observations": [*state.get("observations", []), observation],
+                    "step_index": index + 1,
+                    "status": "running",
+                }
+            if not state.get("batch_approved"):
+                batch_steps = [s for s in plan if str(s.get("tool", "")) in _BATCH_TOOLS]
+                if len(batch_steps) > _batch_threshold():
+                    approval = {
+                        "approval_id": uuid.uuid4().hex,
+                        "action": "batch_move",
+                        "target": f"{len(batch_steps)} 项文件移动/重命名",
+                        "detail": _batch_diff_summary(batch_steps),
+                        "count": len(batch_steps),
+                        "batch": True,
+                        "tool": tool,
+                        "args": args,
+                    }
+                    return {
+                        "current_step": current,
+                        "pending_approval": approval,
+                        "status": "waiting_approval",
+                    }
 
         if tool == "delete_file":
             target = str(args.get("path", ""))
@@ -272,12 +343,19 @@ class AgentRuntime:
                 step, "rejected", result="用户拒绝了危险操作，未修改文件"
             )
 
-        return {
+        result: Dict[str, Any] = {
             "pending_approval": None,
             "observations": [*state.get("observations", []), observation],
             "step_index": state.get("step_index", 0) + 1,
             "status": "running",
         }
+        # 批量审批：记住决定，使同一计划里后续 move/rename 步骤不再逐条弹窗（P1-2）。
+        if pending.get("batch"):
+            if approved:
+                result["batch_approved"] = True
+            else:
+                result["batch_rejected"] = True
+        return result
 
     def _reflect(self, state: AgentState) -> Dict[str, Any]:
         if state.get("status") == "failed":
