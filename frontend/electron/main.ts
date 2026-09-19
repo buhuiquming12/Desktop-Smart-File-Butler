@@ -1,6 +1,8 @@
 import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { readFile } from 'node:fs/promises';
+import { readFile, rm } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -14,6 +16,62 @@ const fallbackBackendUrl = (process.env.BUTLER_BACKEND_URL ?? 'http://127.0.0.1:
 // 主进程读取后经 preload 注入渲染进程，供 REST/WS 鉴权。两端约定同一路径。
 function sessionFilePath(): string {
   return process.env.BUTLER_SESSION_FILE ?? path.join(os.homedir(), '.desktop-smart-file-butler', 'session.json');
+}
+
+// ---- Python 后端 sidecar（P2 打包链路）----
+// Electron 主进程负责拉起后端进程，用户不必再手动开 uvicorn；退出时一并结束。
+// 可配置：BUTLER_NO_SPAWN=1 表示后端由用户自行启动（不 spawn）；
+// BUTLER_PYTHON 指定解释器；BUTLER_BACKEND_DIR 指定后端目录；BUTLER_BACKEND_CMD 完全自定义命令。
+let backendProcess: ChildProcess | null = null;
+
+function backendDir(): string {
+  // dist-electron/main.js -> 仓库根/backend（开发）；打包场景用 BUTLER_BACKEND_DIR 覆盖。
+  return process.env.BUTLER_BACKEND_DIR ?? path.join(currentDirectory, '..', '..', 'backend');
+}
+
+function resolvePython(dir: string): string {
+  if (process.env.BUTLER_PYTHON) return process.env.BUTLER_PYTHON;
+  const venv = process.platform === 'win32'
+    ? path.join(dir, '.venv', 'Scripts', 'python.exe')
+    : path.join(dir, '.venv', 'bin', 'python');
+  if (existsSync(venv)) return venv;
+  return process.platform === 'win32' ? 'python' : 'python3';
+}
+
+function startBackend(): void {
+  if (process.env.BUTLER_NO_SPAWN) return;  // 用户自行启动后端
+  const dir = backendDir();
+  if (!existsSync(dir)) {
+    console.warn('未找到后端目录，跳过 sidecar 启动：', dir);
+    return;
+  }
+  const url = new URL(fallbackBackendUrl);
+  const port = url.port || '8000';
+  let command: string;
+  let args: string[];
+  if (process.env.BUTLER_BACKEND_CMD) {
+    // 例如指向 PyInstaller 打出的独立 exe
+    const parts = process.env.BUTLER_BACKEND_CMD.split(' ').filter(Boolean);
+    command = parts[0] ?? 'python';
+    args = parts.slice(1);
+  } else {
+    command = resolvePython(dir);
+    args = ['-m', 'uvicorn', 'app.main:app', '--host', url.hostname || '127.0.0.1', '--port', port];
+  }
+  try {
+    backendProcess = spawn(command, args, { cwd: dir, stdio: 'inherit', env: process.env });
+    backendProcess.on('error', (err) => console.error('后端 sidecar 启动失败：', err));
+    backendProcess.on('exit', (code) => { console.log('后端 sidecar 退出，code=', code); backendProcess = null; });
+  } catch (err) {
+    console.error('无法拉起后端 sidecar：', err);
+  }
+}
+
+function stopBackend(): void {
+  if (backendProcess) {
+    backendProcess.kill();
+    backendProcess = null;
+  }
 }
 
 interface SessionInfo {
@@ -106,6 +164,11 @@ ipcMain.handle('butler:choose-directory', async () => {
 });
 
 app.whenReady().then(async () => {
+  // 删除上一轮的会话文件，确保 waitForSession 读到本次新后端写入的新令牌，而非陈旧值。
+  if (!process.env.BUTLER_NO_SPAWN) {
+    await rm(sessionFilePath(), { force: true }).catch(() => undefined);
+  }
+  startBackend();
   const session = await waitForSession();
   const backendUrl = session?.backendUrl ?? fallbackBackendUrl;
   // 应用实际加载的地址：开发用 Vite dev server，生产用同源后端。
@@ -121,3 +184,7 @@ app.whenReady().then(async () => {
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
+
+// 应用退出时结束后端 sidecar，避免残留进程占用端口。
+app.on('will-quit', stopBackend);
+process.on('exit', stopBackend);
