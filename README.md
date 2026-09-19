@@ -171,6 +171,11 @@ cd frontend && npm run typecheck        # 前端类型检查
 - **可撤销**：删除进回收站；move/rename/delete 均可按单条或按会话回滚，回滚也写审计日志。
 - **审计日志**：每次文件操作记录到 SQLite `operation_log` 表与 `logs/butler.log`；API Key 不入日志。
 
+## 兼容性与密钥提示
+
+- `llm_config` 为本地 SQLite 配置表，API Key 目前按明文保存。请将数据库文件视为敏感文件；生产环境建议迁移到操作系统凭据管理器，并限制数据目录权限。API Key 不会出现在日志、公开配置接口或 WebSocket 事件中。
+- 当前依赖版本（TypeScript 7、Vite 8、Electron 44）经过项目现有构建链验证，存在较新的 Node/Electron API 兼容性约束。除非有专门的兼容性验证，不主动升级主版本。
+
 ## 配置项（.env）
 
 | 变量 | 说明 | 示例 |

@@ -45,3 +45,7 @@ REFLECTION_SYSTEM_PROMPT = """
 
 final_response 仅在 done 时填写，简洁说明已完成、失败、跳过和待审批情况。
 """.strip()
+
+# P1：补充失败恢复与审批拒绝后的收敛规则，避免原参数重试或绕过审批。
+PLANNER_SYSTEM_PROMPT += "\n工具失败时，重规划必须给出新的尝试路径（换目录、换工具或跳过），不得原样重试同一失败参数。"
+REFLECTION_SYSTEM_PROMPT += "\n若剩余步骤均依赖已被用户拒绝的操作，直接 done 并如实汇总已拒绝项，不要生成绕过审批的替代方案。"
