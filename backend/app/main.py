@@ -24,6 +24,8 @@ from starlette.responses import JSONResponse
 import httpx
 
 from . import db, llm_config, sandbox_config
+from .api import events as ws_events
+from .api import rest as rest_api
 from .agent.graph import AgentRuntime
 from .config import get_settings
 from .logging_conf import get_logger, setup_logging
@@ -249,6 +251,9 @@ def _event(event_type: WSEventType, thread_id: str, **payload: Any) -> WSEvent:
 async def _emit_update(
     client_id: Optional[str], thread_id: str, update: Dict[str, Any]
 ) -> None:
+    await ws_events.emit_update(connections.send, get_runtime().state, client_id, thread_id, update)
+    return
+
     if not client_id:
         return
 
@@ -332,8 +337,8 @@ async def _emit_update(
 
 async def _emit_token(client_id: Optional[str], thread_id: str, data: Any) -> None:
     """把 LLM 自由文本 token 转成 token 事件；结构化输出（内容为空）自然被过滤（P1-4）。"""
-    if not client_id:
-        return
+    await ws_events.emit_token(connections.send, client_id, thread_id, data)
+    return
     chunk = data[0] if isinstance(data, tuple) else data
     content = getattr(chunk, "content", None)
     if isinstance(content, str) and content:
@@ -342,6 +347,8 @@ async def _emit_token(client_id: Optional[str], thread_id: str, data: Any) -> No
 
 async def _dispatch(client_id: Optional[str], thread_id: str, item: Any) -> None:
     """区分多路 stream 输出：("messages"|"updates", data) 元组，或单模式 updates 字典。"""
+    await ws_events.dispatch(connections.send, get_runtime().state, client_id, thread_id, item)
+    return
     if isinstance(item, tuple) and len(item) == 2 and item[0] in ("updates", "messages"):
         mode, data = item
         if mode == "messages":
@@ -626,6 +633,37 @@ def rollback_operation(op_id: int) -> Dict[str, Any]:
 
 @app.post("/api/threads/{thread_id}/rollback")
 def rollback_thread(thread_id: str) -> Dict[str, Any]:
+    """先预检全部目标，再按逆序回滚，返回可直接展示的分级汇总。"""
+    ops = db.operations_for_thread(thread_id)
+    reversible = [op for op in ops if op.action in ("move", "rename", "delete") and op.status == "ok" and op.dest]
+    if not reversible:
+        raise HTTPException(status_code=404, detail="没有可回滚的操作")
+    return rest_api.rollback_summary(thread_id, reversible, filesystem.preflight_restore, filesystem.restore_operation)
+
+    # 兼容旧版本实现（不可达，保留历史处理顺序说明）。
+    results: list[Dict[str, Any]] = []
+    ready = []
+    for op in reversed(reversible):
+        check = filesystem.preflight_restore(op)
+        if check.get("status") == "ok":
+            ready.append(op)
+        else:
+            results.append({"op_id": op.id, "status": check.get("status", "failed"), "detail": check.get("detail", "预检失败")})
+    for op in ready:
+        try:
+            results.append({"op_id": op.id, **filesystem.restore_operation(op)})
+        except (SandboxViolation, FileNotFoundError) as exc:
+            results.append({"op_id": op.id, "status": "failed", "detail": str(exc)})
+    return {
+        "thread_id": thread_id,
+        "total": len(results),
+        "ok": sum(1 for item in results if item["status"] == "ok"),
+        "skipped": sum(1 for item in results if item["status"] == "skipped"),
+        "failed": sum(1 for item in results if item["status"] == "failed"),
+        "results": results,
+    }
+
+    # 保留旧实现作为兼容参考（不可达）。
     """回滚某会话的所有可逆操作（按发生顺序倒序还原）。"""
     ops = db.operations_for_thread(thread_id)
     reversible = [
