@@ -7,6 +7,18 @@
 """
 from __future__ import annotations
 
+
+def preflight_restore(op: OperationLog) -> dict:
+    """回滚预检：不修改文件，只确认源和目标均位于沙箱且源仍存在。"""
+    if op.action not in _REVERSIBLE_ACTIONS or op.status != "ok" or not op.dest:
+        return {"status": "skipped", "detail": "操作没有可回滚目标"}
+    try:
+        current = resolve_in_sandbox(op.dest, must_exist=True)
+        resolve_in_sandbox(op.target)
+    except (SandboxViolation, FileNotFoundError, OSError) as exc:
+        return {"status": "failed", "detail": f"预检失败：{exc}"}
+    return {"status": "ok", "detail": "预检通过", "current": str(current)}
+
 import shutil
 from datetime import datetime
 from pathlib import Path
