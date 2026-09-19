@@ -27,7 +27,21 @@ from .state import AgentState, PlanOutput, ReflectionOutput
 
 logger = get_logger(__name__)
 _MAX_REPLANS = 3
+_MAX_PLAN_STEPS = 30           # 单个计划最多步数（提示词同步约束）
+_SUPER_STEPS_PER_STEP = 2      # 移除 observe 后每步占用 act + reflecting 两个超级步
 _MAX_SCAN_RESULTS = 500
+
+
+def _recursion_limit() -> int:
+    """按计划上限与允许的重规划次数推导安全的 recursion_limit。
+
+    每个规划周期 = 1(planning) + 30 步 × 2 超级步；共 1 + _MAX_REPLANS 个周期，
+    再加 perceive(1) 与删除审批 / 边界余量。避免像固定 120 那样在 30 步 + 重规划时踩线。
+    """
+    per_cycle = 1 + _MAX_PLAN_STEPS * _SUPER_STEPS_PER_STEP
+    cycles = 1 + _MAX_REPLANS
+    margin = 20
+    return 1 + cycles * per_cycle + margin
 _SUPPORTED_CONTENT_EXTS = {
     "pdf", "doc", "docx", "txt", "md", "csv", "log", "json",
     "png", "jpg", "jpeg", "bmp", "tiff", "webp",
@@ -66,7 +80,6 @@ class AgentRuntime:
         workflow.add_node("planning", self._plan)
         workflow.add_node("act", self._act)
         workflow.add_node("approval", self._approval)
-        workflow.add_node("observe", self._observe)
         workflow.add_node("reflecting", self._reflect)
 
         workflow.add_edge(START, "perceive")
@@ -74,13 +87,14 @@ class AgentRuntime:
         workflow.add_conditional_edges(
             "planning", self._after_plan, {"act": "act", "done": END}
         )
+        # 移除只返回 {"status": "running"} 的空 observe 节点：观察已由 act/approval
+        # 写入状态，act 直连 reflecting，每步从 3 个超级步降到 2 个（见 P0-3）。
         workflow.add_conditional_edges(
             "act",
             self._after_act,
-            {"approval": "approval", "observe": "observe"},
+            {"approval": "approval", "reflecting": "reflecting"},
         )
-        workflow.add_edge("approval", "observe")
-        workflow.add_edge("observe", "reflecting")
+        workflow.add_edge("approval", "reflecting")
         workflow.add_conditional_edges(
             "reflecting",
             self._after_reflect,
@@ -135,7 +149,7 @@ class AgentRuntime:
                     HumanMessage(content=_json(context)),
                 ]
             )
-            for item in result.steps[:30]:
+            for item in result.steps[:_MAX_PLAN_STEPS]:
                 if item.tool == "set_preference" and "key" in item.args:
                     key = str(item.args["key"]).lower()
                     if any(
@@ -143,7 +157,7 @@ class AgentRuntime:
                         for secret in ("api_key", "token", "secret", "password")
                     ):
                         raise ValueError("拒绝把密钥、令牌或密码保存为用户偏好")
-            steps = [step.model_dump() for step in result.steps[:30]]
+            steps = [step.model_dump() for step in result.steps[:_MAX_PLAN_STEPS]]
             if not steps:
                 return {
                     "plan": [],
@@ -261,10 +275,6 @@ class AgentRuntime:
             "status": "running",
         }
 
-    def _observe(self, state: AgentState) -> Dict[str, Any]:
-        # 工具结果已由 act/approval 以结构化观察写入状态；该节点明确保留循环语义。
-        return {"status": "running"}
-
     def _reflect(self, state: AgentState) -> Dict[str, Any]:
         if state.get("status") == "failed":
             return {}
@@ -327,8 +337,8 @@ class AgentRuntime:
         return "act"
 
     @staticmethod
-    def _after_act(state: AgentState) -> Literal["approval", "observe"]:
-        return "approval" if state.get("pending_approval") else "observe"
+    def _after_act(state: AgentState) -> Literal["approval", "reflecting"]:
+        return "approval" if state.get("pending_approval") else "reflecting"
 
     @staticmethod
     def _after_reflect(state: AgentState) -> Literal["act", "plan", "done"]:
@@ -483,7 +493,7 @@ class AgentRuntime:
 
     @staticmethod
     def config(thread_id: str) -> Dict[str, Any]:
-        return {"configurable": {"thread_id": thread_id}, "recursion_limit": 120}
+        return {"configurable": {"thread_id": thread_id}, "recursion_limit": _recursion_limit()}
 
     def start_stream(self, message: str, thread_id: str) -> Iterable[Dict[str, Any]]:
         initial: AgentState = {
