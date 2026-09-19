@@ -33,6 +33,16 @@ jobs:
         with:
           name: pytest-log
           path: backend/pytest.log
+      - name: 展示 pytest 失败摘要
+        if: failure()
+        working-directory: backend
+        run: |
+          {
+            echo '### pytest 失败日志'
+            echo '```text'
+            tail -n 80 pytest.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   frontend:
     name: 前端类型检查 (tsc)
