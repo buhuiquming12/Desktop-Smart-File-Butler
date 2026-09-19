@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Literal, Optional
 
 import sqlite3
+from datetime import datetime, timedelta, timezone
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -145,6 +146,45 @@ def _build_checkpointer() -> SqliteSaver:
     return saver
 
 
+def cleanup_checkpoints(checkpointer: SqliteSaver, state_reader: Any, *, max_sessions: int = 100, max_age_days: int = 30) -> int:
+    """清理旧 checkpoint；待审批会话即使超出 TTL 也保留。"""
+    conn = getattr(checkpointer, "conn", None) or getattr(checkpointer, "connection", None)
+    if conn is None:
+        return 0
+    try:
+        rows = conn.execute("SELECT DISTINCT thread_id FROM checkpoints").fetchall()
+    except sqlite3.DatabaseError:
+        return 0
+    sessions = []
+    for row in rows:
+        thread_id = row[0]
+        try:
+            state = state_reader(thread_id) or {}
+        except Exception:  # noqa: BLE001
+            state = {}
+        if state.get("status") == "waiting_approval" or state.get("pending_approval"):
+            continue
+        try:
+            latest = conn.execute("SELECT MAX(checkpoint_id) FROM checkpoints WHERE thread_id=?", (thread_id,)).fetchone()[0]
+        except sqlite3.DatabaseError:
+            latest = ""
+        sessions.append((str(latest), thread_id))
+    sessions.sort(reverse=True)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+    # checkpoint_id 使用时间排序；保留最近 N 个，其余作为 TTL 候选。
+    victims = [thread_id for index, (_, thread_id) in enumerate(sessions) if index >= max_sessions]
+    removed = 0
+    for thread_id in victims:
+        try:
+            conn.execute("DELETE FROM checkpoint_writes WHERE thread_id=?", (thread_id,))
+            conn.execute("DELETE FROM checkpoints WHERE thread_id=?", (thread_id,))
+            conn.commit()
+            removed += 1
+        except sqlite3.DatabaseError:
+            conn.rollback()
+    return removed
+
+
 def _safe_summary_name(source: Path, output_name: Optional[str]) -> str:
     raw = output_name or f"{source.stem}_摘要.md"
     # 禁止把 output_name 当成路径逃逸；仅取文件名，并清除 Windows 非法字符。
@@ -166,6 +206,7 @@ class AgentRuntime:
         self.reflector = self.llm.with_structured_output(ReflectionOutput)
         self.checkpointer = _build_checkpointer()
         self.graph = self._build_graph()
+        cleanup_checkpoints(self.checkpointer, self.state)
 
     def _build_graph(self):
         workflow = StateGraph(AgentState)
