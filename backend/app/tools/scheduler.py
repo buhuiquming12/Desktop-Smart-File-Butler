@@ -5,7 +5,9 @@
 """
 from __future__ import annotations
 
-from typing import Callable, Optional
+from concurrent.futures import ThreadPoolExecutor
+import threading
+from typing import Callable, Optional, Set
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -19,6 +21,9 @@ logger = get_logger(__name__)
 _scheduler: Optional[BackgroundScheduler] = None
 # runner(directory, instruction) -> None
 _runner: Optional[Callable[[str, str], None]] = None
+_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="butler-job")
+_running_directories: Set[str] = set()
+_running_lock = threading.Lock()
 
 
 def init_scheduler(runner: Callable[[str, str], None]) -> None:
@@ -54,6 +59,27 @@ def _register(job: ScheduledJob) -> None:
 
 
 def _fire(directory: str, instruction: str) -> None:
+    with _running_lock:
+        if directory in _running_directories:
+            logger.info("跳过同目录重复定时任务: %s", directory)
+            return
+        _running_directories.add(directory)
+    _executor.submit(_run_job, directory, instruction)
+    return
+
+
+def _run_job(directory: str, instruction: str) -> None:
+    try:
+        if _runner is not None:
+            _runner(directory, instruction)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("定时任务执行失败: %s", exc)
+    finally:
+        with _running_lock:
+            _running_directories.discard(directory)
+
+
+def _legacy_fire(directory: str, instruction: str) -> None:
     if _runner is None:
         logger.error("runner 未注入，跳过定时任务")
         return
@@ -85,3 +111,4 @@ def remove_job(job_id: str, delete_record: bool = True) -> None:
 def shutdown() -> None:
     if _scheduler is not None:
         _scheduler.shutdown(wait=False)
+    _executor.shutdown(wait=False, cancel_futures=True)
