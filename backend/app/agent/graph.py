@@ -86,6 +86,8 @@ def _json(value: Any) -> str:
 
 _PLANNER_SAMPLE = 20        # 回灌给规划器的扫描样本条数
 _PLANNER_TEXT_CAP = 1000    # 回灌给规划器的长文本（如 extract_text）上限字符数
+_SUMMARY_CHUNK_CHARS = 12_000   # map-reduce 摘要的分段大小
+_SUMMARY_MAX_CHUNKS = 40        # 摘要最多处理的段数，超出显式提示（避免长文档静默截断，P2）
 
 
 def _summarize_observation(obs: Dict[str, Any]) -> Dict[str, Any]:
@@ -561,30 +563,56 @@ class AgentRuntime:
         )
         return {"category": category, "rule_category": rule, "semantic_category": semantic}
 
+    def _summarize_once(self, title: str, text: str, *, is_segment: bool = False) -> str:
+        role = (
+            "请用中文摘要这一段文档片段，保留其中的关键事实、日期、数字、行动项，简洁客观。"
+            if is_segment
+            else "请用中文总结文档，保留主题、关键事实、日期、行动项。使用 Markdown，避免补充原文没有的信息。"
+        )
+        response = self.llm.invoke(
+            [SystemMessage(content=role), HumanMessage(content=f"文件名：{title}\n\n{text}")]
+        )
+        content = response.content
+        return content if isinstance(content, str) else _json(content)
+
+    def _summarize_text(self, name: str, text: str) -> str:
+        """长文档 map-reduce 摘要：分段各自摘要（map）再归并（reduce），避免静默截断（P2）。"""
+        chunks = extract.chunk_text(text, _SUMMARY_CHUNK_CHARS)
+        if len(chunks) <= 1:
+            return self._summarize_once(name, text)
+
+        truncated = len(chunks) > _SUMMARY_MAX_CHUNKS
+        chunks = chunks[:_SUMMARY_MAX_CHUNKS]
+        partials = [
+            self._summarize_once(f"{name}（第 {i + 1}/{len(chunks)} 段）", chunk, is_segment=True)
+            for i, chunk in enumerate(chunks)
+        ]
+        combined = "\n\n".join(
+            f"【第 {i + 1} 段摘要】\n{p}" for i, p in enumerate(partials)
+        )
+        final = self._summarize_once(
+            f"{name}（对以下各段摘要做整体归纳，输出连贯的最终摘要）", combined
+        )
+        if truncated:
+            final = (
+                f"> 注意：文档过长，仅摘要了前 {_SUMMARY_MAX_CHUNKS} 段"
+                f"（约 {_SUMMARY_MAX_CHUNKS * _SUMMARY_CHUNK_CHARS} 字符），其余未纳入。\n\n"
+                + final
+            )
+        return final
+
     def _write_summary(
         self, file_path: str, output_dir: str, output_name: Optional[str]
     ) -> str:
         source = resolve_in_sandbox(file_path, must_exist=True)
         destination_dir = resolve_in_sandbox(output_dir)
         destination_dir.mkdir(parents=True, exist_ok=True)
-        text = extract.extract_text(str(source))
+        # 取全文（不截断），长文档走 map-reduce 分段摘要，避免只摘开头（P2）。
+        text = extract.extract_text(str(source), max_chars=None)
         if not text or text.startswith("["):
             raise ValueError(f"无法从 {source.name} 提取可摘要内容: {text}")
 
-        response = self.llm.invoke(
-            [
-                SystemMessage(
-                    content=(
-                        "请用中文总结文档，保留主题、关键事实、日期、行动项。"
-                        "使用 Markdown，避免补充原文没有的信息。"
-                    )
-                ),
-                HumanMessage(content=f"文件名：{source.name}\n\n{text}"),
-            ]
-        )
-        summary = response.content
-        if not isinstance(summary, str):
-            summary = _json(summary)
+        summary = self._summarize_text(source.name, text)
 
         target = destination_dir / _safe_summary_name(source, output_name)
         # 摘要也是写操作；默认不覆盖，自动编号。

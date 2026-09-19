@@ -16,11 +16,19 @@ _TEXT_EXTS = {"txt", "md", "csv", "log", "json"}
 _MAX_CHARS = 20_000  # 提取文本上限，避免超长内容压爆上下文
 
 
-def _truncate(text: str) -> str:
+def _truncate(text: str, max_chars: int | None = _MAX_CHARS) -> str:
     text = text.strip()
-    if len(text) > _MAX_CHARS:
-        return text[:_MAX_CHARS] + f"\n...[已截断，原文 {len(text)} 字符]"
+    if max_chars is not None and len(text) > max_chars:
+        return text[:max_chars] + f"\n...[已截断，原文 {len(text)} 字符]"
     return text
+
+
+def chunk_text(text: str, size: int) -> list[str]:
+    """按字符数把文本切成不超过 size 的块，供 map-reduce 摘要使用（P2）。"""
+    text = text.strip()
+    if not text:
+        return []
+    return [text[i : i + size] for i in range(0, len(text), size)]
 
 
 def extract_pdf(path: Path) -> str:
@@ -51,6 +59,9 @@ def extract_txt(path: Path) -> str:
     return "[无法以常见编码读取文本文件]"
 
 
+_OCR_TIMEOUT_SEC = 30  # 单张图片 OCR 超时，避免坏图/超大图无限阻塞批量任务（P2）
+
+
 def extract_image_ocr(path: Path) -> str:
     try:
         import pytesseract
@@ -63,18 +74,25 @@ def extract_image_ocr(path: Path) -> str:
         pytesseract.pytesseract.tesseract_cmd = cmd
     try:
         img = Image.open(str(path))
-        # 中英文混合识别；未安装 chi_sim 语言包时回退到默认
+        # 中英文混合识别；未安装 chi_sim 语言包时回退到默认。加超时防止单张图卡死批量任务。
         try:
-            return pytesseract.image_to_string(img, lang="chi_sim+eng")
+            return pytesseract.image_to_string(img, lang="chi_sim+eng", timeout=_OCR_TIMEOUT_SEC)
         except pytesseract.TesseractError:
-            return pytesseract.image_to_string(img)
+            return pytesseract.image_to_string(img, timeout=_OCR_TIMEOUT_SEC)
+    except RuntimeError as exc:  # pytesseract 超时抛 RuntimeError
+        logger.warning("OCR 超时 %s: %s", path, exc)
+        return f"[OCR 超时（超过 {_OCR_TIMEOUT_SEC}s）: {path.name}]"
     except Exception as exc:  # noqa: BLE001 - OCR 失败不应中断整体流程
         logger.warning("OCR 失败 %s: %s", path, exc)
         return f"[OCR 失败: {exc}]"
 
 
-def extract_text(file_path: str) -> str:
-    """按扩展名分派到对应提取器，返回截断后的文本。"""
+def extract_text(file_path: str, max_chars: int | None = _MAX_CHARS) -> str:
+    """按扩展名分派到对应提取器，返回文本。
+
+    ``max_chars=None`` 时不截断（供 map-reduce 摘要读取全文，见 P2）；默认截断到
+    20k，避免分类等场景把超长内容压爆上下文。
+    """
     p = resolve_in_sandbox(file_path, must_exist=True)
     ext = p.suffix.lower().lstrip(".")
 
@@ -89,4 +107,4 @@ def extract_text(file_path: str) -> str:
     else:
         text = f"[不支持的文件类型: .{ext}]"
 
-    return _truncate(text)
+    return _truncate(text, max_chars)
