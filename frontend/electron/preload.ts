@@ -1,4 +1,4 @@
-import { contextBridge } from 'electron';
+import { contextBridge, ipcRenderer } from 'electron';
 
 export interface DesktopBridge {
   platform: NodeJS.Platform;
@@ -6,6 +6,8 @@ export interface DesktopBridge {
   sessionToken: string;
   /** 后端基址（含端口），由主进程从会话文件读取后注入。 */
   backendUrl: string;
+  /** 打开原生目录选择器，返回所选目录绝对路径；取消则返回 null（P1-3）。 */
+  chooseDirectory: () => Promise<string | null>;
   versions: Readonly<{
     electron: string;
     chrome: string;
@@ -23,6 +25,7 @@ const desktopBridge: DesktopBridge = Object.freeze({
   platform: process.platform,
   sessionToken: readArg('--butler-token='),
   backendUrl: readArg('--butler-backend='),
+  chooseDirectory: () => ipcRenderer.invoke('butler:choose-directory') as Promise<string | null>,
   versions: Object.freeze({
     electron: process.versions.electron,
     chrome: process.versions.chrome,

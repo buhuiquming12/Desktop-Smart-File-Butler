@@ -23,7 +23,7 @@ from starlette.responses import JSONResponse
 
 import httpx
 
-from . import db, llm_config
+from . import db, llm_config, sandbox_config
 from .agent.graph import AgentRuntime
 from .config import get_settings
 from .logging_conf import get_logger, setup_logging
@@ -34,6 +34,7 @@ from .models import (
     LLMModelsRequest,
     LLMSettingsUpdate,
     PreferenceUpdate,
+    SandboxSettingsUpdate,
     ScheduledJob,
     WSEvent,
     WSEventType,
@@ -411,7 +412,7 @@ def health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "model_provider": config.provider,
-        "sandbox_configured": bool(settings.sandbox_root_paths),
+        "sandbox_configured": bool(sandbox_config.effective_roots()),
     }
 
 
@@ -424,9 +425,36 @@ def public_config() -> Dict[str, Any]:
         "openai_model": config.openai_model,
         "ollama_model": config.ollama_model,
         "ollama_base_url": config.ollama_base_url,
-        "sandbox_roots": [str(path) for path in settings.sandbox_root_paths],
+        "sandbox_roots": [str(path) for path in sandbox_config.effective_roots()],
         "ocr_enabled": bool(settings.tesseract_cmd),
     }
+
+
+# ---------------- 沙箱根目录（前端可配，DB 覆盖 .env） ----------------
+
+
+@app.get("/api/settings/sandbox")
+def get_sandbox_settings() -> Dict[str, Any]:
+    """返回当前生效的沙箱根目录，以及是否来自 DB 覆盖。"""
+    override = db.get_preference(sandbox_config.ROOTS_KEY)
+    return {
+        "roots": [str(p) for p in sandbox_config.effective_roots()],
+        "source": "database" if override else "env",
+        "env_roots": [str(p) for p in settings.sandbox_root_paths],
+    }
+
+
+@app.put("/api/settings/sandbox")
+def update_sandbox_settings(body: SandboxSettingsUpdate) -> Dict[str, Any]:
+    """保存沙箱根目录覆盖项（权限变更）。空列表清除覆盖、回退 .env。
+
+    因 effective_roots 每次读库，保存后对后续所有文件操作立即生效。
+    """
+    try:
+        sandbox_config.save_roots(body.roots)
+    except sandbox_config.InvalidSandboxRoot as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return get_sandbox_settings()
 
 
 # ---------------- 模型配置 ----------------
@@ -590,6 +618,9 @@ def update_preference(key: str, body: PreferenceUpdate) -> Dict[str, str]:
     normalized_key = key.strip()
     if not normalized_key or len(normalized_key) > 200:
         raise HTTPException(status_code=422, detail="偏好键不能为空且最多 200 字符")
+    if normalized_key.startswith("__"):
+        # __ 前缀为内部保留键（如沙箱根目录），不允许经普通偏好接口绕过校验写入。
+        raise HTTPException(status_code=422, detail="保留键不可通过偏好接口修改")
     if any(
         secret in normalized_key.lower()
         for secret in ("api_key", "token", "secret", "password")

@@ -15,6 +15,7 @@ import type {
   OperationLog,
   PendingApproval,
   Preference,
+  SandboxSettings,
   ScheduledJob,
   TaskItem,
   TaskStatus,
@@ -81,6 +82,7 @@ export function App() {
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('general');
   const [preferences, setPreferences] = useState<Preference[]>([]);
   const [llmSettings, setLLMSettings] = useState<LLMSettings | null>(null);
+  const [sandboxSettings, setSandboxSettings] = useState<SandboxSettings | null>(null);
   const [jobs, setJobs] = useState<ScheduledJob[]>([]);
   const [logs, setLogs] = useState<OperationLog[]>([]);
   const [settingsLoading, setSettingsLoading] = useState(false);
@@ -237,12 +239,13 @@ export function App() {
   const loadSettingsData = useCallback(async () => {
     setSettingsLoading(true);
     setSettingsError(null);
-    const results = await Promise.allSettled([api.getPreferences(), api.getJobs(), api.getOperations(), api.getLLMSettings()]);
-    const [preferenceResult, jobResult, logResult, llmResult] = results;
+    const results = await Promise.allSettled([api.getPreferences(), api.getJobs(), api.getOperations(), api.getLLMSettings(), api.getSandboxSettings()]);
+    const [preferenceResult, jobResult, logResult, llmResult, sandboxResult] = results;
     if (preferenceResult.status === 'fulfilled') setPreferences(preferenceResult.value);
     if (jobResult.status === 'fulfilled') setJobs(jobResult.value);
     if (logResult.status === 'fulfilled') setLogs(logResult.value);
     if (llmResult.status === 'fulfilled') setLLMSettings(llmResult.value);
+    if (sandboxResult.status === 'fulfilled') setSandboxSettings(sandboxResult.value);
     const rejected = results.find((result) => result.status === 'rejected');
     if (rejected?.status === 'rejected') setSettingsError(rejected.reason instanceof Error ? rejected.reason.message : '部分数据加载失败');
     setSettingsLoading(false);
@@ -277,6 +280,17 @@ export function App() {
   };
 
   const fetchModels = (request: LLMModelsRequest): Promise<LLMModelsResponse> => api.listLLMModels(request);
+
+  const saveSandbox = async (roots: string[]): Promise<void> => {
+    setSettingsError(null);
+    try {
+      const saved = await api.updateSandboxSettings(roots);
+      setSandboxSettings(saved);
+    } catch (error) {
+      setSettingsError(error instanceof Error ? error.message : '保存沙箱目录失败');
+      throw error;
+    }
+  };
 
   const savePreference = async (preference: Preference): Promise<void> => {
     setSettingsError(null);
@@ -355,6 +369,7 @@ export function App() {
         apiBase={apiBase}
         wsBase={wsBase}
         llmSettings={llmSettings}
+        sandboxSettings={sandboxSettings}
         preferences={preferences}
         jobs={jobs}
         logs={logs}
@@ -363,6 +378,7 @@ export function App() {
         onClose={() => setSettingsOpen(false)}
         onSaveEndpoints={saveEndpoints}
         onSaveLLM={saveLLM}
+        onSaveSandbox={saveSandbox}
         onFetchModels={fetchModels}
         onSavePreference={savePreference}
         onCreateJob={createJob}

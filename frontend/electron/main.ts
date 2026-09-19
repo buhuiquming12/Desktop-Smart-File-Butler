@@ -1,4 +1,4 @@
-import { app, BrowserWindow, shell } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron';
 import { fileURLToPath } from 'node:url';
 import { readFile } from 'node:fs/promises';
 import os from 'node:os';
@@ -97,6 +97,13 @@ function createWindow(appUrl: string, token: string, backendUrl: string): void {
 
   void window.loadURL(appUrl);
 }
+
+// 原生目录选择器：返回所选目录绝对路径，供沙箱根目录配置使用（P1-3）。
+ipcMain.handle('butler:choose-directory', async () => {
+  const result = await dialog.showOpenDialog({ properties: ['openDirectory', 'createDirectory'] });
+  if (result.canceled || result.filePaths.length === 0) return null;
+  return result.filePaths[0];
+});
 
 app.whenReady().then(async () => {
   const session = await waitForSession();

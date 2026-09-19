@@ -185,9 +185,14 @@ def get_preference(key: str) -> Optional[str]:
 
 
 def all_preferences() -> List[Preference]:
+    """返回用户偏好。以 __ 开头的保留键（如内部沙箱配置）不对外暴露、也不喂给规划器。"""
     with _conn() as c:
         rows = c.execute("SELECT key, value FROM preferences").fetchall()
-    return [Preference(key=r["key"], value=r["value"]) for r in rows]
+    return [
+        Preference(key=r["key"], value=r["value"])
+        for r in rows
+        if not r["key"].startswith("__")
+    ]
 
 
 # ---------- 模型配置（前端可写，覆盖 .env 默认值） ----------

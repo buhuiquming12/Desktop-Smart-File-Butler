@@ -8,7 +8,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List
 
-from .config import get_settings
 from .logging_conf import get_logger
 
 logger = get_logger(__name__)
@@ -19,7 +18,10 @@ class SandboxViolation(Exception):
 
 
 def _sandbox_roots() -> List[Path]:
-    roots = get_settings().sandbox_root_paths
+    # 有效根目录 = DB 覆盖（前端界面可配）优先，否则 .env 默认（见 P1-3）。
+    from .sandbox_config import effective_roots
+
+    roots = effective_roots()
     if not roots:
         logger.warning("SANDBOX_ROOTS 未配置，所有文件操作都会被拒绝")
     return roots

@@ -120,11 +120,18 @@ export interface HealthResponse {
   [key: string]: unknown;
 }
 
+export interface SandboxSettings {
+  roots: string[];
+  source: 'database' | 'env';
+  env_roots: string[];
+}
+
 /** preload 注入的桌面桥接对象（见 electron/preload.ts）。 */
 export interface DesktopBridge {
   platform: string;
   sessionToken: string;
   backendUrl: string;
+  chooseDirectory: () => Promise<string | null>;
   versions: { electron: string; chrome: string; node: string };
 }
 

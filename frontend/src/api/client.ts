@@ -9,6 +9,7 @@ import type {
   LLMSettingsUpdate,
   OperationLog,
   Preference,
+  SandboxSettings,
   ScheduledJob,
   WSEvent,
 } from '../types';
@@ -141,6 +142,14 @@ export class ApiClient {
 
   listLLMModels(request: LLMModelsRequest): Promise<LLMModelsResponse> {
     return this.request('/api/settings/llm/models', { method: 'POST', body: JSON.stringify(request) });
+  }
+
+  getSandboxSettings(): Promise<SandboxSettings> {
+    return this.request('/api/settings/sandbox');
+  }
+
+  updateSandboxSettings(roots: string[]): Promise<SandboxSettings> {
+    return this.request('/api/settings/sandbox', { method: 'PUT', body: JSON.stringify({ roots }) });
   }
 }
 

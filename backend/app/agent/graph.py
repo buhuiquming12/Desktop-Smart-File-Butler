@@ -135,9 +135,9 @@ class AgentRuntime:
     # ---------------- 图节点 ----------------
 
     def _perceive(self, state: AgentState) -> Dict[str, Any]:
-        from ..config import get_settings
+        from ..sandbox_config import effective_roots
 
-        roots = [str(p) for p in get_settings().sandbox_root_paths]
+        roots = [str(p) for p in effective_roots()]
         preferences = [p.model_dump() for p in db.all_preferences()]
         history = [
             op.model_dump(mode="json") for op in db.recent_operations(limit=20)

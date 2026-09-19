@@ -7,6 +7,7 @@ import type {
   LLMSettingsUpdate,
   OperationLog,
   Preference,
+  SandboxSettings,
   ScheduledJob,
 } from '../types';
 
@@ -18,6 +19,7 @@ interface SettingsProps {
   apiBase: string;
   wsBase: string;
   llmSettings: LLMSettings | null;
+  sandboxSettings: SandboxSettings | null;
   preferences: Preference[];
   jobs: ScheduledJob[];
   logs: OperationLog[];
@@ -26,6 +28,7 @@ interface SettingsProps {
   onClose: () => void;
   onSaveEndpoints: (apiBase: string, wsBase: string) => void;
   onSaveLLM: (update: LLMSettingsUpdate) => Promise<void>;
+  onSaveSandbox: (roots: string[]) => Promise<void>;
   onFetchModels: (request: LLMModelsRequest) => Promise<LLMModelsResponse>;
   onSavePreference: (preference: Preference) => Promise<void>;
   onCreateJob: (job: Omit<ScheduledJob, 'job_id'>) => Promise<void>;
@@ -69,6 +72,31 @@ export function Settings(props: SettingsProps) {
   const [savingLLM, setSavingLLM] = useState(false);
   const [rollingBack, setRollingBack] = useState<number | null>(null);
 
+  // 沙箱根目录编辑态（权限变更，见 P1-3）
+  const [sandboxRoots, setSandboxRoots] = useState<string[]>([]);
+  const [savingSandbox, setSavingSandbox] = useState(false);
+  const [manualRoot, setManualRoot] = useState('');
+
+  const addRoot = (dir: string): void => {
+    const value = dir.trim();
+    if (!value) return;
+    setSandboxRoots((current) => (current.includes(value) ? current : [...current, value]));
+  };
+
+  const pickDirectory = async (): Promise<void> => {
+    const chosen = await window.desktop?.chooseDirectory();
+    if (chosen) addRoot(chosen);
+  };
+
+  const saveSandbox = async (): Promise<void> => {
+    setSavingSandbox(true);
+    try {
+      await props.onSaveSandbox(sandboxRoots);
+    } finally {
+      setSavingSandbox(false);
+    }
+  };
+
   const rollback = async (opId: number): Promise<void> => {
     setRollingBack(opId);
     try {
@@ -95,6 +123,9 @@ export function Settings(props: SettingsProps) {
     setAvailableModels([]);
     setModelStatus(null);
   }, [props.llmSettings, props.open]);
+  useEffect(() => {
+    if (props.sandboxSettings) setSandboxRoots(props.sandboxSettings.roots);
+  }, [props.sandboxSettings, props.open]);
 
   if (!props.open) return null;
 
@@ -198,6 +229,37 @@ export function Settings(props: SettingsProps) {
               <label>本地 WebSocket 地址<input value={wsBase} onChange={(event) => setWsBase(event.target.value)} placeholder="ws://127.0.0.1:8000" /></label>
               <button className="primary-button" type="button" onClick={() => props.onSaveEndpoints(apiBase.trim(), wsBase.trim())}>保存并重连</button>
               {window.desktop && <p className="version-note">Electron {window.desktop.versions.electron} · {window.desktop.platform}</p>}
+
+              <div className="section-divider" />
+              <div><h3>可操作的文件夹（沙箱根目录）</h3><p>Agent 只能读写这些文件夹内的文件，越界一律拒绝。</p></div>
+              <div className="inline-error" role="note">
+                ⚠ 权限变更：新增目录会授权 Agent 移动、重命名、删除其中的文件。请只添加你信任 Agent 操作的目录。
+              </div>
+              {props.sandboxSettings?.source === 'env' && sandboxRoots.length > 0 && (
+                <p className="muted">当前来自 .env 默认配置；保存后将改为界面配置覆盖。</p>
+              )}
+              <ul className="root-list">
+                {sandboxRoots.length === 0 ? (
+                  <li className="muted">未配置任何目录，所有文件操作都会被拒绝。</li>
+                ) : sandboxRoots.map((root) => (
+                  <li key={root} className="root-row">
+                    <code title={root}>{root}</code>
+                    <button className="icon-button" type="button" aria-label={`移除 ${root}`}
+                      onClick={() => setSandboxRoots((current) => current.filter((r) => r !== root))}>×</button>
+                  </li>
+                ))}
+              </ul>
+              {window.desktop ? (
+                <button className="secondary-button" type="button" onClick={() => void pickDirectory()}>选择目录…</button>
+              ) : (
+                <div className="root-add">
+                  <input value={manualRoot} onChange={(event) => setManualRoot(event.target.value)} placeholder="输入目录的绝对路径" />
+                  <button className="secondary-button" type="button" onClick={() => { addRoot(manualRoot); setManualRoot(''); }}>添加</button>
+                </div>
+              )}
+              <button className="primary-button" type="button" disabled={savingSandbox} onClick={() => void saveSandbox()}>
+                {savingSandbox ? '保存中…' : '保存沙箱目录'}
+              </button>
             </div>
           )}
 

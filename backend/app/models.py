@@ -36,6 +36,11 @@ class LLMSettingsUpdate(BaseModel):
     ollama_model: Optional[str] = Field(default=None, max_length=200)
 
 
+class SandboxSettingsUpdate(BaseModel):
+    """前端保存沙箱根目录覆盖项（权限变更）。空列表表示清除覆盖、回退 .env。"""
+    roots: List[str] = Field(default_factory=list, max_length=50)
+
+
 class LLMModelsRequest(BaseModel):
     """探测某个 OpenAI 兼容 / Ollama 服务的可用模型列表。
 
