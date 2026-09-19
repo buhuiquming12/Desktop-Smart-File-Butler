@@ -15,7 +15,6 @@ from app.config import get_settings
 def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     monkeypatch.setenv("SANDBOX_ROOTS", str(tmp_path))
     monkeypatch.setenv("DB_PATH", str(tmp_path / "butler.db"))
-    monkeypatch.setenv("CHROMA_DIR", str(tmp_path / "chroma"))
     monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
     get_settings.cache_clear()
     db._initialized = False

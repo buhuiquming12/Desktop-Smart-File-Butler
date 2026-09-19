@@ -13,7 +13,6 @@ from app.config import get_settings
 def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("SANDBOX_ROOTS", str(tmp_path))
     monkeypatch.setenv("DB_PATH", str(tmp_path / "butler.db"))
-    monkeypatch.setenv("CHROMA_DIR", str(tmp_path / "chroma"))
     monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
     monkeypatch.setenv("MODEL_PROVIDER", "openai")
     monkeypatch.setenv("OPENAI_MODEL", "env-model")

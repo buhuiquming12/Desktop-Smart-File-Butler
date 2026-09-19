@@ -54,7 +54,6 @@ def _make_llm(root: Path, count: int, dest: str = "archive"):
 def _setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, count: int, dest: str = "archive"):
     monkeypatch.setenv("SANDBOX_ROOTS", str(tmp_path))
     monkeypatch.setenv("DB_PATH", str(tmp_path / "butler.db"))
-    monkeypatch.setenv("CHROMA_DIR", str(tmp_path / "chroma"))
     monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
     get_settings.cache_clear()
     db._initialized = False

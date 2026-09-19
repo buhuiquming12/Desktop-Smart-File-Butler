@@ -20,7 +20,6 @@ def dirs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     (root_b / "b.txt").write_text("b", encoding="utf-8")
     monkeypatch.setenv("SANDBOX_ROOTS", str(root_a))  # .env 默认只允许 A
     monkeypatch.setenv("DB_PATH", str(tmp_path / "butler.db"))
-    monkeypatch.setenv("CHROMA_DIR", str(tmp_path / "chroma"))
     monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
     get_settings.cache_clear()
     db._initialized = False

@@ -36,7 +36,6 @@ def setup_logging(log_dir: str) -> None:
 
     # 降低第三方库噪音
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("chromadb").setLevel(logging.WARNING)
 
     _CONFIGURED = True
 

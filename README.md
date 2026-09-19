@@ -10,10 +10,9 @@
 ┌───────────────────────────────┐      同源 HTTP / WebSocket     ┌──────────────────────────────┐
 │  Electron 前端 (React + TS)    │  ◄──────────────────────────► │  Python 后端 (FastAPI)         │
 │  - 对话界面 ChatPanel          │   (生产:前端由后端同源托管)     │  - Agent 循环 (LangGraph)      │
-│  - 任务看板 TaskBoard          │                                │  - 工具集 (fs/extract/vector)  │
+│  - 任务看板 TaskBoard          │                                │  - 工具集 (fs/extract/分类)    │
 │  - 审批弹窗 ApprovalModal      │                                │  - SQLite (记忆/历史/审批快照) │
-│  - 设置页 Settings             │                                │  - Chroma (内容向量，可选检索) │
-│  - 主进程拉起后端 sidecar      │                                │  - APScheduler (定时整理)      │
+│  - 设置页 Settings             │                                │  - APScheduler (定时整理)      │
 └───────────────────────────────┘                                └──────────────────────────────┘
 ```
 
@@ -63,7 +62,7 @@ perceive(感知) → plan(规划) → act(工具调用) → reflect(反思) ─�
 │       └── tools/
 │           ├── filesystem.py    # 扫描/移动/重命名/建夹/删除(回收站)/回滚
 │           ├── extract.py       # PDF/Word/TXT/图片 OCR（分段 + 超时）
-│           ├── vectorstore.py   # Chroma 向量（检索用；分类已改为 LLM）
+│           ├── categories.py    # 扩展名粗分类（LLM 不可用时的回退）
 │           └── scheduler.py     # APScheduler 定时任务
 │       └── tests/               # pytest（沙箱/审批/回滚/递归/鉴权/摘要/分类等）
 └── frontend/
@@ -185,6 +184,5 @@ cd frontend && npm run typecheck        # 前端类型检查
 | `SANDBOX_ROOTS` | 允许操作的根目录（`;` 分隔），也可在设置界面覆盖 | `C:\Users\me\Downloads;C:\Users\me\Desktop` |
 | `TESSERACT_CMD` | Tesseract 可执行路径 | `C:\...\tesseract.exe` |
 | `DB_PATH` | SQLite 路径 | `./data/butler.db` |
-| `CHROMA_DIR` | Chroma 持久化目录 | `./data/chroma` |
 
 > 模型配置与沙箱根目录也可在设置界面修改，保存后覆盖 `.env` 默认值并立即生效。

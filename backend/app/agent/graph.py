@@ -22,7 +22,7 @@ from .. import db
 from ..logging_conf import get_logger
 from ..models import ScheduledJob
 from ..security import resolve_in_sandbox
-from ..tools import extract, filesystem, scheduler, vectorstore
+from ..tools import categories, extract, filesystem, scheduler
 from .llm import build_llm
 from .prompts import PLANNER_SYSTEM_PROMPT, REFLECTION_SYSTEM_PROMPT
 from .state import AgentState, PlanOutput, ReflectionOutput
@@ -576,20 +576,13 @@ class AgentRuntime:
     def _classify_file(self, file_path: str) -> Dict[str, Any]:
         path = resolve_in_sandbox(file_path, must_exist=True)
         ext = path.suffix.lower().lstrip(".")
-        rule = vectorstore.rule_category(ext)
+        rule = categories.rule_category(ext)
         text = ""
         if ext in _SUPPORTED_CONTENT_EXTS:
             text = extract.extract_text(str(path))
         has_content = bool(text.strip()) and not text.startswith("[")
         llm_category = self._llm_classify(path.name, rule, text) if has_content else None
         category = llm_category or rule
-        # 仍写入向量库供检索用（best-effort，失败不影响分类结果）。
-        vectorstore.index_file(
-            file_id=str(path),
-            text=text,
-            category=category,
-            metadata={"path": str(path), "extension": ext},
-        )
         return {"category": category, "rule_category": rule, "llm_category": llm_category}
 
     def _summarize_once(self, title: str, text: str, *, is_segment: bool = False) -> str:

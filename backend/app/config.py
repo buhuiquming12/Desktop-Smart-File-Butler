@@ -32,7 +32,6 @@ class Settings(BaseSettings):
 
     # 存储
     db_path: str = "./data/butler.db"
-    chroma_dir: str = "./data/chroma"
     log_dir: str = "./logs"
 
     # 服务
@@ -58,7 +57,6 @@ class Settings(BaseSettings):
         """确保数据 / 日志目录存在。"""
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         Path(self.log_dir).mkdir(parents=True, exist_ok=True)
-        Path(self.chroma_dir).mkdir(parents=True, exist_ok=True)
 
 
 @lru_cache
