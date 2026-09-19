@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  backend:
+    name: 后端测试 (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - name: 安装依赖
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: 运行测试
+        working-directory: backend
+        run: python -m pytest -q
+
+  frontend:
+    name: 前端类型检查 (tsc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: 安装依赖
+        working-directory: frontend
+        # 该项目锁定了较新/预览版工具链（TS 7、Vite 8 等），用 legacy-peer-deps 规避 peer 冲突。
+        run: npm install --legacy-peer-deps --no-audit --no-fund
+      - name: 类型检查
+        working-directory: frontend
+        run: npm run typecheck
