@@ -175,8 +175,8 @@ export function Settings(props: SettingsProps) {
             <div className="settings-section">
               <div><h3>服务连接</h3><p>前端仅连接本地后端；保存后会立即重新连接。</p></div>
               <div className="provider-card">
-                <strong>OpenAI 兼容 API</strong>
-                <p>模型服务的 Provider、模型名和 Base URL 等非敏感信息由后端配置提供。API Key 仅在后端 <code>.env</code> 中配置，前端不会读取、显示或保存密钥。</p>
+                <strong>模型服务</strong>
+                <p>Provider、模型名、Base URL 与 API Key 可在「模型配置」中修改。密钥仅保存在本地后端（<code>.env</code> 默认值或本地数据库覆盖项），保存后不会回传前端，也不会显示明文——界面只标记是否已配置。</p>
               </div>
               <label>本地 REST API 地址<input value={apiBase} onChange={(event) => setApiBase(event.target.value)} placeholder="http://127.0.0.1:8000" /></label>
               <label>本地 WebSocket 地址<input value={wsBase} onChange={(event) => setWsBase(event.target.value)} placeholder="ws://127.0.0.1:8000" /></label>
