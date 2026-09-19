@@ -592,8 +592,13 @@ class AgentRuntime:
             "error": "",
             "perception": {},
             "reflection": {},
+            "batch_approved": False,
+            "batch_rejected": False,
         }
-        return self.graph.stream(initial, self.config(thread_id), stream_mode="updates")
+        # updates：逐节点状态增量；messages：LLM token 流（点亮 P1-4 的 token 事件）。
+        return self.graph.stream(
+            initial, self.config(thread_id), stream_mode=["updates", "messages"]
+        )
 
     def resume_stream(
         self, thread_id: str, decision: Literal["approve", "reject"]
@@ -601,7 +606,7 @@ class AgentRuntime:
         return self.graph.stream(
             Command(resume={"decision": decision}),
             self.config(thread_id),
-            stream_mode="updates",
+            stream_mode=["updates", "messages"],
         )
 
     def state(self, thread_id: str) -> Dict[str, Any]:

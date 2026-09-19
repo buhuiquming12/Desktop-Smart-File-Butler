@@ -49,6 +49,8 @@ logger = get_logger(__name__)
 _runtime: Optional[AgentRuntime] = None
 _runtime_lock = threading.Lock()
 _background_tasks: Set[asyncio.Task[Any]] = set()
+# 用户请求中止的会话 id；执行循环在每个 update 边界检查并停止（P1-4）。
+_cancel_requested: Set[str] = set()
 
 # ---------------- 会话令牌与来源校验（P0-2） ----------------
 #
@@ -328,17 +330,52 @@ async def _emit_update(
             )
 
 
+async def _emit_token(client_id: Optional[str], thread_id: str, data: Any) -> None:
+    """把 LLM 自由文本 token 转成 token 事件；结构化输出（内容为空）自然被过滤（P1-4）。"""
+    if not client_id:
+        return
+    chunk = data[0] if isinstance(data, tuple) else data
+    content = getattr(chunk, "content", None)
+    if isinstance(content, str) and content:
+        await connections.send(client_id, _event(WSEventType.token, thread_id, token=content))
+
+
+async def _dispatch(client_id: Optional[str], thread_id: str, item: Any) -> None:
+    """区分多路 stream 输出：("messages"|"updates", data) 元组，或单模式 updates 字典。"""
+    if isinstance(item, tuple) and len(item) == 2 and item[0] in ("updates", "messages"):
+        mode, data = item
+        if mode == "messages":
+            await _emit_token(client_id, thread_id, data)
+        elif isinstance(data, dict):
+            await _emit_update(client_id, thread_id, data)
+    elif isinstance(item, dict):
+        await _emit_update(client_id, thread_id, item)
+
+
 async def _run_stream(
     iterator: Iterable[Dict[str, Any]], thread_id: str, client_id: Optional[str]
 ) -> Dict[str, Any]:
     """逐项消费同步 LangGraph 流，同时向 Electron 推送进度。"""
     try:
         while True:
-            has_item, update = await asyncio.to_thread(_next_update, iterator)
+            if thread_id in _cancel_requested:
+                _cancel_requested.discard(thread_id)
+                logger.info("会话 %s 被用户中止", thread_id)
+                if client_id:
+                    await connections.send(
+                        client_id,
+                        _event(
+                            WSEventType.done, thread_id,
+                            status="cancelled",
+                            message="任务已停止。当前步骤前的操作已保留，可在操作日志中查看或撤销。",
+                        ),
+                    )
+                return get_runtime().state(thread_id)
+            has_item, item = await asyncio.to_thread(_next_update, iterator)
             if not has_item:
                 break
-            if update:
-                await _emit_update(client_id, thread_id, update)
+            if item:
+                await _dispatch(client_id, thread_id, item)
 
         state = get_runtime().state(thread_id)
         if state.get("status") == "waiting_approval":
@@ -383,6 +420,7 @@ def _track(coro: Any) -> None:
 async def _start_chat(request: ChatRequest, fallback_client: Optional[str] = None) -> str:
     thread_id = request.thread_id or uuid.uuid4().hex
     client_id = request.client_id or fallback_client
+    _cancel_requested.discard(thread_id)  # 清除可能残留的中止请求
     iterator = get_runtime().start_stream(request.message.strip(), thread_id)
     await _run_stream(iterator, thread_id, client_id)
     return thread_id
@@ -544,6 +582,13 @@ def thread_state(thread_id: str) -> Dict[str, Any]:
     if not state:
         raise HTTPException(status_code=404, detail="会话不存在")
     return state
+
+
+@app.post("/api/threads/{thread_id}/cancel", status_code=status.HTTP_202_ACCEPTED)
+def cancel_thread(thread_id: str) -> Dict[str, str]:
+    """请求中止会话：执行循环在下一个步骤边界停止，已完成步骤保留（P1-4）。"""
+    _cancel_requested.add(thread_id)
+    return {"thread_id": thread_id, "status": "cancelling"}
 
 
 @app.post("/api/approvals/respond", status_code=status.HTTP_202_ACCEPTED)
@@ -717,6 +762,10 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str) -> None:
                         )
                     else:
                         _track(_resume_approval(response, client_id))
+                elif message_type == "cancel":
+                    cancel_thread_id = message.get("thread_id", "")
+                    if cancel_thread_id:
+                        _cancel_requested.add(cancel_thread_id)
                 elif message_type == "ping":
                     await websocket.send_json({"type": "pong"})
                 else:

@@ -165,10 +165,11 @@ export function App() {
         break;
       }
       case 'done': {
+        const cancelled = event.payload.status === 'cancelled';
         const finalText = payloadText(event.payload, 'message', 'content', 'result');
         if (finalText) updateAssistant(event.thread_id, finalText, false);
         setMessages((current) => current.map((message) => message.id === `assistant-${event.thread_id}` ? { ...message, pending: false } : message));
-        setTasks((current) => current.map((task) => task.threadId === event.thread_id && task.status === 'running' ? { ...task, status: 'success', updatedAt: now } : task));
+        setTasks((current) => current.map((task) => task.threadId === event.thread_id && task.status === 'running' ? { ...task, status: cancelled ? 'failed' : 'success', updatedAt: now } : task));
         setBusy(false);
         break;
       }
@@ -219,6 +220,16 @@ export function App() {
       }]);
     });
   }, [api, clientId, threadId]);
+
+  const stopChat = useCallback(() => {
+    if (!threadId) {
+      setBusy(false);
+      return;
+    }
+    if (!socketRef.current?.send({ type: 'cancel', thread_id: threadId })) {
+      void api.cancelThread(threadId).catch(() => undefined);
+    }
+  }, [api, threadId]);
 
   const decideApproval = useCallback(async (decision: ApprovalDecision) => {
     const approval = approvalQueue[0];
@@ -358,7 +369,7 @@ export function App() {
       </aside>
 
       <main className="workspace">
-        <ChatPanel messages={messages} connectionState={connectionState} busy={busy} onSend={sendChat} />
+        <ChatPanel messages={messages} connectionState={connectionState} busy={busy} onSend={sendChat} onStop={stopChat} />
         <TaskBoard tasks={tasks} onClear={clearCompleted} />
       </main>
 

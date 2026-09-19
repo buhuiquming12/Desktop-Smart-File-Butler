@@ -6,6 +6,7 @@ interface ChatPanelProps {
   connectionState: ConnectionState;
   busy: boolean;
   onSend: (message: string) => void;
+  onStop: () => void;
 }
 
 const suggestedPrompts = [
@@ -23,7 +24,7 @@ function connectionLabel(state: ConnectionState): string {
   }
 }
 
-export function ChatPanel({ messages, connectionState, busy, onSend }: ChatPanelProps) {
+export function ChatPanel({ messages, connectionState, busy, onSend, onStop }: ChatPanelProps) {
   const [draft, setDraft] = useState('');
   const endRef = useRef<HTMLDivElement>(null);
 
@@ -97,9 +98,15 @@ export function ChatPanel({ messages, connectionState, busy, onSend }: ChatPanel
         />
         <div className="composer__footer">
           <span>Enter 发送 · Shift + Enter 换行</span>
-          <button className="primary-button send-button" type="submit" disabled={!draft.trim() || busy}>
-            {busy ? '处理中' : '发送'} <span aria-hidden="true">→</span>
-          </button>
+          {busy ? (
+            <button className="secondary-button send-button" type="button" onClick={onStop}>
+              停止 <span aria-hidden="true">■</span>
+            </button>
+          ) : (
+            <button className="primary-button send-button" type="submit" disabled={!draft.trim()}>
+              发送 <span aria-hidden="true">→</span>
+            </button>
+          )}
         </div>
       </form>
     </section>

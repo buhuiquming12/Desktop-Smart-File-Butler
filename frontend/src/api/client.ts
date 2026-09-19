@@ -112,6 +112,10 @@ export class ApiClient {
     return this.request('/api/operations');
   }
 
+  cancelThread(threadId: string): Promise<unknown> {
+    return this.request(`/api/threads/${encodeURIComponent(threadId)}/cancel`, { method: 'POST' });
+  }
+
   rollbackOperation(opId: number): Promise<unknown> {
     return this.request(`/api/operations/${encodeURIComponent(String(opId))}/rollback`, { method: 'POST' });
   }
@@ -155,6 +159,7 @@ export class ApiClient {
 
 export type SocketMessage =
   | { type: 'chat'; message: string; thread_id?: string }
+  | { type: 'cancel'; thread_id: string }
   | ({ type: 'approval' } & ApprovalResponse);
 
 interface AgentSocketOptions {
