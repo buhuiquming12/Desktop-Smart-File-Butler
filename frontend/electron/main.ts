@@ -8,25 +8,62 @@ import path from 'node:path';
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const developmentUrl = process.env.VITE_DEV_SERVER_URL;
-// 生产模式下前端由后端 StaticFiles 同源托管（见 P0-1），Electron 直接加载后端 URL，
-// 使渲染进程 origin 与 /api、/ws 一致，彻底摆脱 CORS 与 opaque(null) origin。
+// 生产模式下前端由后端 StaticFiles 同源托管（P0-1），Electron loadURL 到后端，
+// 使渲染进程 origin 与 /api、/ws 一致，摆脱 CORS 与 opaque(null) origin。
 const fallbackBackendUrl = (process.env.BUTLER_BACKEND_URL ?? 'http://127.0.0.1:8000').replace(/\/+$/, '');
 
-// 后端启动时把 { token, host, port } 写入该会话文件（见 backend P0-2）。
-// 主进程读取后经 preload 注入渲染进程，供 REST/WS 鉴权。两端约定同一路径。
+// 供 preload 同步读取的会话信息；后端就绪后填充。
+let currentSession: { token: string; backendUrl: string } = { token: '', backendUrl: fallbackBackendUrl };
+let mainWindow: BrowserWindow | null = null;
+let allowedOrigin = new URL(developmentUrl ?? fallbackBackendUrl).origin;
+
 function sessionFilePath(): string {
   return process.env.BUTLER_SESSION_FILE ?? path.join(os.homedir(), '.desktop-smart-file-butler', 'session.json');
 }
 
+// ---- 启动 / 错误占位页，避免后端就绪前一片白屏 ----
+function htmlPage(body: string): string {
+  const doc = `<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<style>html,body{height:100%;margin:0}body{display:flex;align-items:center;justify-content:center;
+background:#f5f7fb;color:#334;font-family:system-ui,"Microsoft YaHei",sans-serif}
+.box{text-align:center;max-width:520px;padding:24px}.sp{width:38px;height:38px;margin:0 auto 18px;
+border:4px solid #d7deea;border-top-color:#4b6bfb;border-radius:50%;animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}h1{font-size:18px;margin:.4em 0}p{color:#6b7280;font-size:14px;line-height:1.6}
+code{background:#eef;padding:1px 5px;border-radius:4px}</style></head><body><div class="box">${body}</div></body></html>`;
+  return `data:text/html;charset=utf-8,${encodeURIComponent(doc)}`;
+}
+const LOADING_PAGE = htmlPage('<div class="sp"></div><h1>正在启动本地服务…</h1><p>首次启动需加载模型与索引组件，可能需要几秒。</p>');
+function errorPage(reason: string): string {
+  return htmlPage(
+    `<h1>无法连接本地后端</h1><p>${reason}</p>` +
+    `<p>请确认后端可启动；也可手动运行后端后重开应用：<br><code>cd backend &amp;&amp; python -m uvicorn app.main:app --port 8000</code></p>` +
+    `<p>如已自行启动后端，可设置环境变量 <code>BUTLER_NO_SPAWN=1</code> 让应用不再自行拉起。</p>`,
+  );
+}
+
 // ---- Python 后端 sidecar（P2 打包链路）----
-// Electron 主进程负责拉起后端进程，用户不必再手动开 uvicorn；退出时一并结束。
-// 可配置：BUTLER_NO_SPAWN=1 表示后端由用户自行启动（不 spawn）；
-// BUTLER_PYTHON 指定解释器；BUTLER_BACKEND_DIR 指定后端目录；BUTLER_BACKEND_CMD 完全自定义命令。
 let backendProcess: ChildProcess | null = null;
 
-function backendDir(): string {
-  // dist-electron/main.js -> 仓库根/backend（开发）；打包场景用 BUTLER_BACKEND_DIR 覆盖。
-  return process.env.BUTLER_BACKEND_DIR ?? path.join(currentDirectory, '..', '..', 'backend');
+/** 从多个根向上查找含 app/main.py 的 backend 目录，兼容打包后的多层嵌套布局。 */
+function findBackendDir(): string | null {
+  if (process.env.BUTLER_BACKEND_DIR) {
+    return existsSync(path.join(process.env.BUTLER_BACKEND_DIR, 'app', 'main.py'))
+      ? process.env.BUTLER_BACKEND_DIR
+      : null;
+  }
+  const starts = [currentDirectory, app.getAppPath(), process.resourcesPath, process.cwd()].filter(Boolean);
+  for (const start of starts) {
+    let dir = start as string;
+    for (let i = 0; i < 8; i += 1) {
+      if (existsSync(path.join(dir, 'app', 'main.py'))) return dir;
+      const candidate = path.join(dir, 'backend');
+      if (existsSync(path.join(candidate, 'app', 'main.py'))) return candidate;
+      const parent = path.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  }
+  return null;
 }
 
 function resolvePython(dir: string): string {
@@ -38,19 +75,18 @@ function resolvePython(dir: string): string {
   return process.platform === 'win32' ? 'python' : 'python3';
 }
 
-function startBackend(): void {
-  if (process.env.BUTLER_NO_SPAWN) return;  // 用户自行启动后端
-  const dir = backendDir();
-  if (!existsSync(dir)) {
-    console.warn('未找到后端目录，跳过 sidecar 启动：', dir);
-    return;
+function startBackend(): boolean {
+  if (process.env.BUTLER_NO_SPAWN) return true;  // 用户自行启动后端
+  const dir = findBackendDir();
+  if (!dir) {
+    console.warn('未找到后端目录（backend/app/main.py），跳过 sidecar 启动');
+    return false;
   }
   const url = new URL(fallbackBackendUrl);
   const port = url.port || '8000';
   let command: string;
   let args: string[];
   if (process.env.BUTLER_BACKEND_CMD) {
-    // 例如指向 PyInstaller 打出的独立 exe
     const parts = process.env.BUTLER_BACKEND_CMD.split(' ').filter(Boolean);
     command = parts[0] ?? 'python';
     args = parts.slice(1);
@@ -59,11 +95,14 @@ function startBackend(): void {
     args = ['-m', 'uvicorn', 'app.main:app', '--host', url.hostname || '127.0.0.1', '--port', port];
   }
   try {
+    console.log('启动后端 sidecar：', command, args.join(' '), '于', dir);
     backendProcess = spawn(command, args, { cwd: dir, stdio: 'inherit', env: process.env });
     backendProcess.on('error', (err) => console.error('后端 sidecar 启动失败：', err));
     backendProcess.on('exit', (code) => { console.log('后端 sidecar 退出，code=', code); backendProcess = null; });
+    return true;
   } catch (err) {
     console.error('无法拉起后端 sidecar：', err);
+    return false;
   }
 }
 
@@ -92,8 +131,7 @@ async function readSession(): Promise<SessionInfo | null> {
   }
 }
 
-// 后端与 Electron 进程解耦（见 P2 打包链路），启动顺序不确定；轮询等待会话文件出现。
-async function waitForSession(timeoutMs = 15_000): Promise<SessionInfo | null> {
+async function waitForSession(timeoutMs = 30_000): Promise<SessionInfo | null> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const session = await readSession();
@@ -112,7 +150,7 @@ function isTrustedExternalUrl(rawUrl: string): boolean {
   }
 }
 
-function createWindow(appUrl: string, token: string, backendUrl: string): void {
+function createWindow(): BrowserWindow {
   const window = new BrowserWindow({
     width: 1240,
     height: 820,
@@ -128,56 +166,76 @@ function createWindow(appUrl: string, token: string, backendUrl: string): void {
       nodeIntegration: false,
       sandbox: true,
       webSecurity: true,
-      // 令牌与后端地址经 argv 注入 preload；不走 IPC，避免渲染进程主动索取。
-      additionalArguments: [`--butler-token=${token}`, `--butler-backend=${backendUrl}`],
     },
   });
 
   window.once('ready-to-show', () => window.show());
   window.webContents.setWindowOpenHandler(({ url }) => {
-    if (isTrustedExternalUrl(url)) {
-      void shell.openExternal(url);
-    }
+    if (isTrustedExternalUrl(url)) void shell.openExternal(url);
     return { action: 'deny' };
   });
   window.webContents.on('will-navigate', (event, url) => {
-    // 仅允许在应用自身 origin 内导航；跨源导航一律拦截（外链走 openExternal）。
+    // 仅允许在应用自身 origin 内导航；data: 占位页与跨源导航按需放行/拦截。
+    if (url.startsWith('data:')) return;
     try {
-      const target = new URL(url);
-      const allowed = new URL(appUrl);
-      if (target.origin !== allowed.origin) {
-        event.preventDefault();
-      }
+      if (new URL(url).origin !== allowedOrigin) event.preventDefault();
     } catch {
       event.preventDefault();
     }
   });
 
-  void window.loadURL(appUrl);
+  void window.loadURL(LOADING_PAGE);  // 先展示启动页，避免白屏
+  return window;
 }
 
-// 原生目录选择器：返回所选目录绝对路径，供沙箱根目录配置使用（P1-3）。
+// 令牌经同步 IPC 提供给 preload；页面 reload 时会重新取到最新值。
+ipcMain.on('butler:session', (event) => {
+  event.returnValue = currentSession;
+});
+
+// 原生目录选择器（P1-3）。
 ipcMain.handle('butler:choose-directory', async () => {
   const result = await dialog.showOpenDialog({ properties: ['openDirectory', 'createDirectory'] });
   if (result.canceled || result.filePaths.length === 0) return null;
   return result.filePaths[0];
 });
 
-app.whenReady().then(async () => {
-  // 删除上一轮的会话文件，确保 waitForSession 读到本次新后端写入的新令牌，而非陈旧值。
+async function boot(): Promise<void> {
+  mainWindow = createWindow();  // 立即出窗，显示启动页
+
   if (!process.env.BUTLER_NO_SPAWN) {
+    // 删除旧会话文件，确保读到本次新后端写入的新令牌。
     await rm(sessionFilePath(), { force: true }).catch(() => undefined);
   }
-  startBackend();
+  const spawned = startBackend();
   const session = await waitForSession();
-  const backendUrl = session?.backendUrl ?? fallbackBackendUrl;
-  // 应用实际加载的地址：开发用 Vite dev server，生产用同源后端。
-  const appUrl = developmentUrl ?? backendUrl;
-  const token = session?.token ?? '';
 
-  createWindow(appUrl, token, backendUrl);
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+
+  if (developmentUrl) {
+    // 开发模式：UI 走 Vite，后端提供 API；令牌来自会话文件。
+    currentSession = { token: session?.token ?? '', backendUrl: session?.backendUrl ?? fallbackBackendUrl };
+    allowedOrigin = new URL(developmentUrl).origin;
+    void mainWindow.loadURL(developmentUrl);
+    return;
+  }
+
+  if (session) {
+    currentSession = { token: session.token, backendUrl: session.backendUrl };
+    allowedOrigin = new URL(session.backendUrl).origin;
+    void mainWindow.loadURL(session.backendUrl);
+  } else {
+    const reason = spawned
+      ? '后端进程已启动，但在 30 秒内未就绪（首次可能在下载/加载组件）。'
+      : '未能自动启动后端（未找到 backend 目录或 Python 环境）。';
+    void mainWindow.loadURL(errorPage(reason));
+  }
+}
+
+app.whenReady().then(async () => {
+  await boot();
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow(appUrl, token, backendUrl);
+    if (BrowserWindow.getAllWindows().length === 0) void boot();
   });
 });
 
