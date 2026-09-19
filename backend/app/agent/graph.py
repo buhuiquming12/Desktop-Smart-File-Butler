@@ -546,6 +546,33 @@ class AgentRuntime:
             logger.exception("工具执行失败 tool=%s args=%s", tool, args)
             return self._observation(step, "failed", error=str(exc))
 
+    def _llm_classify(self, name: str, rule: str, text: str) -> Optional[str]:
+        """让已配置的 LLM 依据文件名与内容摘要给出细分类别（P2：替代向量相似度分类）。
+
+        LLM 对中文更稳、不依赖嵌入模型下载，也避免相似度多数投票的自我强化。失败返回 None。
+        """
+        try:
+            response = self.llm.invoke(
+                [
+                    SystemMessage(content=(
+                        "你是文件分类助手。根据文件名与内容片段，给出一个简洁的中文类别词"
+                        "（如：发票、合同、简历、学习笔记、财务报表、产品截图、日志）。"
+                        "只输出类别词本身，不要解释、不要标点。"
+                    )),
+                    HumanMessage(content=f"文件名：{name}\n粗分类：{rule}\n内容片段：\n{text[:2000]}"),
+                ]
+            )
+            content = response.content if isinstance(response.content, str) else ""
+            category = content.strip().splitlines()[0].strip() if content.strip() else ""
+            # 清洗：去标点、限长，避免模型返回整句
+            category = re.sub(
+                r'[<>:"/\\|?*\x00-\x1f，。！？、；：（）()【】\[\]\s]+', "", category
+            )[:20]
+            return category or None
+        except Exception as exc:  # noqa: BLE001 - 分类失败不应中断整体流程，回退规则分类
+            logger.warning("LLM 分类失败 %s: %s", name, exc)
+            return None
+
     def _classify_file(self, file_path: str) -> Dict[str, Any]:
         path = resolve_in_sandbox(file_path, must_exist=True)
         ext = path.suffix.lower().lstrip(".")
@@ -553,15 +580,17 @@ class AgentRuntime:
         text = ""
         if ext in _SUPPORTED_CONTENT_EXTS:
             text = extract.extract_text(str(path))
-        semantic = vectorstore.suggest_category(text) if text else None
-        category = semantic or rule
+        has_content = bool(text.strip()) and not text.startswith("[")
+        llm_category = self._llm_classify(path.name, rule, text) if has_content else None
+        category = llm_category or rule
+        # 仍写入向量库供检索用（best-effort，失败不影响分类结果）。
         vectorstore.index_file(
             file_id=str(path),
             text=text,
             category=category,
             metadata={"path": str(path), "extension": ext},
         )
-        return {"category": category, "rule_category": rule, "semantic_category": semantic}
+        return {"category": category, "rule_category": rule, "llm_category": llm_category}
 
     def _summarize_once(self, title: str, text: str, *, is_segment: bool = False) -> str:
         role = (
