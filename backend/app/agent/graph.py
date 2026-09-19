@@ -82,6 +82,48 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str)
 
 
+_PLANNER_SAMPLE = 20        # 回灌给规划器的扫描样本条数
+_PLANNER_TEXT_CAP = 1000    # 回灌给规划器的长文本（如 extract_text）上限字符数
+
+
+def _summarize_observation(obs: Dict[str, Any]) -> Dict[str, Any]:
+    """把单条观察压缩后再喂给规划/反思，避免把 500 条扫描明细或整篇文本反复回灌（P1-5）。
+
+    完整清单仍保留在 state 里供工具使用，这里只产出摘要视图。
+    """
+    slim: Dict[str, Any] = {
+        "step_id": obs.get("step_id"),
+        "tool": obs.get("tool"),
+        "description": obs.get("description"),
+        "status": obs.get("status"),
+    }
+    if obs.get("error"):
+        slim["error"] = obs["error"]
+
+    result = obs.get("result")
+    if isinstance(result, dict) and isinstance(result.get("items"), list):
+        items = result["items"]
+        distribution: Dict[str, int] = {}
+        for item in items:
+            ext = (item.get("ext") or "无扩展名") if isinstance(item, dict) else "未知"
+            distribution[ext] = distribution.get(ext, 0) + 1
+        slim["result"] = {
+            "total": result.get("total", len(items)),
+            "truncated": result.get("truncated", False),
+            "extension_distribution": distribution,
+            "sample": items[:_PLANNER_SAMPLE],
+        }
+    elif isinstance(result, str) and len(result) > _PLANNER_TEXT_CAP:
+        slim["result"] = result[:_PLANNER_TEXT_CAP] + f"……（已截断，原文共 {len(result)} 字符）"
+    else:
+        slim["result"] = result
+    return slim
+
+
+def _summarize_observations(observations: list) -> list:
+    return [_summarize_observation(o) for o in observations]
+
+
 def _safe_summary_name(source: Path, output_name: Optional[str]) -> str:
     raw = output_name or f"{source.stem}_摘要.md"
     # 禁止把 output_name 当成路径逃逸；仅取文件名，并清除 Windows 非法字符。
@@ -166,7 +208,8 @@ class AgentRuntime:
             "用户目标": state.get("user_request", ""),
             "环境感知": state.get("perception", {}),
             "既有计划": state.get("plan", []),
-            "已获得观察": state.get("observations", []),
+            # 只喂摘要（总数 / 扩展名分布 / 前 20 条），完整清单留在 state 供工具用（P1-5）。
+            "已获得观察": _summarize_observations(state.get("observations", [])),
             "要求": (
                 "这是重规划。不要重复已经成功或被拒绝的步骤；请根据扫描/提取结果，"
                 "生成尚未完成的具体步骤。"
@@ -363,7 +406,7 @@ class AgentRuntime:
 
         plan = state.get("plan", [])
         index = state.get("step_index", 0)
-        latest = state.get("observations", [])[-1:] or []
+        latest = _summarize_observations(state.get("observations", [])[-1:])
         context = {
             "目标": state.get("user_request", ""),
             "当前计划": plan,
