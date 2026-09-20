@@ -146,11 +146,71 @@ def _build_checkpointer() -> SqliteSaver:
     return saver
 
 
-def cleanup_checkpoints(checkpointer: SqliteSaver, state_reader: Any, *, max_sessions: int = 100, max_age_days: int = 30) -> int:
-    """清理旧 checkpoint；待审批会话即使超出 TTL 也保留。"""
+# UUIDv6 的 60 位时间戳基准：1582-10-15 00:00:00（与 UUIDv1 相同的格里高利历纪元）。
+_UUID_EPOCH = datetime(1582, 10, 15, tzinfo=timezone.utc)
+
+
+def _checkpoint_created_at(checkpoint_id: Any) -> Optional[datetime]:
+    """从 checkpoint_id（UUIDv6）解析生成时刻；无法解析时返回 None。
+
+    langgraph 用自带的 uuid6() 生成 checkpoint_id，前 60 位是自 1582-10-15 起的
+    100 纳秒计数，因此 id 本身即时间序，无需额外的 created_at 列。
+
+    不能用 uuid.UUID.time：stdlib 的该属性按 UUIDv1 的字段布局取值，对 v6 会算出
+    相差数千年的时间（只有 langgraph 自带的 UUID 子类重写了它）。这里按 v6 布局
+    自行拼接：高 48 位放前 32+16 位，版本位之后放低 12 位。
+    """
+    try:
+        value = uuid.UUID(str(checkpoint_id))
+    except (ValueError, AttributeError, TypeError):
+        return None
+    if value.version != 6:
+        return None
+    high48 = value.int >> 80
+    intervals = (
+        ((high48 >> 16) << 28)
+        | ((high48 & 0xFFFF) << 12)
+        | ((value.int >> 64) & 0x0FFF)
+    )
+    return _UUID_EPOCH + timedelta(microseconds=intervals / 10)
+
+
+def cleanup_checkpoints(
+    checkpointer: SqliteSaver,
+    state_reader: Any,
+    *,
+    max_sessions: int = 100,
+    max_age_days: int = 30,
+) -> int:
+    """清理旧 checkpoint。
+
+    两项策略叠加（此前 max_age_days 是死代码：cutoff 算完从未使用）：
+      * 保留最近 ``max_sessions`` 个会话，无论多旧；
+      * 其余会话按 ``max_age_days`` 做 TTL 淘汰，超过才删除。
+
+    待审批会话（status=waiting_approval 或仍有 pending_approval）无条件保留：
+    删掉它们等于让用户永远无法再批准那个危险操作，正是 P1-6 要保住的东西。
+
+    表名以 sqlite_master 实测为准：langgraph 落库的副表叫 ``writes``，此前代码写的
+    ``checkpoint_writes`` 并不存在，DELETE 抛错后被 except 吞掉并 rollback，
+    导致整个函数从未真正删除过任何会话（连 max_sessions 名额截断也是失效的）。
+    """
     conn = getattr(checkpointer, "conn", None) or getattr(checkpointer, "connection", None)
     if conn is None:
         return 0
+    try:
+        tables = {
+            row[0]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+    except sqlite3.DatabaseError:
+        return 0
+    if "checkpoints" not in tables:
+        return 0
+    # 副表按存在与否删，缺表时跳过而不是让 DELETE 抛错把整批删除回滚掉。
+    delete_sql = [
+        f"DELETE FROM {name} WHERE thread_id=?" for name in ("writes", "checkpoints") if name in tables
+    ]
     try:
         rows = conn.execute("SELECT DISTINCT thread_id FROM checkpoints").fetchall()
     except sqlite3.DatabaseError:
@@ -169,19 +229,32 @@ def cleanup_checkpoints(checkpointer: SqliteSaver, state_reader: Any, *, max_ses
         except sqlite3.DatabaseError:
             latest = ""
         sessions.append((str(latest), thread_id))
+    # checkpoint_id 为 UUIDv6，十六进制字符串即时间序，倒序排列即由新到旧。
     sessions.sort(reverse=True)
+
     cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
-    # checkpoint_id 使用时间排序；保留最近 N 个，其余作为 TTL 候选。
-    victims = [thread_id for index, (_, thread_id) in enumerate(sessions) if index >= max_sessions]
+    victims = []
+    for index, (latest, thread_id) in enumerate(sessions):
+        if index < max_sessions:
+            continue  # 最近 max_sessions 个会话一律保留
+        created = _checkpoint_created_at(latest)
+        if created is None or created >= cutoff:
+            # 时间不可判定时宁可保留：清理是破坏性操作，取保守一侧。
+            continue
+        victims.append(thread_id)
+
     removed = 0
     for thread_id in victims:
         try:
-            conn.execute("DELETE FROM checkpoint_writes WHERE thread_id=?", (thread_id,))
-            conn.execute("DELETE FROM checkpoints WHERE thread_id=?", (thread_id,))
+            for sql in delete_sql:
+                conn.execute(sql, (thread_id,))
             conn.commit()
             removed += 1
         except sqlite3.DatabaseError:
+            logger.exception("checkpoint 清理失败 thread=%s，已回滚", thread_id)
             conn.rollback()
+    if removed:
+        logger.info("checkpoint 清理：删除 %d 个超过 %d 天的旧会话", removed, max_age_days)
     return removed
 
 
