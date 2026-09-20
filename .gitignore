@@ -12,6 +12,9 @@ dist/
 .mypy_cache/
 .ruff_cache/
 .pytest_cache/
+# pytest --basetemp 的固定落点（CI 与本地验证命令均使用，见 README/CI）
+.pytest-tmp/
+backend/.pytest-tmp/
 .tox/
 .nox/
 .coverage
