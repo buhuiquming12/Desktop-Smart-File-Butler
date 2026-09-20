@@ -292,112 +292,18 @@ async def _fail_terminal(
 async def _emit_update(
     client_id: Optional[str], thread_id: str, update: Dict[str, Any]
 ) -> None:
+    """转发流更新事件（实现见 api.events.emit_update，此处只做依赖注入）。"""
     await ws_events.emit_update(connections.send, get_runtime().state, client_id, thread_id, update)
-    return
-
-    if not client_id:
-        return
-
-    # LangGraph update 通常形如 {"node_name": {state delta}}。
-    for node, delta in update.items():
-        if node == "__interrupt__":
-            state = get_runtime().state(thread_id)
-            pending = state.get("pending_approval") or {}
-            if pending:
-                await connections.send(
-                    client_id,
-                    _event(WSEventType.approval_required, thread_id, **pending),
-                )
-            continue
-
-        safe_delta = delta if isinstance(delta, dict) else {"value": str(delta)}
-        await connections.send(
-            client_id,
-            _event(WSEventType.node, thread_id, node=node, status=safe_delta.get("status")),
-        )
-
-        current = safe_delta.get("current_step")
-        if node == "act" and current:
-            await connections.send(
-                client_id,
-                _event(
-                    WSEventType.tool_call,
-                    thread_id,
-                    tool=current.get("tool", ""),
-                    name=current.get("tool", ""),
-                    task_id=current.get("id", ""),
-                    detail=current.get("description", ""),
-                    args=current.get("args", {}),
-                ),
-            )
-
-        observations = safe_delta.get("observations")
-        if observations:
-            latest = observations[-1]
-            await connections.send(
-                client_id,
-                _event(
-                    WSEventType.tool_result,
-                    thread_id,
-                    tool=latest.get("tool", ""),
-                    name=latest.get("tool", ""),
-                    task_id=latest.get("step_id", ""),
-                    detail=latest.get("error") or str(latest.get("result", "")),
-                    success=latest.get("status") == "ok",
-                    status=latest.get("status", ""),
-                    observation=latest,
-                ),
-            )
-            task_status = {
-                "ok": "success",
-                "failed": "failed",
-                "rejected": "failed",
-            }.get(latest.get("status"), "running")
-            await connections.send(
-                client_id,
-                _event(
-                    WSEventType.task,
-                    thread_id,
-                    task_id=latest.get("step_id"),
-                    title=latest.get("tool") or "文件任务",
-                    description=latest.get("description"),
-                    detail=latest.get("error") or latest.get("description", ""),
-                    status=task_status,
-                    tool=latest.get("tool"),
-                    error=latest.get("error", ""),
-                ),
-            )
-
-        pending = safe_delta.get("pending_approval")
-        if pending:
-            await connections.send(
-                client_id,
-                _event(WSEventType.approval_required, thread_id, **pending),
-            )
 
 
 async def _emit_token(client_id: Optional[str], thread_id: str, data: Any) -> None:
     """把 LLM 自由文本 token 转成 token 事件；结构化输出（内容为空）自然被过滤（P1-4）。"""
     await ws_events.emit_token(connections.send, client_id, thread_id, data)
-    return
-    chunk = data[0] if isinstance(data, tuple) else data
-    content = getattr(chunk, "content", None)
-    if isinstance(content, str) and content:
-        await connections.send(client_id, _event(WSEventType.token, thread_id, token=content))
 
 
 async def _dispatch(client_id: Optional[str], thread_id: str, item: Any) -> None:
     """区分多路 stream 输出：("messages"|"updates", data) 元组，或单模式 updates 字典。"""
     await ws_events.dispatch(connections.send, get_runtime().state, client_id, thread_id, item)
-    return
-    if isinstance(item, tuple) and len(item) == 2 and item[0] in ("updates", "messages"):
-        mode, data = item
-        if mode == "messages":
-            await _emit_token(client_id, thread_id, data)
-        elif isinstance(data, dict):
-            await _emit_update(client_id, thread_id, data)
-    elif isinstance(item, dict):
-        await _emit_update(client_id, thread_id, item)
 
 
 async def _run_stream(
