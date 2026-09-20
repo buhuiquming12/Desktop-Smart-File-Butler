@@ -42,11 +42,13 @@ def _conn() -> Iterator[sqlite3.Connection]:
     settings = get_settings()
     conn = sqlite3.connect(settings.db_path, timeout=10)
     conn.row_factory = sqlite3.Row
-    # WAL 让 APScheduler 线程与 API 线程的读写并发不再互相阻塞成 "database is locked"；
-    # busy_timeout 兜底等待锁，而非立即失败（P2）。
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
+    # busy_timeout 必须排在任何可能取锁的语句之前：切换 journal_mode 需要写锁，
+    # 先设好等待时长才能等到锁，而不是立刻抛 "database is locked"（B9）。
     conn.execute("PRAGMA busy_timeout=10000")
+    # synchronous 是连接级设置，每条连接都要设（P2）。
+    conn.execute("PRAGMA synchronous=NORMAL")
+    # journal_mode=WAL 是写进库头的持久属性，只在建库时设置一次即可（见 init_db）。
+    # 此前每条连接都重复设置，等于每次连接都去抢一次写锁，是多余的争用来源。
     try:
         yield conn
         conn.commit()
@@ -60,6 +62,9 @@ def init_db() -> None:
         if _initialized:
             return
         with _conn() as c:
+            # WAL 让 APScheduler 线程与 API 线程的读写并发不再互相阻塞成
+            # "database is locked"（P2）。该属性持久化在库头，建库时设一次即可。
+            c.execute("PRAGMA journal_mode=WAL")
             c.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS operation_log (

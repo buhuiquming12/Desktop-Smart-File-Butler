@@ -64,8 +64,14 @@ def _fire(directory: str, instruction: str) -> None:
             logger.info("跳过同目录重复定时任务: %s", directory)
             return
         _running_directories.add(directory)
-    _executor.submit(_run_job, directory, instruction)
-    return
+    try:
+        _executor.submit(_run_job, directory, instruction)
+    except RuntimeError:
+        # 线程池已关闭（进程正在退出，或测试中 lifespan 已 shutdown 过）：必须收回
+        # 标记，否则该目录会被永久判定为“正在运行”，此后再也不会触发（B9）。
+        with _running_lock:
+            _running_directories.discard(directory)
+        logger.error("定时任务无法提交执行（线程池已关闭）: %s", directory)
 
 
 def _run_job(directory: str, instruction: str) -> None:
