@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AgentSocket, ApiClient, DEFAULT_API_BASE, DEFAULT_WS_BASE } from './api/client';
+import { helpText, isCommandName, type SlashCommandName } from './commands';
 import { ApprovalModal } from './components/ApprovalModal';
 import { ChatPanel } from './components/ChatPanel';
 import { Settings, type SettingsTab } from './components/Settings';
@@ -104,6 +105,14 @@ export function App() {
   // B2 心跳：最后一次收到后端事件的时刻，供 busy 看门狗判定是否已失联。
   const lastActivityRef = useRef<number>(Date.now());
   const api = useMemo(() => new ApiClient(apiBase), [apiBase]);
+
+  // 正在运行的后台/定时会话：它们的进度只存在 threadViews 里（任务看板只看当前会话），
+  // 因此用「结束」按钮上的计数把它们暴露出来，否则用户根本不知道还有东西在跑。
+  const runningBackgroundIds = useMemo(
+    () => Object.entries(threadViews).filter(([, view]) => view.busy).map(([id]) => id),
+    [threadViews],
+  );
+  const runningCount = runningBackgroundIds.length + (busy ? 1 : 0);
 
   const updateAssistant = useCallback((eventThreadId: string, content: string, append: boolean, error = false) => {
     setMessages((current) => {
@@ -281,15 +290,53 @@ export function App() {
     });
   }, [api, clientId, threadId]);
 
-  const stopChat = useCallback(() => {
-    if (!threadId) {
-      setBusy(false);
-      return;
-    }
-    if (!socketRef.current?.send({ type: 'cancel', thread_id: threadId })) {
-      void api.cancelThread(threadId).catch(() => undefined);
-    }
-  }, [api, threadId]);
+  /** 单线程取消：优先走 WS，发送失败时回落 REST。取消只在执行循环的步骤边界生效。 */
+  const requestCancel = useCallback((targetId: string) => {
+    if (socketRef.current?.send({ type: 'cancel', thread_id: targetId })) return;
+    void api.cancelThread(targetId).catch(() => undefined);
+  }, [api]);
+
+  /**
+   * 结束所有正在运行的工作流：当前会话与后台/定时会话一视同仁。
+   *
+   * 后台/定时会话此前没有任何停止入口（任务看板只显示当前会话的任务），定时任务一旦
+   * 跑起来就只能等它自己结束——这是「没办法自己结束工作流」的根因。
+   */
+  const endWorkflows = useCallback(() => {
+    const targets = busy && threadId ? [threadId, ...runningBackgroundIds] : [...runningBackgroundIds];
+    if (targets.length === 0) return;
+    targets.forEach(requestCancel);
+    setMessages((current) => [...current, {
+      id: createId('system'),
+      role: 'system',
+      content: `已请求结束 ${targets.length} 个正在运行的工作流。后端会在下一个步骤边界停止；停在等待审批的会话会在此后恢复时停止。`,
+      timestamp: new Date().toISOString(),
+    }]);
+  }, [busy, requestCancel, runningBackgroundIds, threadId]);
+
+  /** 清空当前对话视图，下一条消息开启新会话；后端记录与操作日志不受影响。 */
+  const startNewConversation = useCallback(() => {
+    setThreadId(undefined);
+    threadIdRef.current = undefined;
+    setActiveThreadId(undefined);
+    setTasks([]);
+    setBusy(false);
+    setMessages([{
+      id: createId('system'),
+      role: 'system',
+      content: '已开始新会话。此前会话的文件操作记录仍在「操作日志」中；若要撤销那批操作，请在开启新会话前使用 /撤销。',
+      timestamp: new Date().toISOString(),
+    }]);
+  }, []);
+
+  const showHelp = useCallback(() => {
+    setMessages((current) => [...current, {
+      id: createId('system'),
+      role: 'system',
+      content: helpText(),
+      timestamp: new Date().toISOString(),
+    }]);
+  }, []);
 
   const decideApproval = useCallback(async (decision: ApprovalDecision) => {
     const approval = approvalQueue[0];
@@ -326,10 +373,59 @@ export function App() {
     if (settingsOpen) void loadSettingsData();
   }, [loadSettingsData, settingsOpen]);
 
-  const openSettings = (tab: SettingsTab): void => {
+  const openSettings = useCallback((tab: SettingsTab): void => {
     setSettingsTab(tab);
     setSettingsOpen(true);
-  };
+  }, []);
+
+  /** 撤销本次会话已完成的文件操作（复用 /api/threads/{id}/rollback）。 */
+  const rollbackCurrentThread = useCallback(async () => {
+    const targetId = threadIdRef.current;
+    const notice = (content: string, error = false): void => {
+      setMessages((current) => [...current, { id: createId('system'), role: 'system', content, timestamp: new Date().toISOString(), error }]);
+    };
+    if (!targetId) {
+      notice('当前没有可撤销的会话。', true);
+      return;
+    }
+    try {
+      await api.rollbackThread(targetId);
+      notice('已撤销本次会话中可撤销的文件操作，详情见「操作日志」。');
+      void loadSettingsData();
+    } catch (error) {
+      notice(error instanceof Error ? `撤销失败：${error.message}` : '撤销失败', true);
+    }
+  }, [api, loadSettingsData]);
+
+  /**
+   * 斜杠指令分发。
+   *
+   * handlers 用 `Record<SlashCommandName, ...>` 声明：目录里新增指令却没在这里接上，
+   * tsc 会直接报缺键，不必等运行时才发现点了没反应。
+   */
+  const runCommand = useCallback((name: string): void => {
+    if (!isCommandName(name)) {
+      setMessages((current) => [...current, {
+        id: createId('system'),
+        role: 'system',
+        content: `未知指令 /${name}，输入 /帮助 查看可用指令。`,
+        timestamp: new Date().toISOString(),
+        error: true,
+      }]);
+      return;
+    }
+    const handlers: Record<SlashCommandName, () => void> = {
+      '结束': endWorkflows,
+      '新会话': startNewConversation,
+      '撤销': () => void rollbackCurrentThread(),
+      '日志': () => openSettings('logs'),
+      '任务': () => openSettings('schedules'),
+      '模型': () => openSettings('model'),
+      '设置': () => openSettings('preferences'),
+      '帮助': showHelp,
+    };
+    handlers[name]();
+  }, [endWorkflows, openSettings, rollbackCurrentThread, showHelp, startNewConversation]);
 
   const saveEndpoints = (newApiBase: string, newWsBase: string): void => {
     if (!newApiBase || !newWsBase) return;
@@ -436,7 +532,15 @@ export function App() {
       </aside>
 
       <main className="workspace">
-        <ChatPanel messages={activeThreadId && threadViews[activeThreadId] ? threadViews[activeThreadId].messages : messages} connectionState={connectionState} busy={activeThreadId && threadViews[activeThreadId] ? threadViews[activeThreadId].busy : busy} onSend={sendChat} onStop={stopChat} />
+        <ChatPanel
+          messages={activeThreadId && threadViews[activeThreadId] ? threadViews[activeThreadId].messages : messages}
+          connectionState={connectionState}
+          busy={activeThreadId && threadViews[activeThreadId] ? threadViews[activeThreadId].busy : busy}
+          runningCount={runningCount}
+          onSend={sendChat}
+          onEnd={endWorkflows}
+          onCommand={runCommand}
+        />
         <TaskBoard tasks={activeThreadId && threadViews[activeThreadId] ? threadViews[activeThreadId].tasks : tasks} onClear={clearCompleted} />
       </main>
 

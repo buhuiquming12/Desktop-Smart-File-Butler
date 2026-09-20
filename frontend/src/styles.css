@@ -95,12 +95,20 @@ h3 { margin: 0; font-size: 15px; }
 .typing { display: flex; gap: 3px; margin-top: 7px; }
 .typing i { width: 4px; height: 4px; border-radius: 50%; background: #9ca2b0; animation: typing 1s infinite ease-in-out; }
 .typing i:nth-child(2) { animation-delay: .15s; }.typing i:nth-child(3) { animation-delay: .3s; }
-.composer { margin: 0 22px 20px; border: 1px solid #dfe2e9; border-radius: 12px; background: white; box-shadow: 0 6px 20px rgba(30,40,70,.05); transition: .15s; }
+.composer { position: relative; margin: 0 22px 20px; border: 1px solid #dfe2e9; border-radius: 12px; background: white; box-shadow: 0 6px 20px rgba(30,40,70,.05); transition: .15s; }
 .composer:focus-within { border-color: #a9a9eb; box-shadow: 0 0 0 3px rgba(92,92,226,.08); }
 .composer textarea { width: 100%; min-height: 58px; padding: 13px 14px 7px; border: 0; outline: 0; resize: none; color: var(--text); background: transparent; font-size: 12px; line-height: 1.5; }
 .composer textarea::placeholder { color: #a1a7b4; }
 .composer__footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 7px 8px 8px 14px; }
 .composer__footer > span { color: #a1a7b4; font-size: 8px; }
+.composer__actions { display: flex; gap: 8px; }
+/* 指令面板挂在输入框上方，不挤压消息区。 */
+.command-menu { position: absolute; bottom: calc(100% + 6px); left: 0; right: 0; z-index: 20; padding: 4px; border: 1px solid #dfe2e9; border-radius: 10px; background: white; box-shadow: 0 12px 30px rgba(30,40,70,.12); }
+.command-menu__item { display: flex; align-items: baseline; gap: 8px; padding: 7px 9px; border-radius: 7px; cursor: pointer; }
+.command-menu__item--active { background: var(--primary-soft); }
+.command-menu__item code { color: var(--primary); font-size: 11px; font-weight: 700; }
+.command-menu__item span { color: #6b7280; font-size: 10px; }
+.command-menu__empty { padding: 7px 9px; color: #a1a7b4; font-size: 10px; }
 
 .primary-button, .secondary-button, .danger-button { min-height: 34px; padding: 8px 13px; border-radius: 8px; font-size: 11px; font-weight: 700; cursor: pointer; }
 .primary-button { border: 1px solid var(--primary); color: white; background: var(--primary); }

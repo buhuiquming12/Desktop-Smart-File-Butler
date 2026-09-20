@@ -1,5 +1,13 @@
 import { reconnectDelay } from './api/client';
 import {
+  SLASH_COMMANDS,
+  commandQuery,
+  exactCommand,
+  helpText,
+  isCommandName,
+  matchCommands,
+} from './commands';
+import {
   BUSY_STALL_TIMEOUT_MS,
   addToApprovalQueue,
   approvalOrigin,
@@ -91,3 +99,36 @@ if (shortThreadId('scheduled-ffffffff') === shortThreadId('scheduled-abc12345'))
   throw new Error('B3: 不同定时任务会话无法区分');
 }
 if (shortThreadId('short') !== 'short') throw new Error('B3: 短会话 id 不应截断');
+
+// ---- B11：斜杠指令面板 ----
+
+// 只是敲下 `/` 就该展开完整目录，因此过滤词为空串而不是 null。
+if (commandQuery('/') !== '') throw new Error('B11: 单独的 / 未进入指令模式');
+if (commandQuery('  /结束  ') !== '结束') throw new Error('B11: 指令词未 trim');
+if (commandQuery('整理下载目录') !== null) throw new Error('B11: 普通消息被误判为指令');
+if (commandQuery('/结束 顺便清一下下载目录') !== null) throw new Error('B11: 指令后带正文时不应拦截');
+if (commandQuery('/新会话') !== '新会话') throw new Error('B11: 多字指令名解析错误');
+
+// 空查询给全量目录：面板刚展开时不能是空的。
+if (matchCommands('').length !== SLASH_COMMANDS.length) throw new Error('B11: 空查询未返回完整目录');
+// 子串匹配：中文指令名没有词边界，按前缀匹配会让「会话」这类输入永远匹配不上。
+if (!matchCommands('会话').some((command) => command.name === '新会话')) throw new Error('B11: 子串匹配失效');
+if (matchCommands('').length === 0) throw new Error('B11: 指令目录为空');
+if (matchCommands('这不可能匹配到任何指令').length !== 0) throw new Error('B11: 无匹配时应返回空列表');
+
+// Enter 直接执行：只有输入与指令完全同名才算，半截输入交给高亮项。
+if (exactCommand('/结束')?.name !== '结束') throw new Error('B11: 完整指令名未识别');
+if (exactCommand('/结') !== null) throw new Error('B11: 半截输入不应直接执行');
+if (exactCommand('结束') !== null) throw new Error('B11: 缺少前导斜杠不应识别为指令');
+if (exactCommand('/结束 现在') !== null) throw new Error('B11: 带正文的输入不应识别为指令');
+
+// 指令名收窄函数是 App 分发前的唯一门禁，必须挡住目录外的输入。
+if (!isCommandName('结束')) throw new Error('B11: 合法指令被拒');
+if (isCommandName('不存在的指令')) throw new Error('B11: 未知指令未被挡住');
+if (isCommandName('')) throw new Error('B11: 空指令名未被挡住');
+
+// /帮助 与面板同源：目录里每条指令都要能在帮助里找到，否则用户看的指令表是残的。
+const help = helpText();
+for (const command of SLASH_COMMANDS) {
+  if (!help.includes(`/${command.name} `)) throw new Error(`B11: 帮助缺少指令 ${command.name}`);
+}
