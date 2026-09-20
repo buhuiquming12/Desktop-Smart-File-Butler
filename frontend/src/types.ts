@@ -126,7 +126,7 @@ export interface SandboxSettings {
   env_roots: string[];
 }
 
-/** preload 注入的桌面桥接对象（见 electron/preload.ts）。 */
+/** preload 注入的桌面桥接对象（见 electron/preload.cts）。 */
 export interface DesktopBridge {
   platform: string;
   sessionToken: string;

@@ -161,7 +161,8 @@ function createWindow(): BrowserWindow {
     show: false,
     autoHideMenuBar: true,
     webPreferences: {
-      preload: path.join(currentDirectory, 'preload.js'),
+      // 必须是 CJS：sandbox 预加载不支持 ESM，故 preload 源码用 .cts 编译出 preload.cjs。
+      preload: path.join(currentDirectory, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
