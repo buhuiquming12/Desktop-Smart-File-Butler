@@ -92,7 +92,8 @@ export function reduceThreadEvent(view: ThreadViewState, event: WSEvent, now = n
     }
     case 'done':
     case 'error': {
-      const failed = event.type === 'error' || event.payload.status === 'cancelled';
+      // B1：后端终态统一为 done(status=failed|completed)，error 类型仅用于非终态诊断。
+      const failed = event.type === 'error' || event.payload.status === 'failed' || event.payload.status === 'cancelled';
       const text = payloadText(event.payload, 'message', 'error', 'detail', 'content', 'result');
       if (text) next.messages = updateAssistant(next.messages, event.thread_id, text, false, failed);
       next.messages = next.messages.map((message) => message.id === `assistant-${event.thread_id}` ? { ...message, pending: false } : message);

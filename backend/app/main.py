@@ -248,6 +248,32 @@ def _event(event_type: WSEventType, thread_id: str, **payload: Any) -> WSEvent:
     return WSEvent(type=event_type, thread_id=thread_id, payload=payload)
 
 
+async def _fail_terminal(
+    client_id: Optional[str], thread_id: str, message: str, *, detail: str = ""
+) -> None:
+    """广播唯一的终态失败事件（B1 错误广播不变量）。
+
+    任何会话启动 / 执行失败都必须经由这里收尾：前端只认终态事件来解除 busy，
+    一旦有失败路径绕过它，界面就会永久停在“处理中”。message 面向用户且可审计，
+    detail 保留原始异常文本供排查。
+    """
+    if not client_id:
+        return
+    try:
+        await connections.send(
+            client_id,
+            _event(
+                WSEventType.done,
+                thread_id,
+                status="failed",
+                message=message,
+                error=detail or message,
+            ),
+        )
+    except Exception:  # noqa: BLE001 - 兜底广播本身失败时不应再抛出，避免掩盖原始错误
+        logger.exception("广播终态失败事件时出错 thread=%s", thread_id)
+
+
 async def _emit_update(
     client_id: Optional[str], thread_id: str, update: Dict[str, Any]
 ) -> None:
@@ -394,14 +420,15 @@ async def _run_stream(
                 )
             return state
 
-        event_type = WSEventType.error if state.get("status") == "failed" else WSEventType.done
+        # 终态统一走 done（status=completed|failed），WSEventType.error 只留给非终态诊断（B1）。
+        final_status = state.get("status")
         if client_id:
             await connections.send(
                 client_id,
                 _event(
-                    event_type,
+                    WSEventType.done,
                     thread_id,
-                    status=state.get("status"),
+                    status=final_status,
                     message=state.get("final_response", ""),
                     error=state.get("error", ""),
                     observations=state.get("observations", []),
@@ -410,25 +437,41 @@ async def _run_stream(
         return state
     except Exception as exc:  # noqa: BLE001
         logger.exception("Agent 执行失败 thread=%s", thread_id)
-        if client_id:
-            await connections.send(
-                client_id,
-                _event(WSEventType.error, thread_id, message=str(exc)),
-            )
+        await _fail_terminal(client_id, thread_id, f"任务执行失败：{exc}", detail=str(exc))
         return {"thread_id": thread_id, "status": "failed", "error": str(exc)}
+
+
+def _log_task_failure(task: asyncio.Task[Any]) -> None:
+    """记录后台任务的未取异常。B1 中正是这类静默吞异常让界面卡死无迹可寻。"""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("后台任务异常终止（前端可能未收到终态事件）", exc_info=exc)
 
 
 def _track(coro: Any) -> None:
     task = asyncio.create_task(coro)
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
+    task.add_done_callback(_log_task_failure)
 
 
 async def _start_chat(request: ChatRequest, fallback_client: Optional[str] = None) -> str:
     thread_id = request.thread_id or uuid.uuid4().hex
     client_id = request.client_id or fallback_client
     _cancel_requested.discard(thread_id)  # 清除可能残留的中止请求
-    iterator = get_runtime().start_stream(request.message.strip(), thread_id)
+
+    # get_runtime() 与 start_stream() 位于 _run_stream 的异常捕获之外：模型未配置时
+    # AgentRuntime 构造即失败，异常被 _track 吞掉，前端永远等不到终态事件而永久 busy（B1）。
+    # 这里显式兜底，保证任何启动失败都会广播 done(status=failed)。
+    try:
+        iterator = get_runtime().start_stream(request.message.strip(), thread_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("启动会话失败 thread=%s", thread_id)
+        await _fail_terminal(client_id, thread_id, f"无法启动会话：{exc}", detail=str(exc))
+        return thread_id
+
     await _run_stream(iterator, thread_id, client_id)
     return thread_id
 
@@ -436,14 +479,27 @@ async def _start_chat(request: ChatRequest, fallback_client: Optional[str] = Non
 async def _resume_approval(
     response: ApprovalResponse, fallback_client: Optional[str] = None
 ) -> str:
-    state = get_runtime().state(response.thread_id)
-    pending = state.get("pending_approval") or {}
-    if not pending:
-        raise HTTPException(status_code=409, detail="该会话没有待审批操作")
-    if pending.get("approval_id") != response.approval_id:
-        raise HTTPException(status_code=409, detail="审批已过期或不匹配")
+    try:
+        state = get_runtime().state(response.thread_id)
+        pending = state.get("pending_approval") or {}
+        if not pending:
+            raise HTTPException(status_code=409, detail="该会话没有待审批操作")
+        if pending.get("approval_id") != response.approval_id:
+            raise HTTPException(status_code=409, detail="审批已过期或不匹配")
 
-    iterator = get_runtime().resume_stream(response.thread_id, response.decision.value)
+        iterator = get_runtime().resume_stream(response.thread_id, response.decision.value)
+    except HTTPException as exc:
+        if fallback_client is None:
+            raise  # REST 调用方依赖 4xx 语义自行处理
+        # WS 调用方：_track 会吞掉异常，必须在此广播终态，否则界面卡死（B1）。
+        logger.warning("恢复会话被拒 thread=%s: %s", response.thread_id, exc.detail)
+        await _fail_terminal(fallback_client, response.thread_id, str(exc.detail))
+        return response.thread_id
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("恢复会话失败 thread=%s", response.thread_id)
+        await _fail_terminal(fallback_client, response.thread_id, f"无法恢复会话：{exc}", detail=str(exc))
+        return response.thread_id
+
     await _run_stream(iterator, response.thread_id, fallback_client)
     return response.thread_id
 

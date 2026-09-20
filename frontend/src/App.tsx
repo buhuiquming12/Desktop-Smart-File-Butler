@@ -181,11 +181,13 @@ export function App() {
         break;
       }
       case 'done': {
-        const cancelled = event.payload.status === 'cancelled';
+        // B1：后端已把失败统一收敛为 done(status=failed)，此处必须按失败呈现，
+        // 否则用户只看到一句普通回复，无从得知任务其实失败了。
+        const failed = event.payload.status === 'failed' || event.payload.status === 'cancelled';
         const finalText = payloadText(event.payload, 'message', 'content', 'result');
-        if (finalText) updateAssistant(event.thread_id, finalText, false);
+        if (finalText) updateAssistant(event.thread_id, finalText, false, failed);
         setMessages((current) => current.map((message) => message.id === `assistant-${event.thread_id}` ? { ...message, pending: false } : message));
-        setTasks((current) => current.map((task) => task.threadId === event.thread_id && task.status === 'running' ? { ...task, status: cancelled ? 'failed' : 'success', updatedAt: now } : task));
+        setTasks((current) => current.map((task) => task.threadId === event.thread_id && task.status === 'running' ? { ...task, status: failed ? 'failed' : 'success', updatedAt: now } : task));
         setBusy(false);
         break;
       }
