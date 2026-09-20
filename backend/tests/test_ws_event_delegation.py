@@ -39,6 +39,18 @@ class _Runtime:
         return self._state
 
 
+class _UntouchableRuntime:
+    """一旦读取会话状态就失败。
+
+    ``_dispatch`` 是构造 ``AgentRuntime`` 的入口（形参 ``get_runtime().state``），
+    但 messages/token 路径根本不读 state。本文件测的是事件委派，不该顺带依赖
+    环境里的模型配置：本地 ``.env`` 有占位 Key、CI 没有，同样的代码会一个过一个挂。
+    """
+
+    def state(self, thread_id: str) -> Dict[str, Any]:
+        raise AssertionError(f"messages 路径不应读取会话状态（thread={thread_id}）")
+
+
 class _Chunk:
     """模拟 LLM 流式 chunk；结构化输出时 content 为空串。"""
 
@@ -56,6 +68,8 @@ def recorder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Recorder:
     db.init_db()
     rec = _Recorder()
     monkeypatch.setattr(main, "connections", rec)
+    # 默认桩：需要会话状态的用例自行覆盖它（见下方 _Runtime）。
+    monkeypatch.setattr(main, "get_runtime", lambda: _UntouchableRuntime())
     yield rec
     get_settings.cache_clear()
     db._initialized = False
@@ -70,7 +84,7 @@ def test_dispatch_routes_updates_items(recorder: _Recorder, monkeypatch: pytest.
 
 
 def test_dispatch_routes_messages_items(recorder: _Recorder) -> None:
-    """messages 模式 → token 事件，载荷为 chunk 文本。"""
+    """messages 模式 → token 事件，载荷为 chunk 文本（无需读取会话状态）。"""
     asyncio.run(main._dispatch("c1", "t1", ("messages", _Chunk("片段"))))
     assert recorder.types() == ["token"]
     assert recorder.sent[0][1].payload["token"] == "片段"
