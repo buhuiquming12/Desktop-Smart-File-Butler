@@ -41,6 +41,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px
 .safety-card strong, .safety-card p { display: block; margin: 0; }
 .safety-card strong { color: #cceee1; font-size: 11px; }
 .safety-card p { margin-top: 3px; color: #758b89; font-size: 10px; }
+/* B3：有待审批操作时切换为警示态，让后台/定时任务的审批常驻可见。 */
+.safety-card--alert { border-color: rgba(230, 168, 80, .35); background: rgba(180, 120, 30, .16); }
+.safety-card--alert > span { color: #f0b45e; }
+.safety-card--alert strong { color: #ffe1b0; }
+.safety-card--alert p { color: #b39270; }
 .profile-button { display: flex; align-items: center; gap: 9px; width: 100%; padding: 10px 8px; border: 0; border-top: 1px solid rgba(255,255,255,.07); background: transparent; color: #f0f0f6; text-align: left; cursor: pointer; }
 .profile-button > span:nth-child(2) { min-width: 0; flex: 1; }
 .profile-button strong, .profile-button small { display: block; }
@@ -146,6 +151,8 @@ h3 { margin: 0; font-size: 15px; }
 .approval-summary dt { color: var(--muted); font-size: 10px; }
 .approval-summary dd { min-width: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; color: #353c4d; font-family: ui-monospace, monospace; font-size: 10px; white-space: nowrap; }
 .approval-note { margin: 12px 0 20px; color: #9b6b32; font-size: 9px; }
+/* B3：多条审批排队时的进度提示。 */
+.approval-queue-note { margin: 8px 0 0; padding: 7px 10px; border-radius: 8px; color: #a66b1f; background: #fff5e7; font-size: 10px; font-weight: 700; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
 
 .settings-layer { position: fixed; z-index: 40; inset: 0; display: flex; justify-content: flex-end; }

@@ -71,6 +71,40 @@ export const STALLED_NOTICE =
   `已超过 ${BUSY_STALL_TIMEOUT_MS / 1000} 秒未收到后端任何响应，已停止等待。` +
   '任务可能仍在后台执行：可在「操作日志」中核对已完成的步骤，必要时撤销。';
 
+// ---- B3：审批队列 ----
+
+/** 审批入队，按 approval_id 去重（同一项可能因重连或重复推送被多次送达）。 */
+export function addToApprovalQueue(queue: PendingApproval[], approval: PendingApproval): PendingApproval[] {
+  if (queue.some((item) => item.approval_id === approval.approval_id)) return queue;
+  return [...queue, approval];
+}
+
+/**
+ * 判断事件是否属于后台会话。
+ *
+ * 后台/定时会话的进度事件不应覆盖当前会话视图，但它们的审批必须照常入队（B3）：
+ * 早先直接 return 把 reduceThreadEvent 给出的 approval 丢了，导致定时任务一旦
+ * 需要危险操作审批就永远停在 waiting_approval，且界面上没有任何恢复入口。
+ */
+export function isBackgroundEvent(eventThreadId: string, activeThreadId: string | undefined): boolean {
+  return Boolean(eventThreadId && activeThreadId && eventThreadId !== activeThreadId);
+}
+
+/** 审批来源标签。定时任务会话 id 形如 scheduled-xxxx（见后端 _scheduled_runner）。 */
+export function approvalOrigin(threadId: string): string {
+  return threadId.startsWith('scheduled-') ? '定时任务' : '对话会话';
+}
+
+/**
+ * 会话 id 较长时取尾部 8 位展示。
+ *
+ * 取尾部而非头部：定时任务 id 一律以 scheduled- 开头，取头部会全部显示成
+ * "schedule…" 而无法区分是哪一次任务。是否定时任务由 approvalOrigin 单独标注。
+ */
+export function shortThreadId(threadId: string): string {
+  return threadId.length > 8 ? `…${threadId.slice(-8)}` : threadId;
+}
+
 export function reduceThreadEvent(view: ThreadViewState, event: WSEvent, now = new Date().toISOString()): { view: ThreadViewState; approval?: PendingApproval } {
   let next: ThreadViewState = { ...view, messages: [...view.messages], tasks: [...view.tasks] };
   switch (event.type) {

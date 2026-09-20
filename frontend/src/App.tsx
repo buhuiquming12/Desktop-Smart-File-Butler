@@ -24,6 +24,8 @@ import type {
 import {
   BUSY_STALL_TICK_MS,
   STALLED_NOTICE,
+  addToApprovalQueue,
+  isBackgroundEvent,
   isStalled,
   reduceThreadEvent,
   type ThreadViewState,
@@ -143,12 +145,18 @@ export function App() {
 
   const handleSocketEvent = useCallback((event: WSEvent) => {
     lastActivityRef.current = Date.now();  // 任何事件都算心跳，避免看门狗误判长任务
-    if (event.thread_id && threadIdRef.current && event.thread_id !== threadIdRef.current) {
+    if (isBackgroundEvent(event.thread_id, threadIdRef.current)) {
+      // 后台/定时会话的进度不覆盖当前会话视图，但审批必须照常入队并弹窗（B3）。
       setThreadViews((current) => {
         const view = current[event.thread_id] ?? { messages: [], tasks: [], busy: true };
         const result = reduceThreadEvent(view, event);
         return { ...current, [event.thread_id]: result.view };
       });
+      // 在 setState 更新函数之外计算，避免在 reducer 里做副作用（StrictMode 会重放）。
+      const backgroundApproval = event.type === 'approval_required' ? parseApproval(event) : null;
+      if (backgroundApproval) {
+        setApprovalQueue((current) => addToApprovalQueue(current, backgroundApproval));
+      }
       return;
     }
     if (event.thread_id) {
@@ -184,7 +192,7 @@ export function App() {
       case 'approval_required': {
         const approval = parseApproval(event);
         if (approval) {
-          setApprovalQueue((current) => current.some((item) => item.approval_id === approval.approval_id) ? current : [...current, approval]);
+          setApprovalQueue((current) => addToApprovalQueue(current, approval));
           updateTask({ id: `approval-${approval.approval_id}`, title: approval.action, detail: approval.target, status: 'waiting', updatedAt: now, threadId: event.thread_id });
         }
         break;
@@ -414,7 +422,14 @@ export function App() {
           <button type="button" onClick={() => openSettings('model')}><span aria-hidden="true">✦</span>模型配置</button>
         </nav>
         <div className="sidebar-spacer" />
-        <div className="safety-card"><span aria-hidden="true">⌾</span><div><strong>安全模式已启用</strong><p>高风险操作需审批</p></div></div>
+        {/* B3：后台/定时任务的审批会在这里常驻计数，避免“有审批在等却看不见”。 */}
+        <div className={`safety-card${approvalQueue.length > 0 ? ' safety-card--alert' : ''}`}>
+          <span aria-hidden="true">{approvalQueue.length > 0 ? '!' : '⌾'}</span>
+          <div>
+            <strong>{approvalQueue.length > 0 ? `${approvalQueue.length} 项待审批` : '安全模式已启用'}</strong>
+            <p>{approvalQueue.length > 0 ? '高风险操作等待你的确认' : '高风险操作需审批'}</p>
+          </div>
+        </div>
         <button className="profile-button" type="button" onClick={() => openSettings('general')}>
           <span className="profile-avatar">本</span><span><strong>本地工作区</strong><small>{connectionState === 'connected' ? '服务正常' : '检查连接'}</small></span><b aria-hidden="true">•••</b>
         </button>
@@ -425,7 +440,7 @@ export function App() {
         <TaskBoard tasks={activeThreadId && threadViews[activeThreadId] ? threadViews[activeThreadId].tasks : tasks} onClear={clearCompleted} />
       </main>
 
-      <ApprovalModal approval={approvalQueue[0] ?? null} submitting={approvalSubmitting} onDecision={(decision) => void decideApproval(decision)} />
+      <ApprovalModal approval={approvalQueue[0] ?? null} queueSize={approvalQueue.length} submitting={approvalSubmitting} onDecision={(decision) => void decideApproval(decision)} />
       <Settings
         open={settingsOpen}
         initialTab={settingsTab}

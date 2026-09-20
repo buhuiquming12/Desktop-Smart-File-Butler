@@ -1,12 +1,16 @@
 import { reconnectDelay } from './api/client';
 import {
   BUSY_STALL_TIMEOUT_MS,
+  addToApprovalQueue,
+  approvalOrigin,
+  isBackgroundEvent,
   isStalled,
   parseApproval,
   reduceThreadEvent,
+  shortThreadId,
   updateAssistant,
 } from './state';
-import type { WSEvent } from './types';
+import type { PendingApproval, WSEvent } from './types';
 
 const event = (thread_id: string, type: WSEvent['type'], payload: Record<string, unknown>): WSEvent => ({ thread_id, type, payload });
 
@@ -49,3 +53,41 @@ if (!isStalled(1_000, 1_000 + BUSY_STALL_TIMEOUT_MS)) throw new Error('看门狗
 // ---- 辅助函数回归 ----
 
 if (updateAssistant([], 'z', 'hi', true)[0]?.content !== 'hi') throw new Error('updateAssistant 未新建消息');
+
+// ---- B3：后台/定时任务审批不得丢弃 ----
+
+const scheduledEvent = event('scheduled-abc12345', 'approval_required', { approval_id: 'ap-1', action: 'delete', target: 'a.txt' });
+const backgroundResult = reduceThreadEvent({ messages: [], tasks: [], busy: true }, scheduledEvent);
+if (!backgroundResult.approval) throw new Error('B3: 后台审批事件未产出 approval');
+if (backgroundResult.approval.approval_id !== 'ap-1') throw new Error('B3: approval_id 解析错误');
+if (backgroundResult.approval.thread_id !== 'scheduled-abc12345') throw new Error('B3: 审批未带上来源会话');
+
+// 后台判定：仅当前会话之外、且确实有 thread_id 的事件算后台。
+if (!isBackgroundEvent('scheduled-abc12345', 'chat-1')) throw new Error('B3: 未识别出后台事件');
+if (isBackgroundEvent('chat-1', 'chat-1')) throw new Error('B3: 当前会话事件被误判为后台');
+if (isBackgroundEvent('chat-1', undefined)) throw new Error('B3: 无活动会话时不应判为后台');
+if (isBackgroundEvent('', 'chat-1')) throw new Error('B3: 空 thread_id 不应判为后台');
+
+const approvalOf = (id: string): PendingApproval => ({
+  approval_id: id,
+  thread_id: 'scheduled-abc12345',
+  action: 'delete',
+  target: 'a.txt',
+  detail: '',
+  created_at: '2026-01-01T00:00:00Z',
+});
+
+// 入队去重：同一条审批重复送达（重连重放）不得在队列里堆积。
+const queued = addToApprovalQueue(addToApprovalQueue([], approvalOf('ap-1')), approvalOf('ap-1'));
+if (queued.length !== 1) throw new Error(`B3: 审批重复入队，长度为 ${queued.length}`);
+if (addToApprovalQueue(queued, approvalOf('ap-2')).length !== 2) throw new Error('B3: 不同审批未入队');
+
+// 来源标签：定时任务会话 id 形如 scheduled-xxxx（见后端 _scheduled_runner）。
+if (approvalOrigin('scheduled-abc12345') !== '定时任务') throw new Error('B3: 定时任务来源标注错误');
+if (approvalOrigin('chat-1') !== '对话会话') throw new Error('B3: 对话会话来源标注错误');
+// 取尾部：定时任务 id 共享 scheduled- 前缀，取头部会全部撞成同一串。
+if (shortThreadId('scheduled-abc12345') !== '…abc12345') throw new Error('B3: 会话 id 截断错误');
+if (shortThreadId('scheduled-ffffffff') === shortThreadId('scheduled-abc12345')) {
+  throw new Error('B3: 不同定时任务会话无法区分');
+}
+if (shortThreadId('short') !== 'short') throw new Error('B3: 短会话 id 不应截断');
