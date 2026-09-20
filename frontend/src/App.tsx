@@ -21,7 +21,13 @@ import type {
   TaskStatus,
   WSEvent,
 } from './types';
-import { reduceThreadEvent, type ThreadViewState } from './state';
+import {
+  BUSY_STALL_TICK_MS,
+  STALLED_NOTICE,
+  isStalled,
+  reduceThreadEvent,
+  type ThreadViewState,
+} from './state';
 
 function createId(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -93,6 +99,8 @@ export function App() {
   const [settingsLoading, setSettingsLoading] = useState(false);
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const socketRef = useRef<AgentSocket | null>(null);
+  // B2 心跳：最后一次收到后端事件的时刻，供 busy 看门狗判定是否已失联。
+  const lastActivityRef = useRef<number>(Date.now());
   const api = useMemo(() => new ApiClient(apiBase), [apiBase]);
 
   const updateAssistant = useCallback((eventThreadId: string, content: string, append: boolean, error = false) => {
@@ -134,6 +142,7 @@ export function App() {
   }, []);
 
   const handleSocketEvent = useCallback((event: WSEvent) => {
+    lastActivityRef.current = Date.now();  // 任何事件都算心跳，避免看门狗误判长任务
     if (event.thread_id && threadIdRef.current && event.thread_id !== threadIdRef.current) {
       setThreadViews((current) => {
         const view = current[event.thread_id] ?? { messages: [], tasks: [], busy: true };
@@ -207,7 +216,11 @@ export function App() {
       baseUrl: wsBase,
       clientId,
       onEvent: handleSocketEvent,
-      onOpen: () => setConnectionState('connected'),
+      // 重连握手成功本身就是后端可达的证据，据此刷新心跳，不让看门狗误伤。
+      onOpen: () => {
+        lastActivityRef.current = Date.now();
+        setConnectionState('connected');
+      },
       onClose: () => setConnectionState('disconnected'),
       onError: () => setConnectionState('error'),
     });
@@ -219,10 +232,30 @@ export function App() {
     };
   }, [clientId, handleSocketEvent, wsBase]);
 
+  // B2 兜底：WS 断线时后端事件无处可送，前端只认终态事件来解除 busy，于是永久卡死。
+  // 以“最后一次收到事件的时刻”为心跳，失联超时即强制解除并明确告知用户。
+  useEffect(() => {
+    if (!busy) return;
+    const timer = setInterval(() => {
+      if (!isStalled(lastActivityRef.current, Date.now())) return;
+      setBusy(false);
+      setMessages((current) => [...current, {
+        id: createId('system'),
+        role: 'system',
+        content: STALLED_NOTICE,
+        timestamp: new Date().toISOString(),
+        error: true,
+      }]);
+    }, BUSY_STALL_TICK_MS);
+    return () => clearInterval(timer);
+  }, [busy]);
+
   const sendChat = useCallback((message: string) => {
     if (threadId) setActiveThreadId(threadId);
     const userMessage: ChatMessage = { id: createId('user'), role: 'user', content: message, timestamp: new Date().toISOString() };
     setMessages((current) => [...current, userMessage]);
+    // 心跳从“发出请求”开始计，断线时也就从这一刻起测算失联时长。
+    lastActivityRef.current = Date.now();
     setBusy(true);
     const socketPayload = threadId ? { type: 'chat' as const, message, thread_id: threadId } : { type: 'chat' as const, message };
     if (socketRef.current?.send(socketPayload)) return;

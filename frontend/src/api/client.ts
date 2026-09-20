@@ -169,12 +169,34 @@ interface AgentSocketOptions {
   onOpen?: () => void;
   onClose?: () => void;
   onError?: () => void;
+  /** 覆盖重连等待时长（毫秒）；主要供测试注入确定值。 */
+  backoff?: (attempt: number) => number;
+}
+
+const RECONNECT_BASE_MS = 500;
+const RECONNECT_MAX_MS = 15_000;
+
+/**
+ * 指数退避重连间隔（毫秒），带 0.8~1.0 抖动。
+ *
+ * 抖动是为了错开后端重启时所有客户端的重连时刻，避免惊群；上界保证不会无限增长。
+ */
+export function reconnectDelay(
+  attempt: number,
+  baseMs = RECONNECT_BASE_MS,
+  maxMs = RECONNECT_MAX_MS,
+): number {
+  const exponential = Math.min(maxMs, baseMs * 2 ** Math.max(0, attempt));
+  return Math.min(maxMs, Math.round(exponential * (0.8 + Math.random() * 0.2)));
 }
 
 export class AgentSocket {
   private socket: WebSocket | null = null;
   private readonly url: string;
   private readonly options: AgentSocketOptions;
+  private attempt = 0;
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private stopped = false;
 
   constructor(options: AgentSocketOptions) {
     this.options = options;
@@ -186,12 +208,32 @@ export class AgentSocket {
   }
 
   connect(): void {
-    if (this.socket?.readyState === WebSocket.OPEN || this.socket?.readyState === WebSocket.CONNECTING) return;
-    this.socket = new WebSocket(this.url);
-    this.socket.addEventListener('open', () => this.options.onOpen?.());
-    this.socket.addEventListener('close', () => this.options.onClose?.());
-    this.socket.addEventListener('error', () => this.options.onError?.());
-    this.socket.addEventListener('message', (message) => {
+    this.stopped = false;
+    this.open();
+  }
+
+  private open(): void {
+    if (this.socket && (this.socket.readyState === WebSocket.OPEN || this.socket.readyState === WebSocket.CONNECTING)) return;
+    const socket = new WebSocket(this.url);
+    this.socket = socket;
+    // 所有监听器都先确认自己仍是在用连接：disconnect() 或重连替换后，旧 socket 的
+    // 迟到事件既不能污染状态，也不能再触发一次重连。
+    socket.addEventListener('open', () => {
+      if (this.socket !== socket) return;
+      this.attempt = 0;  // 连上即重置退避，避免长连接掉线后仍按最大间隔等待
+      this.options.onOpen?.();
+    });
+    socket.addEventListener('close', () => {
+      if (this.socket !== socket) return;
+      this.options.onClose?.();
+      this.scheduleReconnect();
+    });
+    socket.addEventListener('error', () => {
+      if (this.socket !== socket) return;
+      this.options.onError?.();
+    });
+    socket.addEventListener('message', (message) => {
+      if (this.socket !== socket) return;
       try {
         const value: unknown = JSON.parse(String(message.data));
         if (isWSEvent(value)) this.options.onEvent(value);
@@ -201,6 +243,22 @@ export class AgentSocket {
     });
   }
 
+  /**
+   * 断线后按指数退避自动重连（B2）。
+   *
+   * 后端按 client_id 路由事件，重连成功后后续事件即恢复送达；断线期间漏掉的事件
+   * 不补发，由 App 的兜底超时负责兜底告知用户。
+   */
+  private scheduleReconnect(): void {
+    if (this.stopped || this.retryTimer !== null) return;
+    const delay = this.options.backoff?.(this.attempt) ?? reconnectDelay(this.attempt);
+    this.attempt += 1;
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      if (!this.stopped) this.open();
+    }, delay);
+  }
+
   send(message: SocketMessage): boolean {
     if (this.socket?.readyState !== WebSocket.OPEN) return false;
     this.socket.send(JSON.stringify(message));
@@ -208,6 +266,11 @@ export class AgentSocket {
   }
 
   disconnect(): void {
+    this.stopped = true;
+    if (this.retryTimer !== null) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
     this.socket?.close();
     this.socket = null;
   }

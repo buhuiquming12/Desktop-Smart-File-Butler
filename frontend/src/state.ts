@@ -56,6 +56,21 @@ export function updateTask(tasks: TaskItem[], task: TaskItem): TaskItem[] {
   return next;
 }
 
+/** B2 兜底超时：WS 断线后事件无人送达，busy 会永久卡住。 */
+export const BUSY_STALL_TIMEOUT_MS = 60_000;
+
+/** 看门狗轮询间隔。 */
+export const BUSY_STALL_TICK_MS = 5_000;
+
+/** 距最后一次收到后端事件超过阈值即判定为失联。 */
+export function isStalled(lastActivityAt: number, now: number, timeoutMs = BUSY_STALL_TIMEOUT_MS): boolean {
+  return now - lastActivityAt >= timeoutMs;
+}
+
+export const STALLED_NOTICE =
+  `已超过 ${BUSY_STALL_TIMEOUT_MS / 1000} 秒未收到后端任何响应，已停止等待。` +
+  '任务可能仍在后台执行：可在「操作日志」中核对已完成的步骤，必要时撤销。';
+
 export function reduceThreadEvent(view: ThreadViewState, event: WSEvent, now = new Date().toISOString()): { view: ThreadViewState; approval?: PendingApproval } {
   let next: ThreadViewState = { ...view, messages: [...view.messages], tasks: [...view.tasks] };
   switch (event.type) {

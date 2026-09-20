@@ -20,6 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from starlette.websockets import WebSocketState
 
 import httpx
 
@@ -153,12 +154,26 @@ class ConnectionManager:
             self._connections.pop(client_id, None)
 
     async def send(self, client_id: str, event: WSEvent) -> None:
+        """向指定客户端推送事件；对端已断开时静默丢弃，绝不向上抛（B2）。
+
+        单个客户端的连接问题不得中断 Agent 执行：这里没有任何重试，事件发不出去
+        就丢掉，前端的重连 + 兜底超时负责恢复（见 AgentSocket 与 App 的 busy 看门狗）。
+        """
         websocket = self._connections.get(client_id)
         if websocket is None:
+            return
+        # 握手未完成或已被对端关闭：直接清理映射，避免向 dead client 反复推送。
+        if websocket.application_state is not WebSocketState.CONNECTED:
+            self.disconnect(client_id, websocket)
             return
         try:
             await websocket.send_json(event.model_dump(mode="json"))
         except (RuntimeError, WebSocketDisconnect):
+            # 发送瞬间对端断开；后续事件会落到上面的分支。
+            logger.debug("推送时发现连接已断开，已清理 client=%s", client_id)
+            self.disconnect(client_id, websocket)
+        except Exception:  # noqa: BLE001 - 推送失败不得冒泡到会话执行循环
+            logger.exception("推送事件失败 client=%s type=%s", client_id, event.type)
             self.disconnect(client_id, websocket)
 
 
