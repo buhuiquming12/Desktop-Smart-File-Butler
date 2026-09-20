@@ -748,8 +748,19 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str) -> None:
     try:
         while True:
             raw = await websocket.receive_text()
+            # 每轮重置：解析失败时 thread_id 必须为空，绝不能沿用上一轮的值
+            # （旧代码在 except HTTPException 里直接读 message，json.loads 抛错时
+            # 要么 NameError，要么把上一轮的消息投递到错误的会话）。
+            thread_id = ""
             try:
                 message = json.loads(raw)
+                if not isinstance(message, dict):
+                    await connections.send(
+                        client_id,
+                        _event(WSEventType.error, "", message="消息格式错误：应为 JSON 对象"),
+                    )
+                    continue
+                thread_id = str(message.get("thread_id") or "")
                 message_type = message.get("type")
                 if message_type == "chat":
                     request = ChatRequest(
@@ -796,7 +807,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str) -> None:
             except HTTPException as exc:
                 await connections.send(
                     client_id,
-                    _event(WSEventType.error, message.get("thread_id", ""), message=str(exc.detail)),
+                    _event(WSEventType.error, thread_id, message=str(exc.detail)),
                 )
     except WebSocketDisconnect:
         connections.disconnect(client_id, websocket)
