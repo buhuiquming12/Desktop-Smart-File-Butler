@@ -24,7 +24,7 @@ from ..logging_conf import get_logger
 from ..models import ScheduledJob
 from ..security import resolve_in_sandbox
 from ..tools import categories, extract, filesystem, scheduler
-from .llm import build_llm
+from .llm import build_llm, build_structured_llm
 from .prompts import PLANNER_SYSTEM_PROMPT, REFLECTION_SYSTEM_PROMPT
 from .state import AgentState, PlanOutput, ReflectionOutput
 
@@ -275,8 +275,10 @@ class AgentRuntime:
 
     def __init__(self) -> None:
         self.llm = build_llm(temperature=0.1)
-        self.planner = self.llm.with_structured_output(PlanOutput)
-        self.reflector = self.llm.with_structured_output(ReflectionOutput)
+        # 不直接用 llm.with_structured_output：默认走 function_calling，请求体带 tools，
+        # 只实现聊天补全的 OpenAI 兼容服务会直接 400（见 build_structured_llm）。
+        self.planner = build_structured_llm(self.llm, PlanOutput)
+        self.reflector = build_structured_llm(self.llm, ReflectionOutput)
         self.checkpointer = _build_checkpointer()
         self.graph = self._build_graph()
         cleanup_checkpoints(self.checkpointer, self.state)
