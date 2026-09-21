@@ -86,6 +86,9 @@ export interface BackendConfig {
 
 export type LLMProvider = 'openai' | 'ollama';
 
+/** auto = 原生结构化输出优先、失败自动降级；prompt = 手动强制降级为提示词 JSON。 */
+export type StructuredOutputMode = 'auto' | 'prompt';
+
 export interface LLMSettings {
   provider: LLMProvider;
   openai_base_url: string;
@@ -93,6 +96,7 @@ export interface LLMSettings {
   openai_api_key_set: boolean;
   ollama_base_url: string;
   ollama_model: string;
+  structured_output_mode: StructuredOutputMode;
 }
 
 export interface LLMSettingsUpdate {
@@ -102,6 +106,7 @@ export interface LLMSettingsUpdate {
   openai_api_key?: string;
   ollama_base_url?: string;
   ollama_model?: string;
+  structured_output_mode?: StructuredOutputMode;
 }
 
 export interface LLMModelsRequest {

@@ -493,6 +493,7 @@ def get_llm_settings() -> Dict[str, Any]:
         "openai_api_key_set": bool(config.openai_api_key),
         "ollama_base_url": config.ollama_base_url,
         "ollama_model": config.ollama_model,
+        "structured_output_mode": config.structured_output_mode,
     }
 
 
@@ -505,6 +506,14 @@ def update_llm_settings(body: LLMSettingsUpdate) -> Dict[str, Any]:
         if provider not in ("openai", "ollama"):
             raise HTTPException(status_code=422, detail="provider 仅支持 openai 或 ollama")
         provided["provider"] = provider
+
+    if provided.get("structured_output_mode"):
+        mode = str(provided["structured_output_mode"]).lower()
+        if mode not in llm_config.STRUCTURED_OUTPUT_MODES:
+            raise HTTPException(
+                status_code=422, detail="structured_output_mode 仅支持 auto 或 prompt"
+            )
+        provided["structured_output_mode"] = mode
 
     llm_config.save_overrides({k: (v if v is not None else "") for k, v in provided.items()})
     reset_runtime()

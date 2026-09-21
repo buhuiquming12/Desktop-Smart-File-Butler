@@ -214,11 +214,14 @@ class StructuredOutputRunnable:
     降级标记不加锁：并发首次失败只会各自判定一次，结论一致，无需串行化。
     """
 
-    def __init__(self, llm: Any, schema: Type[_T]) -> None:
+    def __init__(
+        self, llm: Any, schema: Type[_T], *, use_native: bool = True
+    ) -> None:
         self._schema = schema
-        self._native = llm.with_structured_output(schema)
+        # 手动降级时不构造原生 runnable，连探测用的那次 400 请求都省掉。
+        self._native = llm.with_structured_output(schema) if use_native else None
         self._prompt = PromptJSONStructured(llm, schema)
-        self._use_native = True
+        self._use_native = use_native
 
     @property
     def using_native(self) -> bool:
@@ -243,6 +246,16 @@ class StructuredOutputRunnable:
         return self._prompt.invoke(messages, config, **kwargs)
 
 
-def build_structured_llm(llm: Any, schema: Type[_T]) -> StructuredOutputRunnable:
-    """为 schema 构造带自动降级的结构化输出可运行对象。"""
-    return StructuredOutputRunnable(llm, schema)
+def build_structured_llm(
+    llm: Any, schema: Type[_T], *, force_prompt: Optional[bool] = None
+) -> StructuredOutputRunnable:
+    """为 schema 构造带自动降级的结构化输出可运行对象。
+
+    ``force_prompt`` 为 None 时按配置 ``structured_output_mode`` 决定：
+    ``prompt`` 表示用户在设置界面手动降级，直接跳过 provider 原生路径。
+    """
+    if force_prompt is None:
+        force_prompt = get_effective_config().structured_output_mode == "prompt"
+    if force_prompt:
+        logger.info("已按配置手动降级：%s 直接使用提示词 JSON 模式", schema.__name__)
+    return StructuredOutputRunnable(llm, schema, use_native=not force_prompt)

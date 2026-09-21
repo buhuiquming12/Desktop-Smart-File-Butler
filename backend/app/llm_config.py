@@ -18,7 +18,12 @@ _ALLOWED_KEYS = {
     "openai_api_key",
     "ollama_base_url",
     "ollama_model",
+    "structured_output_mode",
 }
+
+# 结构化输出模式：auto = 原生优先、失败自动降级；prompt = 手动强制降级为提示词 JSON。
+STRUCTURED_OUTPUT_MODES = ("auto", "prompt")
+_DEFAULT_MODE = "auto"
 
 
 @dataclass
@@ -29,6 +34,16 @@ class EffectiveLLMConfig:
     openai_api_key: str
     ollama_base_url: str
     ollama_model: str
+    structured_output_mode: str
+
+
+def normalize_mode(value: str) -> str:
+    """把任意来源的模式值收敛到受支持取值；无法识别时回退默认值。
+
+    DB 里可能是历史遗留或手改的值，这里兜底，避免一个坏值让结构化输出直接不可用。
+    """
+    candidate = (value or "").strip().lower()
+    return candidate if candidate in STRUCTURED_OUTPUT_MODES else _DEFAULT_MODE
 
 
 def get_effective_config() -> EffectiveLLMConfig:
@@ -47,6 +62,9 @@ def get_effective_config() -> EffectiveLLMConfig:
         openai_api_key=pick("openai_api_key", settings.openai_api_key),
         ollama_base_url=pick("ollama_base_url", settings.ollama_base_url),
         ollama_model=pick("ollama_model", settings.ollama_model),
+        structured_output_mode=normalize_mode(
+            pick("structured_output_mode", settings.structured_output_mode)
+        ),
     )
 
 

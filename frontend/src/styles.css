@@ -183,6 +183,10 @@ h3 { margin: 0; font-size: 15px; }
 .provider-card p { margin: 6px 0 0; color: #6d7485; font-size: 9px; line-height: 1.6; }
 .provider-card code { color: #4f56a7; font-family: ui-monospace, monospace; }
 .version-note { margin: 2px 0; color: #a0a5b1; font-size: 9px; }
+/* 勾选行：label 默认是 grid 全宽输入框，这里改成行内排布并让复选框回归原始尺寸 */
+.settings-section .checkbox-row { display: flex; align-items: center; gap: 8px; font-weight: 700; }
+.settings-section .checkbox-row input { width: auto; margin: 0; accent-color: var(--primary); }
+.settings-section .checkbox-row + .muted code { font-family: ui-monospace, monospace; color: #4f56a7; }
 .inline-error { margin-bottom: 15px; padding: 10px 12px; border-radius: 8px; color: #a43b45; background: #fff0f1; font-size: 10px; }
 .data-list { display: grid; gap: 7px; }
 .data-row, .job-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 11px 12px; border: 1px solid var(--line); border-radius: 9px; }

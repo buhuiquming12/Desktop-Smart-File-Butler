@@ -34,6 +34,7 @@ class LLMSettingsUpdate(BaseModel):
     openai_api_key: Optional[str] = Field(default=None, max_length=500)
     ollama_base_url: Optional[str] = Field(default=None, max_length=500)
     ollama_model: Optional[str] = Field(default=None, max_length=200)
+    structured_output_mode: Optional[str] = Field(default=None, max_length=20)
 
 
 class SandboxSettingsUpdate(BaseModel):

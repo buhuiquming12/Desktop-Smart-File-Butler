@@ -62,10 +62,12 @@ class _FakeLLM:
     def __init__(self, replies: List[str] | None = None, native_behavior: Any = None) -> None:
         self.replies = list(replies or [])
         self.native_behavior = native_behavior
+        self.native_builds = 0
         self.native_calls = 0
         self.prompt_calls: List[Any] = []
 
     def with_structured_output(self, schema: Any) -> _FakeNative:
+        self.native_builds += 1
         return _FakeNative(self, schema)
 
     def invoke(self, messages: Any) -> _Reply:
@@ -79,12 +81,20 @@ def _payload(goal: str = "归档", steps: List[str] | None = None) -> str:
     return json.dumps({"goal": goal, "steps": steps or []}, ensure_ascii=False)
 
 
+def _build(llm: Any, schema: Any = Plan) -> Any:
+    """本文件固定按 auto 分支构造，避免读到真实配置。
+
+    配置读取（structured_output_mode / 手动降级）由 test_structured_output_mode.py 覆盖。
+    """
+    return build_structured_llm(llm, schema, force_prompt=False)
+
+
 # ------------------------------- 降级行为 -------------------------------
 
 
 def test_native_success_does_not_degrade() -> None:
     fake = _FakeLLM(native_behavior=Plan(goal="归档", steps=["s1"]))
-    structured = build_structured_llm(fake, Plan)
+    structured = _build(fake)
 
     assert structured.invoke([HumanMessage(content="x")]) == Plan(goal="归档", steps=["s1"])
     assert structured.using_native is True
@@ -93,7 +103,7 @@ def test_native_success_does_not_degrade() -> None:
 
 def test_bad_request_degrades_to_prompt_json() -> None:
     fake = _FakeLLM(replies=[_payload()], native_behavior=BadRequest("invalid_request"))
-    structured = build_structured_llm(fake, Plan)
+    structured = _build(fake)
 
     assert structured.invoke([HumanMessage(content="x")]) == Plan(goal="归档")
     assert structured.using_native is False
@@ -106,7 +116,7 @@ def test_output_parser_error_degrades() -> None:
     fake = _FakeLLM(
         replies=[_payload()], native_behavior=OutputParserException("no tool call found")
     )
-    structured = build_structured_llm(fake, Plan)
+    structured = _build(fake)
 
     assert structured.invoke([HumanMessage(content="x")]) == Plan(goal="归档")
     assert structured.using_native is False
@@ -114,7 +124,7 @@ def test_output_parser_error_degrades() -> None:
 
 def test_degradation_persists_across_calls() -> None:
     fake = _FakeLLM(replies=[_payload(), _payload(goal="第二次")], native_behavior=BadRequest("x"))
-    structured = build_structured_llm(fake, Plan)
+    structured = _build(fake)
 
     structured.invoke([HumanMessage(content="1")])
     second = structured.invoke([HumanMessage(content="2")])
@@ -126,7 +136,7 @@ def test_degradation_persists_across_calls() -> None:
 
 def test_transient_error_propagates_without_degrading() -> None:
     fake = _FakeLLM(native_behavior=ServerError("boom"))
-    structured = build_structured_llm(fake, Plan)
+    structured = _build(fake)
 
     with pytest.raises(ServerError):
         structured.invoke([HumanMessage(content="x")])
@@ -140,7 +150,7 @@ def test_transient_error_propagates_without_degrading() -> None:
 
 def test_instruction_carries_schema_and_keeps_original_messages() -> None:
     fake = _FakeLLM(replies=[_payload()], native_behavior=BadRequest("x"))
-    structured = build_structured_llm(fake, Plan)
+    structured = _build(fake)
 
     structured.invoke([HumanMessage(content="原始请求")])
 
@@ -155,7 +165,7 @@ def test_retries_after_invalid_json_and_feeds_error_back() -> None:
         replies=["抱歉，我来解释一下：先扫描目录。", _payload()],
         native_behavior=BadRequest("x"),
     )
-    structured = build_structured_llm(fake, Plan)
+    structured = _build(fake)
 
     assert structured.invoke([HumanMessage(content="x")]) == Plan(goal="归档")
     assert len(fake.prompt_calls) == 2
@@ -165,7 +175,7 @@ def test_retries_after_invalid_json_and_feeds_error_back() -> None:
 
 def test_raises_with_context_after_all_attempts_exhausted() -> None:
     fake = _FakeLLM(replies=["不是 JSON", "仍然不是 JSON"], native_behavior=BadRequest("x"))
-    structured = build_structured_llm(fake, Plan)
+    structured = _build(fake)
 
     with pytest.raises(ValueError, match="Plan"):
         structured.invoke([HumanMessage(content="x")])
@@ -177,7 +187,7 @@ def test_schema_violation_triggers_retry() -> None:
     """是合法 JSON 但不符合 schema（缺 goal）时，也必须重试而不是直接返回。"""
     fake = _FakeLLM(replies=[json.dumps({"steps": []}), _payload()],
                     native_behavior=BadRequest("x"))
-    structured = build_structured_llm(fake, Plan)
+    structured = _build(fake)
 
     assert structured.invoke([HumanMessage(content="x")]) == Plan(goal="归档")
     assert len(fake.prompt_calls) == 2
@@ -237,12 +247,48 @@ def test_config_forwarded_only_when_provided() -> None:
         def with_structured_output(self, schema: Any) -> _Recorder:
             return _Recorder()
 
-    structured = build_structured_llm(_LLM(), Plan)
+    structured = _build(_LLM())
     structured.invoke([HumanMessage(content="x")])
     assert seen[-1] == ((), {})
 
     structured.invoke([HumanMessage(content="x")], {"tags": ["t"]})
     assert seen[-1] == (({"tags": ["t"]},), {})
+
+
+# ------------------------------- 手动降级（force_prompt） -------------------------------
+
+
+def test_force_prompt_skips_native_entirely() -> None:
+    """手动降级时连原生 runnable 都不构造，探测用的那次 400 请求也省掉。"""
+    fake = _FakeLLM(replies=[_payload()], native_behavior=Plan(goal="不该被用到"))
+    structured = build_structured_llm(fake, Plan, force_prompt=True)
+
+    assert structured.using_native is False
+    assert structured.invoke([HumanMessage(content="x")]) == Plan(goal="归档")
+    assert fake.native_builds == 0
+    assert fake.native_calls == 0
+    assert len(fake.prompt_calls) == 1
+
+
+def test_force_prompt_false_keeps_native_first() -> None:
+    fake = _FakeLLM(native_behavior=Plan(goal="原生"))
+    structured = build_structured_llm(fake, Plan, force_prompt=False)
+
+    assert structured.invoke([HumanMessage(content="x")]) == Plan(goal="原生")
+    assert structured.using_native is True
+    assert fake.native_builds == 1
+    assert fake.prompt_calls == []
+
+
+def test_manual_downgrade_does_not_prevent_later_auto_native() -> None:
+    """手动降级是每次构造时的决定，不应给后续 auto 实例留下粘性状态。"""
+    forced = _FakeLLM(replies=[_payload()])
+    build_structured_llm(forced, Plan, force_prompt=True).invoke([HumanMessage(content="x")])
+
+    auto = _FakeLLM(native_behavior=Plan(goal="原生"))
+    structured = build_structured_llm(auto, Plan, force_prompt=False)
+    assert structured.invoke([HumanMessage(content="x")]) == Plan(goal="原生")
+    assert structured.using_native is True
 
 
 # ------------------------------- 降级判定 -------------------------------

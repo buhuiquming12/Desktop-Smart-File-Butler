@@ -9,6 +9,7 @@ import type {
   Preference,
   SandboxSettings,
   ScheduledJob,
+  StructuredOutputMode,
 } from '../types';
 
 export type SettingsTab = 'general' | 'model' | 'preferences' | 'schedules' | 'logs';
@@ -66,6 +67,7 @@ export function Settings(props: SettingsProps) {
   const [openaiApiKey, setOpenaiApiKey] = useState('');
   const [ollamaBaseUrl, setOllamaBaseUrl] = useState('');
   const [ollamaModel, setOllamaModel] = useState('');
+  const [structuredOutputMode, setStructuredOutputMode] = useState<StructuredOutputMode>('auto');
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [fetchingModels, setFetchingModels] = useState(false);
   const [modelStatus, setModelStatus] = useState<string | null>(null);
@@ -120,6 +122,7 @@ export function Settings(props: SettingsProps) {
     setOpenaiApiKey('');
     setOllamaBaseUrl(s.ollama_base_url);
     setOllamaModel(s.ollama_model);
+    setStructuredOutputMode(s.structured_output_mode);
     setAvailableModels([]);
     setModelStatus(null);
   }, [props.llmSettings, props.open]);
@@ -159,11 +162,17 @@ export function Settings(props: SettingsProps) {
     try {
       const update: LLMSettingsUpdate =
         provider === 'ollama'
-          ? { provider, ollama_base_url: ollamaBaseUrl.trim(), ollama_model: ollamaModel.trim() }
+          ? {
+              provider,
+              ollama_base_url: ollamaBaseUrl.trim(),
+              ollama_model: ollamaModel.trim(),
+              structured_output_mode: structuredOutputMode,
+            }
           : {
               provider,
               openai_base_url: openaiBaseUrl.trim(),
               openai_model: openaiModel.trim(),
+              structured_output_mode: structuredOutputMode,
               // 仅在用户输入了新密钥时提交；留空表示保留已有密钥。
               ...(openaiApiKey.trim() ? { openai_api_key: openaiApiKey.trim() } : {}),
             };
@@ -308,6 +317,22 @@ export function Settings(props: SettingsProps) {
               )}
 
               {modelStatus && <p className="muted">{modelStatus}</p>}
+
+              <div className="section-divider" />
+              <label className="checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={structuredOutputMode === 'prompt'}
+                  onChange={(event) => setStructuredOutputMode(event.target.checked ? 'prompt' : 'auto')}
+                />
+                手动降级：强制使用提示词 JSON
+              </label>
+              <p className="muted">
+                默认「自动」——先让服务商的 function calling 生成结构化结果，服务商不支持（如只实现聊天补全、
+                收到 <code>tools</code> 就返回 400）时自动改走提示词 JSON。若自动判断不适用，可勾选此项跳过原生
+                路径，直接从第一次请求起就用提示词约束输出。保存后下一次对话生效。
+              </p>
+
               <button className="primary-button" type="button" disabled={savingLLM} onClick={() => void saveLLM()}>{savingLLM ? '保存中…' : '保存模型配置'}</button>
             </div>
           )}

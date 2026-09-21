@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://127.0.0.1:11434"
     ollama_model: str = "qwen2.5"
 
+    # 结构化输出模式：auto（原生优先，失败自动降级）| prompt（手动降级，直接走提示词 JSON）
+    structured_output_mode: str = "auto"
+
     # 安全沙箱：用 ; 分隔的目录列表
     sandbox_roots: str = ""
 
