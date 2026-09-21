@@ -194,6 +194,22 @@ ipcMain.on('butler:session', (event) => {
   event.returnValue = currentSession;
 });
 
+// 在系统文件管理器中定位文件/目录（仅经过严格参数校验的本地绝对路径）。
+// 不向渲染进程暴露 shell 或任意路径能力：只接受字符串绝对路径，且必须真实存在。
+ipcMain.handle('butler:reveal-path', async (_event, filePath: unknown) => {
+  if (typeof filePath !== 'string' || filePath.length === 0 || filePath.length > 4096) return false;
+  if (filePath.includes('\0')) return false;
+  if (!path.isAbsolute(filePath)) return false;
+  if (!existsSync(filePath)) return false;
+  try {
+    shell.showItemInFolder(filePath);
+    return true;
+  } catch (error) {
+    console.error('打开所在目录失败：', error);
+    return false;
+  }
+});
+
 // 原生目录选择器（P1-3）。
 ipcMain.handle('butler:choose-directory', async () => {
   const result = await dialog.showOpenDialog({ properties: ['openDirectory', 'createDirectory'] });

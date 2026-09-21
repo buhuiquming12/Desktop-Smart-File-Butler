@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from 'react';
+import { useEffect, useRef, useState, type FormEvent } from 'react';
 import type {
   LLMModelsRequest,
   LLMModelsResponse,
@@ -52,6 +52,61 @@ const tabs: Array<{ id: SettingsTab; label: string }> = [
 ];
 
 export function Settings(props: SettingsProps) {
+  const drawerRef = useRef<HTMLElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const lastFocusedRef = useRef<Element | null>(null);
+  const wasOpenRef = useRef(false);
+  const onCloseRef = useRef(props.onClose);
+
+  useEffect(() => {
+    onCloseRef.current = props.onClose;
+  }, [props.onClose]);
+
+  // 打开时聚焦关闭按钮；真正关闭时把焦点还给触发元素。
+  useEffect(() => {
+    if (props.open) {
+      if (!wasOpenRef.current) {
+        lastFocusedRef.current = document.activeElement;
+        window.setTimeout(() => closeButtonRef.current?.focus(), 0);
+      }
+      wasOpenRef.current = true;
+    } else if (wasOpenRef.current) {
+      wasOpenRef.current = false;
+      const restoreTo = lastFocusedRef.current;
+      if (restoreTo instanceof HTMLElement) restoreTo.focus();
+    }
+  }, [props.open]);
+
+  // Esc 关闭；Tab/Shift+Tab 在抽屉内循环，焦点不逃逸到背景。
+  useEffect(() => {
+    if (!props.open) return;
+    const handleKey = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        onCloseRef.current();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const drawer = drawerRef.current;
+      if (!drawer) return;
+      const focusables = Array.from(drawer.querySelectorAll<HTMLElement>(
+        'button, input, select, textarea, a[href], [tabindex]:not([tabindex="-1"])',
+      )).filter((el) => !el.hasAttribute('disabled') && el.offsetParent !== null);
+      if (focusables.length === 0) return;
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      if (!first || !last) return;
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener('keydown', handleKey);
+    return () => window.removeEventListener('keydown', handleKey);
+  }, [props.open]);
   const [tab, setTab] = useState<SettingsTab>(props.initialTab);
   const [apiBase, setApiBase] = useState(props.apiBase);
   const [wsBase, setWsBase] = useState(props.wsBase);
@@ -213,10 +268,10 @@ export function Settings(props: SettingsProps) {
   return (
     <div className="settings-layer">
       <button className="settings-scrim" type="button" aria-label="关闭设置" onClick={props.onClose} />
-      <section className="settings-drawer" aria-label="设置">
+      <section ref={drawerRef} className="settings-drawer" role="dialog" aria-modal="true" aria-labelledby="settings-drawer-title">
         <header className="settings-header">
-          <div><p className="eyebrow">工作台</p><h2>设置与记录</h2></div>
-          <button className="icon-button" type="button" aria-label="关闭" onClick={props.onClose}>×</button>
+          <div><p className="eyebrow">工作台</p><h2 id="settings-drawer-title">设置与记录</h2></div>
+          <button ref={closeButtonRef} className="icon-button" type="button" aria-label="关闭" onClick={props.onClose}>×</button>
         </header>
 
         <nav className="settings-tabs" aria-label="设置分类">
@@ -233,6 +288,10 @@ export function Settings(props: SettingsProps) {
               <div className="provider-card">
                 <strong>模型服务</strong>
                 <p>Provider、模型名、Base URL 与 API Key 可在「模型配置」中修改。密钥仅保存在本地后端（<code>.env</code> 默认值或本地数据库覆盖项），保存后不会回传前端，也不会显示明文——界面只标记是否已配置。</p>
+              </div>
+              <div className="provider-card">
+                <strong>OCR 识别</strong>
+                <p>本地 OCR 负责图片与扫描件的文字提取。若环境未配置 Tesseract（<code>TESSERACT_CMD</code>），涉及提取图片文字的步骤会以「跳过」呈现，不影响其他文件操作；可在后端环境变量中配置后重新检查。</p>
               </div>
               <label>本地 REST API 地址<input value={apiBase} onChange={(event) => setApiBase(event.target.value)} placeholder="http://127.0.0.1:8000" /></label>
               <label>本地 WebSocket 地址<input value={wsBase} onChange={(event) => setWsBase(event.target.value)} placeholder="ws://127.0.0.1:8000" /></label>

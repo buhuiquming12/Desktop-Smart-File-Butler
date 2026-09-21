@@ -1,12 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AgentSocket, ApiClient, DEFAULT_API_BASE, DEFAULT_WS_BASE } from './api/client';
 import { helpText, isCommandName, type SlashCommandName } from './commands';
+import { ActivityCenter } from './components/ActivityCenter';
 import { ApprovalModal } from './components/ApprovalModal';
 import { ChatPanel } from './components/ChatPanel';
+import { NewConversationModal } from './components/NewConversationModal';
 import { Settings, type SettingsTab } from './components/Settings';
-import { TaskBoard } from './components/TaskBoard';
+import { ToastStack, type ToastItem, type ToastKind } from './components/ToastStack';
 import type {
+  ActivityItem,
   ApprovalDecision,
+  BackendConfig,
   ChatMessage,
   ConnectionState,
   LLMModelsRequest,
@@ -18,22 +22,34 @@ import type {
   Preference,
   SandboxSettings,
   ScheduledJob,
+  SetupHints,
   TaskItem,
   TaskStatus,
+  TaskSummary,
   WSEvent,
 } from './types';
 import {
   BUSY_STALL_TICK_MS,
   STALLED_NOTICE,
   addToApprovalQueue,
-  isBackgroundEvent,
+  buildActivityItems,
+  detachThreadToViews,
   isStalled,
+  parseSummary,
   reduceThreadEvent,
+  resolveEventTarget,
+  shouldPromptNewConversation,
+  type NewConversationAction,
   type ThreadViewState,
 } from './state';
 
 function createId(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** 助手回复的消息 id：会话 + 回合序号。追问同一会话会生成新气泡，而不是把内容追加进第一条回复。 */
+function assistantMessageId(threadId: string, turn: number): string {
+  return `assistant-${threadId}-${turn}`;
 }
 
 function readStored(key: string, fallback: string): string {
@@ -87,9 +103,17 @@ export function App() {
   const [approvalQueue, setApprovalQueue] = useState<PendingApproval[]>([]);
   const [threadId, setThreadId] = useState<string>();
   const threadIdRef = useRef<string | undefined>(undefined);
+  // 每个会话的助手回复按「回合」编号：追问时推进序号，让本次回答落在新气泡里。
+  const assistantTurnRef = useRef<Record<string, number>>({});
   const [activeThreadId, setActiveThreadId] = useState<string>();
   // P1: 后台定时会话与当前聊天各自维护事件状态，事件不会覆盖活动会话。
   const [threadViews, setThreadViews] = useState<Record<string, ThreadViewState>>({});
+  // 新对话后进入后台/已结束的会话 id：它们的迟到事件永远按后台路由，绝不污染新会话。
+  const detachedThreadIdsRef = useRef<Set<string>>(new Set());
+  const [newChatModalOpen, setNewChatModalOpen] = useState(false);
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
+  const toastIdRef = useRef(0);
+  const [setupHints, setSetupHints] = useState<SetupHints>({ checked: false, backendOk: false, modelOk: null, sandboxOk: null, ocrOk: null });
   const [busy, setBusy] = useState(false);
   const [approvalSubmitting, setApprovalSubmitting] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -106,7 +130,7 @@ export function App() {
   const lastActivityRef = useRef<number>(Date.now());
   const api = useMemo(() => new ApiClient(apiBase), [apiBase]);
 
-  // 正在运行的后台/定时会话：它们的进度只存在 threadViews 里（任务看板只看当前会话），
+  // 正在运行的后台/定时会话：它们的进度只存在 threadViews 里（活动中心逐一列出），
   // 因此用「结束」按钮上的计数把它们暴露出来，否则用户根本不知道还有东西在跑。
   const runningBackgroundIds = useMemo(
     () => Object.entries(threadViews).filter(([, view]) => view.busy).map(([id]) => id),
@@ -114,19 +138,33 @@ export function App() {
   );
   const runningCount = runningBackgroundIds.length + (busy ? 1 : 0);
 
+  // 当前前台会话视图：正在查看后台会话时用该会话的视图，否则用主聊天状态。
+  const activeView = activeThreadId ? threadViews[activeThreadId] : undefined;
+  const chatMessages = activeView ? activeView.messages : messages;
+  const chatTasks = activeView ? activeView.tasks : tasks;
+  const chatBusy = activeView ? activeView.busy : busy;
+
+  /** 统一的 Toast 反馈：保存、失败、撤销、任务结束等都用它，避免各写一套。 */
+  const notify = useCallback((content: string, kind: ToastKind = 'info') => {
+    const id = ++toastIdRef.current;
+    setToasts((current) => [...current, { id, content, kind }]);
+    window.setTimeout(() => setToasts((current) => current.filter((toast) => toast.id !== id)), 3500);
+  }, []);
+
   const updateAssistant = useCallback((eventThreadId: string, content: string, append: boolean, error = false) => {
     setMessages((current) => {
+      const id = assistantMessageId(eventThreadId, assistantTurnRef.current[eventThreadId] ?? 1);
       let index = -1;
       for (let cursor = current.length - 1; cursor >= 0; cursor -= 1) {
         const message = current[cursor];
-        if (message?.role === 'assistant' && message.id === `assistant-${eventThreadId}`) {
+        if (message?.role === 'assistant' && message.id === id) {
           index = cursor;
           break;
         }
       }
       if (index < 0) {
         return [...current, {
-          id: `assistant-${eventThreadId}`,
+          id,
           role: 'assistant',
           content,
           timestamp: new Date().toISOString(),
@@ -141,7 +179,6 @@ export function App() {
       return next;
     });
   }, []);
-
   const updateTask = useCallback((task: TaskItem) => {
     setTasks((current) => {
       const existing = current.findIndex((item) => item.id === task.id);
@@ -154,7 +191,9 @@ export function App() {
 
   const handleSocketEvent = useCallback((event: WSEvent) => {
     lastActivityRef.current = Date.now();  // 任何事件都算心跳，避免看门狗误判长任务
-    if (isBackgroundEvent(event.thread_id, threadIdRef.current)) {
+    // 事件按 thread_id 隔离：转入后台/已结束会话的迟到事件路由到对应后台视图，不污染当前会话。
+    const target = resolveEventTarget(event.thread_id, threadIdRef.current, detachedThreadIdsRef.current);
+    if (target === 'background') {
       // 后台/定时会话的进度不覆盖当前会话视图，但审批必须照常入队并弹窗（B3）。
       setThreadViews((current) => {
         const view = current[event.thread_id] ?? { messages: [], tasks: [], busy: true };
@@ -212,9 +251,17 @@ export function App() {
         const failed = event.payload.status === 'failed' || event.payload.status === 'cancelled';
         const finalText = payloadText(event.payload, 'message', 'content', 'result');
         if (finalText) updateAssistant(event.thread_id, finalText, false, failed);
-        setMessages((current) => current.map((message) => message.id === `assistant-${event.thread_id}` ? { ...message, pending: false } : message));
+        const assistantId = assistantMessageId(event.thread_id, assistantTurnRef.current[event.thread_id] ?? 1);
+        const summary = parseSummary(event.payload.summary);
+        setMessages((current) => current.map((message) => {
+          if (message.id !== assistantId) return message;
+          const next = { ...message, pending: false };
+          if (summary) return { ...next, summary, threadId: event.thread_id };
+          return next;
+        }));
         setTasks((current) => current.map((task) => task.threadId === event.thread_id && task.status === 'running' ? { ...task, status: failed ? 'failed' : 'success', updatedAt: now } : task));
         setBusy(false);
+        notify(failed ? '任务已结束（失败或已取消）。' : '任务已完成，结果见下方摘要。', failed ? 'error' : 'success');
         break;
       }
       case 'error': {
@@ -222,10 +269,11 @@ export function App() {
         updateAssistant(event.thread_id, text, false, true);
         setTasks((current) => current.map((task) => task.threadId === event.thread_id && task.status === 'running' ? { ...task, status: 'failed', updatedAt: now } : task));
         setBusy(false);
+        notify('任务执行失败，可查看「操作日志」定位问题。', 'error');
         break;
       }
     }
-  }, [updateAssistant, updateTask]);
+  }, [notify, updateAssistant, updateTask]);
 
   useEffect(() => {
     setConnectionState('connecting');
@@ -249,6 +297,12 @@ export function App() {
     };
   }, [clientId, handleSocketEvent, wsBase]);
 
+  /** 手动重连：连接断开时由界面上的「立即重试」触发。 */
+  const reconnectSocket = useCallback(() => {
+    socketRef.current?.connect();
+    notify('正在重新连接本地服务…');
+  }, [notify]);
+
   // B2 兜底：WS 断线时后端事件无处可送，前端只认终态事件来解除 busy，于是永久卡死。
   // 以“最后一次收到事件的时刻”为心跳，失联超时即强制解除并明确告知用户。
   useEffect(() => {
@@ -267,8 +321,45 @@ export function App() {
     return () => clearInterval(timer);
   }, [busy]);
 
+  // 首次使用检查：启动后调用健康检查与配置接口，判断后端连接、模型、沙箱目录、OCR。
+  // 纯浏览器开发环境拿不到 /api/config 令牌时对应项为 null（不误报“未配置”）。
+  const refreshSetupCheck = useCallback(async () => {
+    let backendOk = false;
+    try {
+      const health = await api.getHealth();
+      backendOk = health?.status === 'ok';
+    } catch {
+      backendOk = false;
+    }
+    let config: BackendConfig | null = null;
+    try {
+      config = await api.getConfig();
+    } catch {
+      config = null;
+    }
+    setSetupHints({
+      checked: true,
+      backendOk,
+      modelOk: config === null
+        ? null
+        : config.model_provider === 'ollama'
+          ? Boolean(config.ollama_model)
+          : Boolean(config.openai_model) && config.openai_api_key_set !== false,
+      sandboxOk: config === null ? null : Array.isArray(config.sandbox_roots) && config.sandbox_roots.length > 0,
+      ocrOk: config === null ? null : Boolean(config.ocr_enabled),
+    });
+  }, [api]);
+
+  useEffect(() => {
+    void refreshSetupCheck();
+  }, [refreshSetupCheck]);
+
   const sendChat = useCallback((message: string) => {
-    if (threadId) setActiveThreadId(threadId);
+    if (threadId) {
+      setActiveThreadId(threadId);
+      // 追问同一会话时推进回合序号：本次回答进入新的气泡，不再往第一条回复里追加。
+      assistantTurnRef.current[threadId] = (assistantTurnRef.current[threadId] ?? 1) + 1;
+    }
     const userMessage: ChatMessage = { id: createId('user'), role: 'user', content: message, timestamp: new Date().toISOString() };
     setMessages((current) => [...current, userMessage]);
     // 心跳从“发出请求”开始计，断线时也就从这一刻起测算失联时长。
@@ -312,15 +403,17 @@ export function App() {
       content: `已请求结束 ${targets.length} 个正在运行的工作流。后端会在下一个步骤边界停止；停在等待审批的会话会在此后恢复时停止。`,
       timestamp: new Date().toISOString(),
     }]);
-  }, [busy, requestCancel, runningBackgroundIds, threadId]);
+    notify(`已请求结束 ${targets.length} 个正在运行的工作流。`, 'info');
+  }, [busy, notify, requestCancel, runningBackgroundIds, threadId]);
 
   /** 清空当前对话视图，下一条消息开启新会话；后端记录与操作日志不受影响。 */
-  const startNewConversation = useCallback(() => {
+  const resetForeground = useCallback(() => {
     setThreadId(undefined);
     threadIdRef.current = undefined;
     setActiveThreadId(undefined);
     setTasks([]);
     setBusy(false);
+    assistantTurnRef.current = {};
     setMessages([{
       id: createId('system'),
       role: 'system',
@@ -328,6 +421,39 @@ export function App() {
       timestamp: new Date().toISOString(),
     }]);
   }, []);
+
+  /**
+   * 新对话统一入口（按钮与 /新会话 共用）：任务运行时不静默清空，先让用户选择去向；
+   * 空闲时直接清空。
+   */
+  const requestNewConversation = useCallback(() => {
+    if (shouldPromptNewConversation(chatBusy)) {
+      setNewChatModalOpen(true);
+      return;
+    }
+    resetForeground();
+  }, [chatBusy, resetForeground]);
+
+  /**
+   * 新对话决策：结束 / 转入后台 都会先把当前会话快照放进后台视图表，并把它记入
+   * detached 集合，旧会话的迟到事件从此只进后台视图，绝不污染新会话。
+   */
+  const handleNewChatChoice = useCallback((action: NewConversationAction) => {
+    if (action === 'cancel') {
+      setNewChatModalOpen(false);
+      return;
+    }
+    const currentThreadId = threadIdRef.current;
+    const hasWork = chatMessages.length > 0 || chatTasks.length > 0 || chatBusy;
+    if (action === 'end' && chatBusy && currentThreadId) requestCancel(currentThreadId);
+    if (currentThreadId && hasWork) {
+      setThreadViews((current) => detachThreadToViews(current, currentThreadId, { messages: chatMessages, tasks: chatTasks, busy: chatBusy }));
+      detachedThreadIdsRef.current.add(currentThreadId);
+    }
+    setNewChatModalOpen(false);
+    resetForeground();
+    notify(action === 'end' ? '已结束当前任务并新建对话。' : '当前任务已转入后台，可在活动中心查看。', 'success');
+  }, [chatBusy, chatMessages, chatTasks, notify, requestCancel, resetForeground]);
 
   const showHelp = useCallback(() => {
     setMessages((current) => [...current, {
@@ -347,12 +473,13 @@ export function App() {
       if (!socketRef.current?.send({ type: 'approval', ...response })) await api.respondToApproval(response);
       setApprovalQueue((current) => current.slice(1));
       updateTask({ id: `approval-${approval.approval_id}`, title: approval.action, detail: approval.target, status: decision === 'approve' ? 'running' : 'failed', updatedAt: new Date().toISOString(), threadId: approval.thread_id });
+      notify(decision === 'approve' ? '已批准该操作，任务继续执行。' : '已拒绝该操作，任务已停止此步骤。', 'success');
     } catch (error) {
-      setMessages((current) => [...current, { id: createId('system'), role: 'system', content: error instanceof Error ? `审批提交失败：${error.message}` : '审批提交失败', timestamp: new Date().toISOString(), error: true }]);
+      notify(error instanceof Error ? `审批提交失败：${error.message}` : '审批提交失败', 'error');
     } finally {
       setApprovalSubmitting(false);
     }
-  }, [api, approvalQueue, updateTask]);
+  }, [api, approvalQueue, notify, updateTask]);
 
   const loadSettingsData = useCallback(async () => {
     setSettingsLoading(true);
@@ -378,24 +505,76 @@ export function App() {
     setSettingsOpen(true);
   }, []);
 
-  /** 撤销本次会话已完成的文件操作（复用 /api/threads/{id}/rollback）。 */
-  const rollbackCurrentThread = useCallback(async () => {
-    const targetId = threadIdRef.current;
-    const notice = (content: string, error = false): void => {
-      setMessages((current) => [...current, { id: createId('system'), role: 'system', content, timestamp: new Date().toISOString(), error }]);
-    };
-    if (!targetId) {
-      notice('当前没有可撤销的会话。', true);
+  /**
+   * 撤销指定会话（默认当前会话）已完成的文件操作（复用 /api/threads/{id}/rollback）。
+   * 由聊天输入、任务结果卡与活动中心共用。
+   */
+  const rollbackThread = useCallback(async (targetId?: string) => {
+    const id = targetId ?? threadIdRef.current;
+    if (!id) {
+      notify('当前没有可撤销的会话。', 'error');
       return;
     }
     try {
-      await api.rollbackThread(targetId);
-      notice('已撤销本次会话中可撤销的文件操作，详情见「操作日志」。');
+      await api.rollbackThread(id);
+      notify('已撤销本次会话中可撤销的文件操作，详情见「操作日志」。', 'success');
       void loadSettingsData();
     } catch (error) {
-      notice(error instanceof Error ? `撤销失败：${error.message}` : '撤销失败', true);
+      notify(error instanceof Error ? `撤销失败：${error.message}` : '撤销失败', 'error');
     }
-  }, [api, loadSettingsData]);
+  }, [api, loadSettingsData, notify]);
+
+  /** 从后台视图切换到前台会话：取回该会话的消息/任务/忙碌态，并从后台表中移除。 */
+  const switchToThread = useCallback((targetId: string) => {
+    const view = threadViews[targetId];
+    if (!view) {
+      notify('找不到该会话。', 'error');
+      return;
+    }
+    setMessages(view.messages);
+    setTasks(view.tasks);
+    setBusy(view.busy);
+    setThreadId(targetId);
+    threadIdRef.current = targetId;
+    // 切回后该会话不再按后台路由；assistantTurnRef 归零，让下一条回复从第 1 回合开始。
+    assistantTurnRef.current[targetId] = 0;
+    setActiveThreadId(undefined);
+    detachedThreadIdsRef.current.delete(targetId);
+    setThreadViews((current) => {
+      const next = { ...current };
+      delete next[targetId];
+      return next;
+    });
+    notify('已切换到该会话。');
+  }, [notify, threadViews]);
+
+  const viewActivityResult = useCallback((item: ActivityItem) => {
+    if (item.kind === 'approval') {
+      notify('该审批已在弹窗中，可直接处理。');
+      return;
+    }
+    if (item.kind === 'current' || !item.threadId) {
+      notify('当前会话的结果已在上方显示。');
+      return;
+    }
+    switchToThread(item.threadId);
+  }, [notify, switchToThread]);
+
+  const copyActivityResult = useCallback((item: ActivityItem) => {
+    const value = item.resultPaths?.[0] ?? item.summary;
+    if (!value) {
+      notify('暂无可复制的结果。', 'error');
+      return;
+    }
+    if (typeof navigator.clipboard?.writeText !== 'function') {
+      notify('当前环境不支持自动复制，请手动选择。', 'error');
+      return;
+    }
+    void navigator.clipboard.writeText(value).then(
+      () => notify('已复制路径。', 'success'),
+      () => notify('复制失败，请手动选择。', 'error'),
+    );
+  }, [notify]);
 
   /**
    * 斜杠指令分发。
@@ -416,8 +595,8 @@ export function App() {
     }
     const handlers: Record<SlashCommandName, () => void> = {
       '结束': endWorkflows,
-      '新会话': startNewConversation,
-      '撤销': () => void rollbackCurrentThread(),
+      '新会话': requestNewConversation,
+      '撤销': () => void rollbackThread(),
       '日志': () => openSettings('logs'),
       '任务': () => openSettings('schedules'),
       '模型': () => openSettings('model'),
@@ -425,7 +604,7 @@ export function App() {
       '帮助': showHelp,
     };
     handlers[name]();
-  }, [endWorkflows, openSettings, rollbackCurrentThread, showHelp, startNewConversation]);
+  }, [endWorkflows, openSettings, requestNewConversation, rollbackThread, showHelp]);
 
   const saveEndpoints = (newApiBase: string, newWsBase: string): void => {
     if (!newApiBase || !newWsBase) return;
@@ -433,6 +612,7 @@ export function App() {
     localStorage.setItem('file-butler-ws-base', newWsBase);
     setApiBase(newApiBase);
     setWsBase(newWsBase);
+    notify('连接地址已保存，正在重连…');
   };
 
   const saveLLM = async (update: LLMSettingsUpdate): Promise<void> => {
@@ -440,6 +620,7 @@ export function App() {
     try {
       const saved = await api.updateLLMSettings(update);
       setLLMSettings(saved);
+      void refreshSetupCheck();
     } catch (error) {
       setSettingsError(error instanceof Error ? error.message : '保存模型配置失败');
       throw error;
@@ -453,6 +634,7 @@ export function App() {
     try {
       const saved = await api.updateSandboxSettings(roots);
       setSandboxSettings(saved);
+      void refreshSetupCheck();
     } catch (error) {
       setSettingsError(error instanceof Error ? error.message : '保存沙箱目录失败');
       throw error;
@@ -502,9 +684,25 @@ export function App() {
     }
   };
 
-  const clearCompleted = (): void => {
-    setTasks((current) => current.filter((task) => task.status === 'running' || task.status === 'waiting' || task.status === 'pending'));
-  };
+  // 当前会话最近一次任务的结构化摘要：从最后一条带摘要的助手消息取。
+  const currentSummary = useMemo<TaskSummary | undefined>(() => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message?.summary) return message.summary;
+    }
+    return undefined;
+  }, [messages]);
+
+  const currentForegroundView = useMemo<ThreadViewState>(() => {
+    const base: ThreadViewState = { messages, tasks, busy };
+    return currentSummary ? { ...base, summary: currentSummary } : base;
+  }, [busy, currentSummary, messages, tasks]);
+
+  /** 右侧活动中心条目：当前会话 + 后台/定时会话（逐一列出，不折叠成数字）+ 待审批任务。 */
+  const activityItems = useMemo(
+    () => buildActivityItems(threadViews, activeThreadId, currentForegroundView, approvalQueue),
+    [activeThreadId, approvalQueue, currentForegroundView, threadViews],
+  );
 
   return (
     <div className="app-shell">
@@ -533,18 +731,33 @@ export function App() {
 
       <main className="workspace">
         <ChatPanel
-          messages={activeThreadId && threadViews[activeThreadId] ? threadViews[activeThreadId].messages : messages}
+          messages={chatMessages}
           connectionState={connectionState}
-          busy={activeThreadId && threadViews[activeThreadId] ? threadViews[activeThreadId].busy : busy}
+          busy={chatBusy}
           runningCount={runningCount}
+          setupHints={setupHints}
           onSend={sendChat}
           onEnd={endWorkflows}
           onCommand={runCommand}
+          onNewConversation={requestNewConversation}
+          onOpenSettings={openSettings}
+          onRetryConnect={reconnectSocket}
+          onRetrySetup={() => void refreshSetupCheck()}
+          onNotify={notify}
+          onRollbackThread={(threadId) => void rollbackThread(threadId)}
         />
-        <TaskBoard tasks={activeThreadId && threadViews[activeThreadId] ? threadViews[activeThreadId].tasks : tasks} onClear={clearCompleted} />
+        <ActivityCenter
+          items={activityItems}
+          onSwitch={switchToThread}
+          onStop={(threadId) => requestCancel(threadId)}
+          onViewResult={viewActivityResult}
+          onCopyResult={(item) => void copyActivityResult(item)}
+        />
       </main>
 
       <ApprovalModal approval={approvalQueue[0] ?? null} queueSize={approvalQueue.length} submitting={approvalSubmitting} onDecision={(decision) => void decideApproval(decision)} />
+      <NewConversationModal open={newChatModalOpen} onChoose={handleNewChatChoice} onCancel={() => setNewChatModalOpen(false)} />
+      <ToastStack toasts={toasts} />
       <Settings
         open={settingsOpen}
         initialTab={settingsTab}

@@ -11,16 +11,52 @@ interface ApprovalModalProps {
 }
 
 export function ApprovalModal({ approval, queueSize = 1, submitting, onDecision }: ApprovalModalProps) {
+  const modalRef = useRef<HTMLElement>(null);
   const rejectButtonRef = useRef<HTMLButtonElement>(null);
+  const lastFocusedRef = useRef<Element | null>(null);
+  const wasOpenRef = useRef(false);
 
+  // 打开时记录触发元素并聚焦拒绝按钮；关闭后把焦点还给触发元素。
   useEffect(() => {
-    if (approval) rejectButtonRef.current?.focus();
+    if (approval) {
+      if (!wasOpenRef.current) {
+        lastFocusedRef.current = document.activeElement;
+        window.setTimeout(() => rejectButtonRef.current?.focus(), 0);
+      }
+      wasOpenRef.current = true;
+    } else if (wasOpenRef.current) {
+      wasOpenRef.current = false;
+      const restoreTo = lastFocusedRef.current;
+      if (restoreTo instanceof HTMLElement) restoreTo.focus();
+    }
   }, [approval]);
 
+  // Esc 拒绝；Tab/Shift+Tab 在弹窗内循环，焦点不逃逸到背景。
   useEffect(() => {
     if (!approval) return;
     const handleKey = (event: KeyboardEvent): void => {
-      if (event.key === 'Escape' && !submitting) onDecision('reject');
+      if (event.key === 'Escape' && !submitting) {
+        event.preventDefault();
+        onDecision('reject');
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const modal = modalRef.current;
+      if (!modal) return;
+      const focusables = Array.from(modal.querySelectorAll<HTMLElement>(
+        'button, input, select, textarea, a[href], [tabindex]:not([tabindex="-1"])',
+      )).filter((el) => !el.hasAttribute('disabled') && el.offsetParent !== null);
+      if (focusables.length === 0) return;
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      if (!first || !last) return;
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
     };
     window.addEventListener('keydown', handleKey);
     return () => window.removeEventListener('keydown', handleKey);
@@ -30,7 +66,7 @@ export function ApprovalModal({ approval, queueSize = 1, submitting, onDecision 
 
   return (
     <div className="modal-backdrop" role="presentation">
-      <section className="approval-modal" role="alertdialog" aria-modal="true" aria-labelledby="approval-title" aria-describedby="approval-detail">
+      <section ref={modalRef} className="approval-modal" role="alertdialog" aria-modal="true" aria-labelledby="approval-title" aria-describedby="approval-detail">
         <div className="warning-icon" aria-hidden="true">!</div>
         <p className="eyebrow">需要你的确认</p>
         <h2 id="approval-title">即将执行高风险操作</h2>

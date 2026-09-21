@@ -283,6 +283,7 @@ async def _fail_terminal(
                 status="failed",
                 message=message,
                 error=detail or message,
+                summary=ws_events.build_task_summary([]),
             ),
         )
     except Exception:  # noqa: BLE001 - 兜底广播本身失败时不应再抛出，避免掩盖原始错误
@@ -322,6 +323,7 @@ async def _run_stream(
                             WSEventType.done, thread_id,
                             status="cancelled",
                             message="任务已停止。当前步骤前的操作已保留，可在操作日志中查看或撤销。",
+                            summary=ws_events.build_task_summary(get_runtime().state(thread_id).get("observations", [])),
                         ),
                     )
                 return get_runtime().state(thread_id)
@@ -353,6 +355,7 @@ async def _run_stream(
                     message=state.get("final_response", ""),
                     error=state.get("error", ""),
                     observations=state.get("observations", []),
+                    summary=ws_events.build_task_summary(state.get("observations", [])),
                 ),
             )
         return state
@@ -445,6 +448,7 @@ def public_config() -> Dict[str, Any]:
     return {
         "model_provider": config.provider,
         "openai_model": config.openai_model,
+        "openai_api_key_set": bool(config.openai_api_key),
         "ollama_model": config.ollama_model,
         "ollama_base_url": config.ollama_base_url,
         "sandbox_roots": [str(path) for path in sandbox_config.effective_roots()],

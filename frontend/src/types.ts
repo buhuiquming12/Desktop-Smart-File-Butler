@@ -44,6 +44,10 @@ export interface ChatMessage {
   timestamp: string;
   pending?: boolean;
   error?: boolean;
+  /** 任务完成时由 done 事件携带的结构化摘要（可选，无则纯文本降级）。 */
+  summary?: TaskSummary;
+  /** 归属会话；有摘要时用于撤销/详情定位。 */
+  threadId?: string;
 }
 
 export type TaskStatus = 'pending' | 'running' | 'success' | 'failed' | 'waiting';
@@ -131,12 +135,69 @@ export interface SandboxSettings {
   env_roots: string[];
 }
 
+/** 任务完成结构化摘要（后端 done 事件 payload.summary）。 */
+export interface TaskSummaryOperation {
+  tool: string;
+  tool_label: string;
+  description: string;
+  status: string;
+  status_label: string;
+  path: string;
+  dest?: string | null;
+}
+
+export interface TaskSummary {
+  ok: number;
+  failed: number;
+  skipped: number;
+  files: string[];
+  operations: TaskSummaryOperation[];
+}
+
+/** 首次使用检查结果：null 表示「未能确认」（如配置接口需要令牌而当前环境无法提供）。 */
+export interface SetupHints {
+  /** 是否已执行过检查（避免闪烁）。 */
+  checked: boolean;
+  backendOk: boolean;
+  modelOk: boolean | null;
+  sandboxOk: boolean | null;
+  ocrOk: boolean | null;
+}
+
+/** 活动中心条目来源分组。 */
+export type ActivityKind = 'current' | 'background' | 'scheduled' | 'approval';
+
+export interface ActivityItem {
+  id: string;
+  kind: ActivityKind;
+  source: string;
+  /** 状态文本（用于徽标与 aria-label）。 */
+  status: TaskStatus;
+  statusLabel: string;
+  updatedAt: string;
+  summary: string;
+  threadId: string;
+  approvalId?: string;
+  /** 是否正在运行（可停止、可结束计数）。 */
+  running: boolean;
+  /** 是否为当前正在查看的会话。 */
+  active: boolean;
+  /** 是否有可展开的操作明细/详情。 */
+  hasDetail: boolean;
+  /** 是否可以切换到该会话（有消息或任务历史可查看）。 */
+  switchable: boolean;
+  /** 结果涉及的主要文件/目录路径（来自结构化摘要），供复制/打开所在目录。 */
+  resultPaths?: string[];
+}
+
 /** preload 注入的桌面桥接对象（见 electron/preload.cts）。 */
 export interface DesktopBridge {
   platform: string;
   sessionToken: string;
   backendUrl: string;
   chooseDirectory: () => Promise<string | null>;
+  /** 在系统文件管理器中显示指定路径（仅本地绝对路径，经主进程参数校验后执行）。 */
+  revealPath: (filePath: string) => Promise<boolean>;
   versions: { electron: string; chrome: string; node: string };
 }
 

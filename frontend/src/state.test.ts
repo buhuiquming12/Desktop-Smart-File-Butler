@@ -11,12 +11,19 @@ import {
   BUSY_STALL_TIMEOUT_MS,
   addToApprovalQueue,
   approvalOrigin,
+  buildActivityItems,
+  detachThreadToViews,
   isBackgroundEvent,
+  isNearBottom,
   isStalled,
   parseApproval,
   reduceThreadEvent,
+  resolveEventTarget,
+  shouldAutoScroll,
+  shouldPromptNewConversation,
   shortThreadId,
   updateAssistant,
+  type ThreadViewState,
 } from './state';
 import type { PendingApproval, WSEvent } from './types';
 
@@ -132,3 +139,74 @@ const help = helpText();
 for (const command of SLASH_COMMANDS) {
   if (!help.includes(`/${command.name} `)) throw new Error(`B11: 帮助缺少指令 ${command.name}`);
 }
+
+
+// ---- 体验优化：新对话生命周期、后台隔离、迟到事件、任务切换、自动滚动 ----
+
+// 新对话决策：只有任务在跑才需要弹窗。
+if (!shouldPromptNewConversation(true)) throw new Error('running busy 未提示决策');
+if (shouldPromptNewConversation(false)) throw new Error('空闲时不应提示决策');
+
+// 「结束并新建 / 转入后台」都会先把当前会话快照放进后台视图表。
+const detached = detachThreadToViews({}, 'old', { messages: [], tasks: [], busy: true });
+if (!detached['old'] || !detached['old'].busy) throw new Error('detachThreadToViews 未快照为 busy');
+
+// 新会话开始后 activeThreadId 为 undefined，旧会话迟到事件仍必须按后台路由，不污染新会话。
+if (resolveEventTarget('old', undefined, new Set(['old'])) !== 'background') throw new Error('迟到事件未按后台路由');
+if (resolveEventTarget('new', undefined, new Set(['old'])) !== 'foreground') throw new Error('新会话事件被误判为后台');
+if (!isBackgroundEvent('old', undefined, new Set(['old']))) throw new Error('detached 集合未被 isBackgroundEvent 识别');
+
+// 任务切换：切换到后台会话时，从 views 中取对应消息。
+const threadViews: Record<string, ThreadViewState> = { 'bg-123': { messages: [{ id: 'm1', role: 'assistant', content: '后台结果', timestamp: '2026-01-01T00:00:00Z' }], tasks: [], busy: false } };
+const items = buildActivityItems(threadViews, undefined, { messages: [], tasks: [], busy: false }, []);
+if (!items.some((item) => item.threadId === 'bg-123' && item.kind === 'background')) throw new Error('活动中心未展示后台会话');
+if (!items.some((item) => item.threadId === 'bg-123' && item.switchable)) throw new Error('后台会话未标记为可切换');
+const switchedView = threadViews['bg-123'];
+if (switchedView?.messages[0]?.content !== '后台结果') throw new Error('切换视图取回内容失败');
+
+// 活动中心分类：定时任务 / 审批。
+const scheduled: Record<string, ThreadViewState> = { 'scheduled-abc': { messages: [], tasks: [{ id: 't1', title: '整理', detail: '扫描', status: 'running', updatedAt: '2026-01-01T00:00:00Z', threadId: 'scheduled-abc' }], busy: true } };
+const withApproval = [{ approval_id: 'ap-1', action: 'delete', target: 'a.txt', detail: '', created_at: '2026-01-01T00:00:00Z', thread_id: 'scheduled-abc' }];
+const scheduledItems = buildActivityItems(scheduled, undefined, { messages: [], tasks: [], busy: false }, []);
+if (!scheduledItems.some((item) => item.threadId === 'scheduled-abc' && item.kind === 'scheduled')) throw new Error('定时任务实例未进入活动中心');
+if (!buildActivityItems({}, undefined, { messages: [], tasks: [], busy: false }, withApproval).some((item) => item.kind === 'approval' && item.approvalId === 'ap-1')) throw new Error('待审批任务未进入活动中心');
+
+// 自动滚动判定：只在底部附近或本就在底部时才跟随。
+if (isNearBottom(100, 500, 100)) throw new Error('距底过远误判为在底部');
+if (!isNearBottom(400, 500, 100)) throw new Error('距底 0 未判定为在底部');
+if (!shouldAutoScroll(true, 300, 500, 100)) throw new Error('此前在底部时不应停止跟随');
+if (shouldAutoScroll(false, 100, 500, 100)) throw new Error('用户离开底部后不应自动滚动');
+
+// 结构化摘要：done 事件携带 summary 时应写入会话视图，且挂在对应助手消息上。
+const summaryEvent = event('s-1', 'done', {
+  status: 'completed',
+  message: '整理完成',
+  summary: {
+    ok: 3,
+    failed: 1,
+    skipped: 2,
+    files: ['C:/a', 'C:/b'],
+    operations: [
+      { tool: 'move_file', tool_label: '移动文件', description: '移动 2 个文件', status: 'ok', status_label: '成功', path: 'C:/a', dest: 'C:/dst' },
+    ],
+  },
+});
+const summaryView = reduceThreadEvent({ messages: [{ id: 'assistant-s-1', role: 'assistant', content: '正在整理', timestamp: '2026-01-01T00:00:00Z', pending: true }], tasks: [], busy: true }, summaryEvent).view;
+if (summaryView.summary?.ok !== 3 || summaryView.summary?.failed !== 1) throw new Error('done 摘要未写入视图');
+if (summaryView.summary?.skipped !== 2) throw new Error('done 摘要 skipped 未解析');
+if (summaryView.summary?.files?.[0] !== 'C:/a') throw new Error('done 摘要文件路径未解析');
+if (summaryView.messages[0]?.summary?.operations?.[0]?.dest !== 'C:/dst') throw new Error('摘要未挂到助手消息');
+if (summaryView.messages[0]?.threadId !== 's-1') throw new Error('摘要消息未记录来源会话');
+
+// 缺 summary 的终态不产生摘要，纯文本降级路径不受影响。
+const noSummaryView = reduceThreadEvent({ messages: [], tasks: [], busy: true }, event('s-2', 'done', { status: 'completed', message: '完成' })).view;
+if (noSummaryView.summary !== undefined) throw new Error('无摘要时不应生成 summary 字段');
+if (noSummaryView.messages[0]?.summary !== undefined) throw new Error('无摘要时消息不应带 summary');
+
+// 非法形状的 summary 必须被拒，防止未经处理的 HTML/坏数据进入页面。
+const badSummaryView = reduceThreadEvent({ messages: [], tasks: [], busy: true }, event('s-3', 'done', { status: 'completed', summary: { html: '<script>' } })).view;
+if (badSummaryView.summary !== undefined) throw new Error('非法摘要形状未被拒绝');
+
+// 活动中心展示结构化摘要的路径，供「复制结果 / 打开所在目录」使用。
+const summaryItems = buildActivityItems({}, undefined, { messages: [{ id: 'm1', role: 'assistant', content: '完成', timestamp: '2026-01-01T00:00:00Z' }], tasks: [], busy: false, summary: { ok: 1, failed: 0, skipped: 0, files: ['C:/x.txt'], operations: [] } }, []);
+if (summaryItems[0]?.resultPaths?.[0] !== 'C:/x.txt') throw new Error('当前会话 resultPaths 未透出摘要文件');
