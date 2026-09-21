@@ -92,6 +92,19 @@ def test_scan_stops_at_depth_cap(sandbox: Path, monkeypatch: pytest.MonkeyPatch)
     assert "three.txt" not in found, "超过深度上限仍在下探"
 
 
+def test_depth_cap_does_not_skip_shallow_sibling_branch(sandbox: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(filesystem, "_MAX_SCAN_DEPTH", 2)
+    shallow = sandbox / "a-shallow"
+    shallow.mkdir()
+    (shallow / "must-find.txt").write_text("x", encoding="utf-8")
+    # 后压栈的分支先遍历，并在第二层碰到更深目录；旧实现会在这里终止整个扫描。
+    (sandbox / "z-deep" / "child").mkdir(parents=True)
+
+    found = _names(filesystem.scan_directory(str(sandbox), recursive=True))
+
+    assert "must-find.txt" in found
+
+
 def test_scan_does_not_follow_directory_symlink(sandbox: Path) -> None:
     """符号链接目录不跟进：指向自身的环不得让扫描停不下来。"""
     (sandbox / "real").mkdir()

@@ -21,15 +21,21 @@ logger = get_logger(__name__)
 _scheduler: Optional[BackgroundScheduler] = None
 # runner(directory, instruction) -> None
 _runner: Optional[Callable[[str, str], None]] = None
-_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="butler-job")
+def _new_executor() -> ThreadPoolExecutor:
+    return ThreadPoolExecutor(max_workers=4, thread_name_prefix="butler-job")
+
+
+_executor = _new_executor()
 _running_directories: Set[str] = set()
 _running_lock = threading.Lock()
 
 
 def init_scheduler(runner: Callable[[str, str], None]) -> None:
     """启动调度器并从 DB 装载已有任务。"""
-    global _scheduler, _runner
+    global _scheduler, _runner, _executor
     _runner = runner
+    if getattr(_executor, "_shutdown", False):
+        _executor = _new_executor()
     if _scheduler is None:
         _scheduler = BackgroundScheduler()
         _scheduler.start()
@@ -37,16 +43,21 @@ def init_scheduler(runner: Callable[[str, str], None]) -> None:
 
     for job in db.list_jobs():
         if job.enabled:
-            _register(job)
+            try:
+                _register(job)
+            except ValueError as exc:
+                # 兼容旧数据库中的坏记录：不让单条非法 cron 阻断整个调度器启动。
+                logger.error("跳过非法定时任务 %s（cron=%s）: %s", job.job_id, job.cron, exc)
+
+
+def validate_cron(cron: str) -> None:
+    """校验标准五段 crontab；供 REST 与 Agent 两条创建链路共用。"""
+    CronTrigger.from_crontab(cron)
 
 
 def _register(job: ScheduledJob) -> None:
     assert _scheduler is not None
-    try:
-        trigger = CronTrigger.from_crontab(job.cron)
-    except ValueError as exc:
-        logger.error("非法 cron 表达式 %s: %s", job.cron, exc)
-        return
+    trigger = CronTrigger.from_crontab(job.cron)
 
     _scheduler.add_job(
         _fire,
@@ -98,6 +109,8 @@ def _legacy_fire(directory: str, instruction: str) -> None:
 
 def add_job(job: ScheduledJob) -> None:
     """新增/更新定时任务，持久化并注册。"""
+    # 必须先校验再落库；此前 Agent 路径会把永远无法注册的坏 cron 当成功保存。
+    validate_cron(job.cron)
     db.upsert_job(job)
     if _scheduler is not None:
         if job.enabled:
@@ -115,6 +128,9 @@ def remove_job(job_id: str, delete_record: bool = True) -> None:
 
 
 def shutdown() -> None:
+    global _scheduler, _runner
     if _scheduler is not None:
         _scheduler.shutdown(wait=False)
+        _scheduler = None
+    _runner = None
     _executor.shutdown(wait=False, cancel_futures=True)

@@ -14,12 +14,14 @@ logger = get_logger(__name__)
 
 _TEXT_EXTS = {"txt", "md", "csv", "log", "json"}
 _MAX_CHARS = 20_000  # 提取文本上限，避免超长内容压爆上下文
+_MAX_SOURCE_BYTES = 50 * 1024 * 1024  # 读取/解析前先限源文件，避免大文件耗尽内存
+_MAX_PDF_PAGES = 500
 
 
 def _truncate(text: str, max_chars: int | None = _MAX_CHARS) -> str:
     text = text.strip()
     if max_chars is not None and len(text) > max_chars:
-        return text[:max_chars] + f"\n...[已截断，原文 {len(text)} 字符]"
+        return text[:max_chars] + "\n...[已截断]"
     return text
 
 
@@ -31,29 +33,46 @@ def chunk_text(text: str, size: int) -> list[str]:
     return [text[i : i + size] for i in range(0, len(text), size)]
 
 
-def extract_pdf(path: Path) -> str:
+def extract_pdf(path: Path, max_chars: int | None = _MAX_CHARS) -> str:
     try:
         from pypdf import PdfReader
     except ImportError:
         return "[未安装 pypdf，无法解析 PDF]"
     reader = PdfReader(str(path))
-    parts = [page.extract_text() or "" for page in reader.pages]
+    if len(reader.pages) > _MAX_PDF_PAGES:
+        raise ValueError(f"PDF 页数超过上限 {_MAX_PDF_PAGES}: {path.name}")
+    parts: list[str] = []
+    length = 0
+    for page in reader.pages:
+        value = page.extract_text() or ""
+        parts.append(value)
+        length += len(value)
+        if max_chars is not None and length > max_chars:
+            break
     return "\n".join(parts)
 
 
-def extract_docx(path: Path) -> str:
+def extract_docx(path: Path, max_chars: int | None = _MAX_CHARS) -> str:
     try:
         import docx
     except ImportError:
         return "[未安装 python-docx，无法解析 Word]"
     doc = docx.Document(str(path))
-    return "\n".join(p.text for p in doc.paragraphs)
+    parts: list[str] = []
+    length = 0
+    for paragraph in doc.paragraphs:
+        parts.append(paragraph.text)
+        length += len(paragraph.text)
+        if max_chars is not None and length > max_chars:
+            break
+    return "\n".join(parts)
 
 
-def extract_txt(path: Path) -> str:
+def extract_txt(path: Path, max_chars: int | None = _MAX_CHARS) -> str:
     for enc in ("utf-8", "gbk", "latin-1"):
         try:
-            return path.read_text(encoding=enc)
+            with path.open("r", encoding=enc) as handle:
+                return handle.read(None if max_chars is None else max_chars + 1)
         except (UnicodeDecodeError, OSError):
             continue
     return "[无法以常见编码读取文本文件]"
@@ -94,14 +113,21 @@ def extract_text(file_path: str, max_chars: int | None = _MAX_CHARS) -> str:
     20k，避免分类等场景把超长内容压爆上下文。
     """
     p = resolve_in_sandbox(file_path, must_exist=True)
+    if not p.is_file():
+        raise IsADirectoryError(f"不是文件: {p}")
+    size = p.stat().st_size
+    if size > _MAX_SOURCE_BYTES:
+        raise ValueError(
+            f"文件过大（{size} 字节），超过提取上限 {_MAX_SOURCE_BYTES} 字节: {p.name}"
+        )
     ext = p.suffix.lower().lstrip(".")
 
     if ext == "pdf":
-        text = extract_pdf(p)
+        text = extract_pdf(p, max_chars)
     elif ext in {"docx", "doc"}:
-        text = extract_docx(p)
+        text = extract_docx(p, max_chars)
     elif ext in _TEXT_EXTS:
-        text = extract_txt(p)
+        text = extract_txt(p, max_chars)
     elif ext in {"png", "jpg", "jpeg", "bmp", "tiff", "webp"}:
         text = extract_image_ocr(p)
     else:

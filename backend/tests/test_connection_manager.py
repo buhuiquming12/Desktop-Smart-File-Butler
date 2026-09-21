@@ -108,3 +108,13 @@ def test_disconnect_ignores_stale_socket() -> None:
     manager.disconnect("c1", old)  # type: ignore[arg-type]
 
     assert manager._connections["c1"] is new
+
+
+def test_broadcast_delivers_to_all_connected_clients() -> None:
+    manager = ConnectionManager()
+    first, second = _FakeWebSocket(), _FakeWebSocket()
+    manager._connections.update({"c1": first, "c2": second})  # type: ignore[arg-type]
+
+    asyncio.run(manager.broadcast(_event()))
+
+    assert len(first.sent) == 1 and len(second.sent) == 1

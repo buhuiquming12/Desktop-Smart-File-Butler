@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from app import db, sandbox_config
+from app.agent.graph import AgentRuntime
 from app.config import get_settings
 from app.security import SandboxViolation, resolve_in_sandbox
 
@@ -63,3 +64,19 @@ def test_reserved_key_hidden_from_preferences(dirs) -> None:
     sandbox_config.save_roots([str(root_b)])
     keys = {p.key for p in db.all_preferences()}
     assert sandbox_config.ROOTS_KEY not in keys
+
+
+def test_agent_cannot_overwrite_reserved_sandbox_key(dirs) -> None:
+    root_a, root_b = dirs
+    runtime = object.__new__(AgentRuntime)
+    result = runtime._execute_step({
+        "id": "reserved",
+        "description": "不得修改沙箱",
+        "tool": "set_preference",
+        "args": {"key": sandbox_config.ROOTS_KEY, "value": str(root_b)},
+    })
+
+    assert result["status"] == "failed"
+    assert sandbox_config.effective_roots() == [root_a.resolve()]
+    with pytest.raises(SandboxViolation):
+        resolve_in_sandbox(str(root_b / "b.txt"), must_exist=True)

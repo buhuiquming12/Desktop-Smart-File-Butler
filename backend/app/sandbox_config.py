@@ -65,5 +65,7 @@ def save_roots(paths: List[str]) -> List[str]:
     # 去重并保持顺序
     seen: set[str] = set()
     unique = [p for p in normalized if not (p in seen or seen.add(p))]
-    db.set_preference(ROOTS_KEY, ";".join(unique))  # 空串表示清除，回退 .env
+    db.set_preference(
+        ROOTS_KEY, ";".join(unique), allow_reserved=True
+    )  # 空串表示清除，回退 .env
     return unique

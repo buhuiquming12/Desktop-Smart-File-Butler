@@ -10,10 +10,10 @@ from typing import Any, AsyncIterator, Dict, Iterable, Optional, Set, Tuple
 
 import os
 import secrets
+import weakref
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -54,6 +54,13 @@ _runtime_lock = threading.Lock()
 _background_tasks: Set[asyncio.Task[Any]] = set()
 # 用户请求中止的会话 id；执行循环在每个 update 边界检查并停止（P1-4）。
 _cancel_requested: Set[str] = set()
+# 弱引用避免攻击者持续提交随机 thread_id 时让锁表永久增长。正在持有或等待锁的
+# 协程都有强引用，因此不会在使用期间被回收。
+_thread_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+# REST/WS 接受聊天后、首个 checkpoint 写入前也允许取消；计数兼容同一 thread 的
+# 多个排队请求，避免用一个 bool 时先结束的请求误删后一个请求的活动标记。
+_active_threads: Dict[str, int] = {}
+_main_loop: Optional[asyncio.AbstractEventLoop] = None
 
 # ---------------- 会话令牌与来源校验（P0-2） ----------------
 #
@@ -176,20 +183,69 @@ class ConnectionManager:
             logger.exception("推送事件失败 client=%s type=%s", client_id, event.type)
             self.disconnect(client_id, websocket)
 
+    async def broadcast(self, event: WSEvent) -> None:
+        """向当前所有渲染进程广播后台/定时任务事件。"""
+        client_ids = list(self._connections)
+        if client_ids:
+            await asyncio.gather(*(self.send(client_id, event) for client_id in client_ids))
+
 
 connections = ConnectionManager()
 
 
+def _thread_lock(thread_id: str) -> asyncio.Lock:
+    """同一 thread 的启动/恢复必须串行，防止重复审批或并发对话重复执行工具。"""
+    lock = _thread_locks.get(thread_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _thread_locks[thread_id] = lock
+    return lock
+
+
+def _register_thread(thread_id: str) -> None:
+    _active_threads[thread_id] = _active_threads.get(thread_id, 0) + 1
+
+
+def _unregister_thread(thread_id: str) -> None:
+    remaining = _active_threads.get(thread_id, 0) - 1
+    if remaining > 0:
+        _active_threads[thread_id] = remaining
+    else:
+        _active_threads.pop(thread_id, None)
+
+
+def _request_cancel(thread_id: str) -> bool:
+    """仅给真实活动/待审批会话登记取消，避免陈旧标记误杀未来同 ID 会话。"""
+    if _active_threads.get(thread_id, 0) > 0:
+        _cancel_requested.add(thread_id)
+        return True
+    try:
+        state = get_runtime().state(thread_id)
+    except Exception:  # noqa: BLE001 - 取消不存在的会话不应触发新的服务故障
+        logger.exception("检查待取消会话失败 thread=%s", thread_id)
+        return False
+    if state.get("status") in {"perceiving", "planning", "running", "waiting_approval"}:
+        _cancel_requested.add(thread_id)
+        return True
+    return False
+
+
 def _scheduled_runner(directory: str, instruction: str) -> None:
-    """APScheduler 线程中的无 UI 执行入口；危险步骤仍会在 interrupt 处暂停。"""
+    """APScheduler 线程入口；把实际流消费交回主事件循环并广播给 UI。"""
     thread_id = f"scheduled-{uuid.uuid4().hex}"
     message = f"在目录 {directory} 执行以下定时整理任务：{instruction}"
+    loop = _main_loop
+    if loop is None or loop.is_closed():
+        logger.error("定时任务无法启动：主事件循环不可用 thread=%s", thread_id)
+        return
     try:
-        for _ in get_runtime().start_stream(message, thread_id):
-            pass
-        state = get_runtime().state(thread_id)
+        iterator = get_runtime().start_stream(message, thread_id)
+        future = asyncio.run_coroutine_threadsafe(
+            _run_stream(iterator, thread_id, None, broadcast=True), loop
+        )
+        state = future.result()
         if state.get("status") == "waiting_approval":
-            logger.warning("定时任务 %s 需要危险操作审批，已暂停等待用户手动处理", thread_id)
+            logger.warning("定时任务 %s 需要危险操作审批，已广播到活动中心", thread_id)
         else:
             logger.info("定时任务 %s 结束: %s", thread_id, state.get("status"))
     except Exception:  # noqa: BLE001
@@ -198,7 +254,9 @@ def _scheduled_runner(directory: str, instruction: str) -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    global _main_loop
     db.init_db()
+    _main_loop = asyncio.get_running_loop()
     _write_session_file()
     scheduler.init_scheduler(_scheduled_runner)
     logger.info("桌面智能文件管家后端已启动")
@@ -208,6 +266,10 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         scheduler.shutdown()
         for task in list(_background_tasks):
             task.cancel()
+        _main_loop = None
+        _thread_locks.clear()
+        _active_threads.clear()
+        _cancel_requested.clear()
         logger.info("桌面智能文件管家后端已停止")
 
 
@@ -264,7 +326,12 @@ def _event(event_type: WSEventType, thread_id: str, **payload: Any) -> WSEvent:
 
 
 async def _fail_terminal(
-    client_id: Optional[str], thread_id: str, message: str, *, detail: str = ""
+    client_id: Optional[str],
+    thread_id: str,
+    message: str,
+    *,
+    detail: str = "",
+    broadcast: bool = False,
 ) -> None:
     """广播唯一的终态失败事件（B1 错误广播不变量）。
 
@@ -272,20 +339,21 @@ async def _fail_terminal(
     一旦有失败路径绕过它，界面就会永久停在“处理中”。message 面向用户且可审计，
     detail 保留原始异常文本供排查。
     """
-    if not client_id:
+    if not client_id and not broadcast:
         return
     try:
-        await connections.send(
-            client_id,
-            _event(
-                WSEventType.done,
-                thread_id,
-                status="failed",
-                message=message,
-                error=detail or message,
-                summary=ws_events.build_task_summary([]),
-            ),
+        terminal = _event(
+            WSEventType.done,
+            thread_id,
+            status="failed",
+            message=message,
+            error=detail or message,
+            summary=ws_events.build_task_summary([]),
         )
+        if broadcast:
+            await connections.broadcast(terminal)
+        elif client_id:
+            await connections.send(client_id, terminal)
     except Exception:  # noqa: BLE001 - 兜底广播本身失败时不应再抛出，避免掩盖原始错误
         logger.exception("广播终态失败事件时出错 thread=%s", thread_id)
 
@@ -307,61 +375,93 @@ async def _dispatch(client_id: Optional[str], thread_id: str, item: Any) -> None
     await ws_events.dispatch(connections.send, get_runtime().state, client_id, thread_id, item)
 
 
+async def _dispatch_broadcast(thread_id: str, item: Any) -> None:
+    async def send_all(_: str, outgoing: WSEvent) -> None:
+        await connections.broadcast(outgoing)
+
+    await ws_events.dispatch(send_all, get_runtime().state, "broadcast", thread_id, item)
+
+
 async def _run_stream(
-    iterator: Iterable[Dict[str, Any]], thread_id: str, client_id: Optional[str]
+    iterator: Iterable[Dict[str, Any]],
+    thread_id: str,
+    client_id: Optional[str],
+    *,
+    broadcast: bool = False,
+    defer_cancel_once: bool = False,
 ) -> Dict[str, Any]:
     """逐项消费同步 LangGraph 流，同时向 Electron 推送进度。"""
     try:
         while True:
             if thread_id in _cancel_requested:
-                _cancel_requested.discard(thread_id)
-                logger.info("会话 %s 被用户中止", thread_id)
-                if client_id:
-                    await connections.send(
-                        client_id,
-                        _event(
-                            WSEventType.done, thread_id,
-                            status="cancelled",
-                            message="任务已停止。当前步骤前的操作已保留，可在操作日志中查看或撤销。",
-                            summary=ws_events.build_task_summary(get_runtime().state(thread_id).get("observations", [])),
-                        ),
+                if defer_cancel_once:
+                    # 等待审批的图必须先消费一次 reject resume，清掉持久化 interrupt；
+                    # 下一轮再真正终止，避免 UI 已关闭而 checkpoint 永久待审批。
+                    defer_cancel_once = False
+                else:
+                    _cancel_requested.discard(thread_id)
+                    logger.info("会话 %s 被用户中止", thread_id)
+                    runtime = get_runtime()
+                    cancel_state = getattr(runtime, "cancel", None)
+                    if callable(cancel_state):
+                        try:
+                            cancel_state(thread_id)
+                        except Exception:  # noqa: BLE001 - 尚无首个 checkpoint 时仍要完成取消
+                            logger.exception("写入取消 checkpoint 失败 thread=%s", thread_id)
+                    terminal = _event(
+                        WSEventType.done, thread_id,
+                        status="cancelled",
+                        message="任务已停止。当前步骤前的操作已保留，可在操作日志中查看或撤销。",
+                        summary=ws_events.build_task_summary(runtime.state(thread_id).get("observations", [])),
                     )
-                return get_runtime().state(thread_id)
+                    if broadcast:
+                        await connections.broadcast(terminal)
+                    elif client_id:
+                        await connections.send(client_id, terminal)
+                    return runtime.state(thread_id)
             has_item, item = await asyncio.to_thread(_next_update, iterator)
             if not has_item:
                 break
             if item:
-                await _dispatch(client_id, thread_id, item)
+                if broadcast:
+                    await _dispatch_broadcast(thread_id, item)
+                else:
+                    await _dispatch(client_id, thread_id, item)
 
         state = get_runtime().state(thread_id)
         if state.get("status") == "waiting_approval":
             pending = state.get("pending_approval") or {}
-            if client_id and pending:
-                await connections.send(
-                    client_id,
-                    _event(WSEventType.approval_required, thread_id, **pending),
-                )
+            if pending:
+                approval_event = _event(WSEventType.approval_required, thread_id, **pending)
+                if broadcast:
+                    await connections.broadcast(approval_event)
+                elif client_id:
+                    await connections.send(client_id, approval_event)
             return state
 
         # 终态统一走 done（status=completed|failed），WSEventType.error 只留给非终态诊断（B1）。
         final_status = state.get("status")
-        if client_id:
+        terminal = _event(
+            WSEventType.done,
+            thread_id,
+            status=final_status,
+            message=state.get("final_response", ""),
+            error=state.get("error", ""),
+            observations=state.get("observations", []),
+            summary=ws_events.build_task_summary(state.get("observations", [])),
+        )
+        if broadcast:
+            await connections.broadcast(terminal)
+        elif client_id:
             await connections.send(
-                client_id,
-                _event(
-                    WSEventType.done,
-                    thread_id,
-                    status=final_status,
-                    message=state.get("final_response", ""),
-                    error=state.get("error", ""),
-                    observations=state.get("observations", []),
-                    summary=ws_events.build_task_summary(state.get("observations", [])),
-                ),
+                client_id, terminal
             )
         return state
     except Exception as exc:  # noqa: BLE001
         logger.exception("Agent 执行失败 thread=%s", thread_id)
-        await _fail_terminal(client_id, thread_id, f"任务执行失败：{exc}", detail=str(exc))
+        await _fail_terminal(
+            client_id, thread_id, f"任务执行失败：{exc}", detail=str(exc), broadcast=broadcast
+        )
         return {"thread_id": thread_id, "status": "failed", "error": str(exc)}
 
 
@@ -381,51 +481,111 @@ def _track(coro: Any) -> None:
     task.add_done_callback(_log_task_failure)
 
 
-async def _start_chat(request: ChatRequest, fallback_client: Optional[str] = None) -> str:
+async def _start_chat(
+    request: ChatRequest,
+    fallback_client: Optional[str] = None,
+    *,
+    registered: bool = False,
+) -> str:
     thread_id = request.thread_id or uuid.uuid4().hex
     client_id = request.client_id or fallback_client
-    _cancel_requested.discard(thread_id)  # 清除可能残留的中止请求
-
-    # get_runtime() 与 start_stream() 位于 _run_stream 的异常捕获之外：模型未配置时
-    # AgentRuntime 构造即失败，异常被 _track 吞掉，前端永远等不到终态事件而永久 busy（B1）。
-    # 这里显式兜底，保证任何启动失败都会广播 done(status=failed)。
+    if not registered:
+        _register_thread(thread_id)
     try:
-        iterator = get_runtime().start_stream(request.message.strip(), thread_id)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("启动会话失败 thread=%s", thread_id)
-        await _fail_terminal(client_id, thread_id, f"无法启动会话：{exc}", detail=str(exc))
-        return thread_id
+        async with _thread_lock(thread_id):
+            # 启动也在终态兜底内：模型未配置时 AgentRuntime 构造就可能失败。
+            try:
+                iterator = get_runtime().start_stream(request.message.strip(), thread_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("启动会话失败 thread=%s", thread_id)
+                await _fail_terminal(client_id, thread_id, f"无法启动会话：{exc}", detail=str(exc))
+                return thread_id
 
-    await _run_stream(iterator, thread_id, client_id)
-    return thread_id
+            await _run_stream(iterator, thread_id, client_id)
+            return thread_id
+    finally:
+        _unregister_thread(thread_id)
+        # 正常/失败终态不应遗留取消标记；等待审批时则必须保留，让随后取得锁的
+        # _resolve_cancelled_approval 能以 reject 清掉 interrupt 后写入 cancelled。
+        try:
+            state = get_runtime().state(thread_id)
+        except Exception:  # noqa: BLE001
+            state = {}
+        if not state.get("pending_approval"):
+            _cancel_requested.discard(thread_id)
 
 
 async def _resume_approval(
-    response: ApprovalResponse, fallback_client: Optional[str] = None
+    response: ApprovalResponse,
+    fallback_client: Optional[str] = None,
+    *,
+    cancelling: bool = False,
 ) -> str:
+    broadcast = response.thread_id.startswith("scheduled-")
+    async with _thread_lock(response.thread_id):
+        try:
+            state = get_runtime().state(response.thread_id)
+            pending = state.get("pending_approval") or {}
+            if not pending:
+                raise HTTPException(status_code=409, detail="该会话没有待审批操作")
+            if pending.get("approval_id") != response.approval_id:
+                raise HTTPException(status_code=409, detail="审批已过期或不匹配")
+
+            cancelling = cancelling or response.thread_id in _cancel_requested
+            decision = "reject" if cancelling else response.decision.value
+            iterator = get_runtime().resume_stream(response.thread_id, decision)
+        except HTTPException as exc:
+            if fallback_client is None:
+                raise
+            logger.warning("恢复会话被拒 thread=%s: %s", response.thread_id, exc.detail)
+            diagnostic = _event(WSEventType.error, response.thread_id, message=str(exc.detail))
+            if broadcast:
+                await connections.broadcast(diagnostic)
+            else:
+                await connections.send(fallback_client, diagnostic)
+            return response.thread_id
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("恢复会话失败 thread=%s", response.thread_id)
+            await _fail_terminal(
+                fallback_client,
+                response.thread_id,
+                f"无法恢复会话：{exc}",
+                detail=str(exc),
+                broadcast=broadcast,
+            )
+            return response.thread_id
+
+        await _run_stream(
+            iterator,
+            response.thread_id,
+            fallback_client,
+            broadcast=broadcast,
+            defer_cancel_once=cancelling,
+        )
+        return response.thread_id
+
+
+async def _resolve_cancelled_approval(
+    thread_id: str, client_id: Optional[str] = None
+) -> None:
+    """若会话正停在 interrupt，自动以 reject 恢复一次，使取消真正持久化。"""
     try:
-        state = get_runtime().state(response.thread_id)
+        state = get_runtime().state(thread_id)
         pending = state.get("pending_approval") or {}
-        if not pending:
-            raise HTTPException(status_code=409, detail="该会话没有待审批操作")
-        if pending.get("approval_id") != response.approval_id:
-            raise HTTPException(status_code=409, detail="审批已过期或不匹配")
-
-        iterator = get_runtime().resume_stream(response.thread_id, response.decision.value)
-    except HTTPException as exc:
-        if fallback_client is None:
-            raise  # REST 调用方依赖 4xx 语义自行处理
-        # WS 调用方：_track 会吞掉异常，必须在此广播终态，否则界面卡死（B1）。
-        logger.warning("恢复会话被拒 thread=%s: %s", response.thread_id, exc.detail)
-        await _fail_terminal(fallback_client, response.thread_id, str(exc.detail))
-        return response.thread_id
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("恢复会话失败 thread=%s", response.thread_id)
-        await _fail_terminal(fallback_client, response.thread_id, f"无法恢复会话：{exc}", detail=str(exc))
-        return response.thread_id
-
-    await _run_stream(iterator, response.thread_id, fallback_client)
-    return response.thread_id
+        approval_id = str(pending.get("approval_id") or "")
+        if not approval_id:
+            return
+        await _resume_approval(
+            ApprovalResponse(
+                thread_id=thread_id,
+                approval_id=approval_id,
+                decision="reject",
+            ),
+            client_id,
+            cancelling=True,
+        )
+    except Exception:  # noqa: BLE001 - 普通运行中取消仍由 _run_stream 消费
+        logger.exception("清理待审批取消状态失败 thread=%s", thread_id)
 
 
 # ---------------- REST ----------------
@@ -569,7 +729,8 @@ async def list_llm_models(body: LLMModelsRequest) -> Dict[str, Any]:
 async def chat(request: ChatRequest) -> Dict[str, str]:
     thread_id = request.thread_id or uuid.uuid4().hex
     request.thread_id = thread_id
-    _track(_start_chat(request))
+    _register_thread(thread_id)
+    _track(_start_chat(request, registered=True))
     return {"thread_id": thread_id, "status": "accepted"}
 
 
@@ -582,9 +743,11 @@ def thread_state(thread_id: str) -> Dict[str, Any]:
 
 
 @app.post("/api/threads/{thread_id}/cancel", status_code=status.HTTP_202_ACCEPTED)
-def cancel_thread(thread_id: str) -> Dict[str, str]:
+async def cancel_thread(thread_id: str) -> Dict[str, str]:
     """请求中止会话：执行循环在下一个步骤边界停止，已完成步骤保留（P1-4）。"""
-    _cancel_requested.add(thread_id)
+    if not _request_cancel(thread_id):
+        return {"thread_id": thread_id, "status": "not_running"}
+    _track(_resolve_cancelled_approval(thread_id))
     return {"thread_id": thread_id, "status": "cancelling"}
 
 
@@ -630,56 +793,6 @@ def rollback_thread(thread_id: str) -> Dict[str, Any]:
         raise HTTPException(status_code=404, detail="没有可回滚的操作")
     return rest_api.rollback_summary(thread_id, reversible, filesystem.preflight_restore, filesystem.restore_operation)
 
-    # 兼容旧版本实现（不可达，保留历史处理顺序说明）。
-    results: list[Dict[str, Any]] = []
-    ready = []
-    for op in reversed(reversible):
-        check = filesystem.preflight_restore(op)
-        if check.get("status") == "ok":
-            ready.append(op)
-        else:
-            results.append({"op_id": op.id, "status": check.get("status", "failed"), "detail": check.get("detail", "预检失败")})
-    for op in ready:
-        try:
-            results.append({"op_id": op.id, **filesystem.restore_operation(op)})
-        except (SandboxViolation, FileNotFoundError) as exc:
-            results.append({"op_id": op.id, "status": "failed", "detail": str(exc)})
-    return {
-        "thread_id": thread_id,
-        "total": len(results),
-        "ok": sum(1 for item in results if item["status"] == "ok"),
-        "skipped": sum(1 for item in results if item["status"] == "skipped"),
-        "failed": sum(1 for item in results if item["status"] == "failed"),
-        "results": results,
-    }
-
-    # 保留旧实现作为兼容参考（不可达）。
-    """回滚某会话的所有可逆操作（按发生顺序倒序还原）。"""
-    ops = db.operations_for_thread(thread_id)
-    reversible = [
-        op for op in ops
-        if op.action in ("move", "rename", "delete") and op.status == "ok" and op.dest
-    ]
-    if not reversible:
-        raise HTTPException(status_code=404, detail="该会话没有可回滚的操作")
-
-    results = []
-    for op in reversed(reversible):  # 后发生的先撤销，避免路径互相依赖
-        try:
-            results.append({"op_id": op.id, **filesystem.restore_operation(op)})
-        except (SandboxViolation, FileNotFoundError) as exc:
-            results.append({"op_id": op.id, "status": "failed", "detail": str(exc)})
-
-    summary = {
-        "thread_id": thread_id,
-        "total": len(results),
-        "ok": sum(1 for r in results if r["status"] == "ok"),
-        "skipped": sum(1 for r in results if r["status"] == "skipped"),
-        "failed": sum(1 for r in results if r["status"] == "failed"),
-        "results": results,
-    }
-    return summary
-
 
 @app.get("/api/preferences")
 def preferences() -> list[Dict[str, str]]:
@@ -688,18 +801,11 @@ def preferences() -> list[Dict[str, str]]:
 
 @app.put("/api/preferences/{key}")
 def update_preference(key: str, body: PreferenceUpdate) -> Dict[str, str]:
-    normalized_key = key.strip()
-    if not normalized_key or len(normalized_key) > 200:
-        raise HTTPException(status_code=422, detail="偏好键不能为空且最多 200 字符")
-    if normalized_key.startswith("__"):
-        # __ 前缀为内部保留键（如沙箱根目录），不允许经普通偏好接口绕过校验写入。
-        raise HTTPException(status_code=422, detail="保留键不可通过偏好接口修改")
-    if any(
-        secret in normalized_key.lower()
-        for secret in ("api_key", "token", "secret", "password")
-    ):
-        raise HTTPException(status_code=422, detail="密钥、令牌和密码不能保存为偏好")
-    db.set_preference(normalized_key, body.value)
+    try:
+        normalized_key = db.validate_public_preference_key(key)
+        db.set_preference(normalized_key, body.value)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {"key": normalized_key, "value": body.value}
 
 
@@ -713,7 +819,7 @@ def create_job(body: JobCreate) -> Dict[str, Any]:
     try:
         directory_path = resolve_in_sandbox(body.directory, must_exist=True)
         directory = str(directory_path)
-        CronTrigger.from_crontab(body.cron)
+        scheduler.validate_cron(body.cron)
     except (SandboxViolation, FileNotFoundError, NotADirectoryError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     if not directory_path.is_dir():
@@ -781,7 +887,9 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str) -> None:
                         thread_id=message.get("thread_id"),
                         client_id=client_id,
                     )
-                    _track(_start_chat(request, client_id))
+                    request.thread_id = request.thread_id or uuid.uuid4().hex
+                    _register_thread(request.thread_id)
+                    _track(_start_chat(request, client_id, registered=True))
                 elif message_type == "approval":
                     response = ApprovalResponse(
                         thread_id=message.get("thread_id", ""),
@@ -803,8 +911,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str) -> None:
                         _track(_resume_approval(response, client_id))
                 elif message_type == "cancel":
                     cancel_thread_id = message.get("thread_id", "")
-                    if cancel_thread_id:
-                        _cancel_requested.add(cancel_thread_id)
+                    if cancel_thread_id and _request_cancel(cancel_thread_id):
+                        _track(_resolve_cancelled_approval(cancel_thread_id, client_id))
                 elif message_type == "ping":
                     await websocket.send_json({"type": "pong"})
                 else:

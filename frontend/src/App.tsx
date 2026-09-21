@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AgentSocket, ApiClient, DEFAULT_API_BASE, DEFAULT_WS_BASE } from './api/client';
+import { AgentSocket, ApiClient, DEFAULT_API_BASE, DEFAULT_WS_BASE, normalizeApiBase, normalizeWsBase } from './api/client';
 import { helpText, isCommandName, type SlashCommandName } from './commands';
 import { ActivityCenter } from './components/ActivityCenter';
 import { ApprovalModal } from './components/ApprovalModal';
@@ -24,7 +24,6 @@ import type {
   ScheduledJob,
   SetupHints,
   TaskItem,
-  TaskStatus,
   TaskSummary,
   WSEvent,
 } from './types';
@@ -32,24 +31,24 @@ import {
   BUSY_STALL_TICK_MS,
   STALLED_NOTICE,
   addToApprovalQueue,
+  assistantMessageId,
   buildActivityItems,
   detachThreadToViews,
   isStalled,
+  lastAssistantTurn,
+  parseApproval,
+  payloadText,
   parseSummary,
   reduceThreadEvent,
   resolveEventTarget,
   shouldPromptNewConversation,
+  taskStatus,
   type NewConversationAction,
   type ThreadViewState,
 } from './state';
 
 function createId(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-/** 助手回复的消息 id：会话 + 回合序号。追问同一会话会生成新气泡，而不是把内容追加进第一条回复。 */
-function assistantMessageId(threadId: string, turn: number): string {
-  return `assistant-${threadId}-${turn}`;
 }
 
 function readStored(key: string, fallback: string): string {
@@ -64,35 +63,6 @@ function ensureClientId(): string {
   return value;
 }
 
-function payloadText(payload: Record<string, unknown>, ...keys: string[]): string {
-  for (const key of keys) {
-    const value = payload[key];
-    if (typeof value === 'string') return value;
-  }
-  return '';
-}
-
-function taskStatus(value: unknown): TaskStatus {
-  return value === 'pending' || value === 'running' || value === 'success' || value === 'failed' || value === 'waiting'
-    ? value
-    : 'running';
-}
-
-function parseApproval(event: WSEvent): PendingApproval | null {
-  const nested = event.payload.approval;
-  const source = nested && typeof nested === 'object' ? nested as Record<string, unknown> : event.payload;
-  const approvalId = payloadText(source, 'approval_id', 'id');
-  if (!approvalId) return null;
-  return {
-    approval_id: approvalId,
-    thread_id: event.thread_id,
-    action: payloadText(source, 'action') || 'unknown',
-    target: payloadText(source, 'target', 'path') || '未提供目标',
-    detail: payloadText(source, 'detail', 'message'),
-    created_at: payloadText(source, 'created_at') || new Date().toISOString(),
-  };
-}
-
 export function App() {
   const clientId = useMemo(ensureClientId, []);
   const [apiBase, setApiBase] = useState(() => readStored('file-butler-api-base', DEFAULT_API_BASE));
@@ -105,7 +75,6 @@ export function App() {
   const threadIdRef = useRef<string | undefined>(undefined);
   // 每个会话的助手回复按「回合」编号：追问时推进序号，让本次回答落在新气泡里。
   const assistantTurnRef = useRef<Record<string, number>>({});
-  const [activeThreadId, setActiveThreadId] = useState<string>();
   // P1: 后台定时会话与当前聊天各自维护事件状态，事件不会覆盖活动会话。
   const [threadViews, setThreadViews] = useState<Record<string, ThreadViewState>>({});
   // 新对话后进入后台/已结束的会话 id：它们的迟到事件永远按后台路由，绝不污染新会话。
@@ -138,11 +107,10 @@ export function App() {
   );
   const runningCount = runningBackgroundIds.length + (busy ? 1 : 0);
 
-  // 当前前台会话视图：正在查看后台会话时用该会话的视图，否则用主聊天状态。
-  const activeView = activeThreadId ? threadViews[activeThreadId] : undefined;
-  const chatMessages = activeView ? activeView.messages : messages;
-  const chatTasks = activeView ? activeView.tasks : tasks;
-  const chatBusy = activeView ? activeView.busy : busy;
+  // 切换后台会话时会把快照搬回这组三元状态，因此前台只有一个权威状态源。
+  const chatMessages = messages;
+  const chatTasks = tasks;
+  const chatBusy = busy;
 
   /** 统一的 Toast 反馈：保存、失败、撤销、任务结束等都用它，避免各写一套。 */
   const notify = useCallback((content: string, kind: ToastKind = 'info') => {
@@ -205,6 +173,10 @@ export function App() {
       if (backgroundApproval) {
         setApprovalQueue((current) => addToApprovalQueue(current, backgroundApproval));
       }
+      const node = event.type === 'node' ? payloadText(event.payload, 'node', 'name') : '';
+      if (event.type === 'done' || node === 'approval') {
+        setApprovalQueue((current) => current.filter((item) => item.thread_id !== event.thread_id));
+      }
       return;
     }
     if (event.thread_id) {
@@ -219,6 +191,11 @@ export function App() {
         break;
       case 'node': {
         const node = payloadText(event.payload, 'node', 'name') || '处理中';
+        if (!event.thread_id && node === 'connected') break;
+        if (node === 'approval') {
+          setApprovalQueue((current) => current.filter((item) => item.thread_id !== event.thread_id));
+          setTasks((current) => current.filter((task) => !(task.threadId === event.thread_id && task.status === 'waiting')));
+        }
         updateTask({ id: `${event.thread_id}-node`, title: 'Agent 工作流', detail: `正在执行：${node}`, status: 'running', updatedAt: now, threadId: event.thread_id });
         break;
       }
@@ -261,15 +238,18 @@ export function App() {
         }));
         setTasks((current) => current.map((task) => task.threadId === event.thread_id && task.status === 'running' ? { ...task, status: failed ? 'failed' : 'success', updatedAt: now } : task));
         setBusy(false);
+        setApprovalQueue((current) => current.filter((item) => item.thread_id !== event.thread_id));
         notify(failed ? '任务已结束（失败或已取消）。' : '任务已完成，结果见下方摘要。', failed ? 'error' : 'success');
         break;
       }
       case 'error': {
         const text = payloadText(event.payload, 'message', 'error', 'detail') || '任务执行失败，请查看后端日志。';
-        updateAssistant(event.thread_id, text, false, true);
-        setTasks((current) => current.map((task) => task.threadId === event.thread_id && task.status === 'running' ? { ...task, status: 'failed', updatedAt: now } : task));
-        setBusy(false);
-        notify('任务执行失败，可查看「操作日志」定位问题。', 'error');
+        setMessages((current) => [...current, {
+          id: createId('system'), role: 'system', content: text,
+          timestamp: now, error: true,
+        }]);
+        // error 是可恢复诊断（如审批过期），只有 done 才能结束 busy/清掉审批。
+        notify('请求未被接受，请根据提示重试。', 'error');
         break;
       }
     }
@@ -356,7 +336,6 @@ export function App() {
 
   const sendChat = useCallback((message: string) => {
     if (threadId) {
-      setActiveThreadId(threadId);
       // 追问同一会话时推进回合序号：本次回答进入新的气泡，不再往第一条回复里追加。
       assistantTurnRef.current[threadId] = (assistantTurnRef.current[threadId] ?? 1) + 1;
     }
@@ -410,7 +389,6 @@ export function App() {
   const resetForeground = useCallback(() => {
     setThreadId(undefined);
     threadIdRef.current = undefined;
-    setActiveThreadId(undefined);
     setTasks([]);
     setBusy(false);
     assistantTurnRef.current = {};
@@ -470,8 +448,12 @@ export function App() {
     setApprovalSubmitting(true);
     const response = { thread_id: approval.thread_id, approval_id: approval.approval_id, decision };
     try {
-      if (!socketRef.current?.send({ type: 'approval', ...response })) await api.respondToApproval(response);
-      setApprovalQueue((current) => current.slice(1));
+      const sentBySocket = socketRef.current?.send({ type: 'approval', ...response }) ?? false;
+      if (!sentBySocket) {
+        await api.respondToApproval(response);
+        // REST 没有事件回推，只能在 202 验证通过后本地移除；WS 路径等待 approval 节点确认。
+        setApprovalQueue((current) => current.slice(1));
+      }
       updateTask({ id: `approval-${approval.approval_id}`, title: approval.action, detail: approval.target, status: decision === 'approve' ? 'running' : 'failed', updatedAt: new Date().toISOString(), threadId: approval.thread_id });
       notify(decision === 'approve' ? '已批准该操作，任务继续执行。' : '已拒绝该操作，任务已停止此步骤。', 'success');
     } catch (error) {
@@ -536,9 +518,8 @@ export function App() {
     setBusy(view.busy);
     setThreadId(targetId);
     threadIdRef.current = targetId;
-    // 切回后该会话不再按后台路由；assistantTurnRef 归零，让下一条回复从第 1 回合开始。
-    assistantTurnRef.current[targetId] = 0;
-    setActiveThreadId(undefined);
+    // 从已有消息恢复最大回合号，下一次追问必须创建新气泡而非覆盖历史回复。
+    assistantTurnRef.current[targetId] = lastAssistantTurn(view.messages, targetId);
     detachedThreadIdsRef.current.delete(targetId);
     setThreadViews((current) => {
       const next = { ...current };
@@ -608,11 +589,17 @@ export function App() {
 
   const saveEndpoints = (newApiBase: string, newWsBase: string): void => {
     if (!newApiBase || !newWsBase) return;
-    localStorage.setItem('file-butler-api-base', newApiBase);
-    localStorage.setItem('file-butler-ws-base', newWsBase);
-    setApiBase(newApiBase);
-    setWsBase(newWsBase);
-    notify('连接地址已保存，正在重连…');
+    try {
+      const apiEndpoint = normalizeApiBase(newApiBase);
+      const wsEndpoint = normalizeWsBase(newWsBase);
+      localStorage.setItem('file-butler-api-base', apiEndpoint);
+      localStorage.setItem('file-butler-ws-base', wsEndpoint);
+      setApiBase(apiEndpoint);
+      setWsBase(wsEndpoint);
+      notify('连接地址已保存，正在重连…');
+    } catch (error) {
+      notify(error instanceof Error ? error.message : '连接地址格式错误', 'error');
+    }
   };
 
   const saveLLM = async (update: LLMSettingsUpdate): Promise<void> => {
@@ -700,8 +687,8 @@ export function App() {
 
   /** 右侧活动中心条目：当前会话 + 后台/定时会话（逐一列出，不折叠成数字）+ 待审批任务。 */
   const activityItems = useMemo(
-    () => buildActivityItems(threadViews, activeThreadId, currentForegroundView, approvalQueue),
-    [activeThreadId, approvalQueue, currentForegroundView, threadViews],
+    () => buildActivityItems(threadViews, undefined, currentForegroundView, approvalQueue),
+    [approvalQueue, currentForegroundView, threadViews],
   );
 
   return (

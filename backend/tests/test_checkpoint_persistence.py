@@ -87,3 +87,21 @@ def test_pending_approval_survives_new_runtime(env: Path) -> None:
 def test_checkpoint_file_created(env: Path) -> None:
     graph_module.AgentRuntime()
     assert (env / "checkpoints.sqlite").exists()
+
+
+def test_cancel_is_persisted_and_clears_pending_approval(env: Path) -> None:
+    thread_id = "persist-cancel"
+    runtime1 = graph_module.AgentRuntime()
+    for _ in runtime1.start_stream("归档", thread_id):
+        pass
+    assert runtime1.state(thread_id).get("status") == "waiting_approval"
+
+    runtime1.cancel(thread_id)
+    cancelled = runtime1.state(thread_id)
+    assert cancelled.get("status") == "cancelled"
+    assert cancelled.get("pending_approval") is None
+
+    runtime2 = graph_module.AgentRuntime()
+    persisted = runtime2.state(thread_id)
+    assert persisted.get("status") == "cancelled"
+    assert persisted.get("pending_approval") is None

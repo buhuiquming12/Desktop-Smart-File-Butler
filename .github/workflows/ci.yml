@@ -62,3 +62,6 @@ jobs:
       - name: 类型检查
         working-directory: frontend
         run: npm run typecheck
+      - name: 运行前端状态测试
+        working-directory: frontend
+        run: npm test

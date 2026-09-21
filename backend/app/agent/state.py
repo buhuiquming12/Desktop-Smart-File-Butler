@@ -68,6 +68,7 @@ class AgentState(TypedDict, total=False):
         "waiting_approval",
         "completed",
         "failed",
+        "cancelled",
     ]
     replan_count: int
     error: str

@@ -22,16 +22,37 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     yield TestClient(main.app)
     get_settings.cache_clear()
     db._initialized = False
-    main._cancel_requested.discard("cancel-me")
+    main._cancel_requested.clear()
+    main._active_threads.clear()
 
 
 def test_cancel_endpoint_marks_thread(client: TestClient) -> None:
+    main._active_threads["abc"] = 1
     resp = client.post(
         "/api/threads/abc/cancel", headers={"X-Butler-Token": main.get_session_token()}
     )
     assert resp.status_code == 202
+    assert resp.json()["status"] == "cancelling"
     assert "abc" in main._cancel_requested
     main._cancel_requested.discard("abc")
+    main._active_threads.clear()
+
+
+def test_cancel_non_running_thread_does_not_leave_stale_marker(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _EmptyRuntime:
+        def state(self, _thread_id: str):
+            return {}
+
+    monkeypatch.setattr(main, "get_runtime", lambda: _EmptyRuntime())
+    resp = client.post(
+        "/api/threads/never-started/cancel",
+        headers={"X-Butler-Token": main.get_session_token()},
+    )
+    assert resp.status_code == 202
+    assert resp.json()["status"] == "not_running"
+    assert "never-started" not in main._cancel_requested
 
 
 def test_run_stream_stops_on_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -53,3 +74,38 @@ def test_run_stream_stops_on_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
     result = asyncio.run(asyncio.wait_for(main._run_stream(_infinite(), tid, None), timeout=5))
     assert result == {"status": "running"}
     assert tid not in main._cancel_requested  # 已被消费清除
+
+
+def test_cancel_resolves_persisted_pending_approval(monkeypatch: pytest.MonkeyPatch) -> None:
+    tid = "cancel-pending"
+
+    class _PendingRuntime:
+        def __init__(self) -> None:
+            self.value = {
+                "status": "waiting_approval",
+                "pending_approval": {"approval_id": "ap-1"},
+                "observations": [],
+            }
+            self.decision = ""
+
+        def state(self, _tid: str):
+            return self.value
+
+        def resume_stream(self, _tid: str, decision: str):
+            self.decision = decision
+
+            def updates():
+                self.value = {"status": "running", "pending_approval": None, "observations": []}
+                yield ("updates", {"approval": {"status": "running"}})
+
+            return updates()
+
+    runtime = _PendingRuntime()
+    monkeypatch.setattr(main, "get_runtime", lambda: runtime)
+    main._cancel_requested.add(tid)
+
+    asyncio.run(main._resolve_cancelled_approval(tid))
+
+    assert runtime.decision == "reject"
+    assert runtime.value["pending_approval"] is None
+    assert tid not in main._cancel_requested

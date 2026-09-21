@@ -5,17 +5,18 @@ from typing import Any, Callable, Iterable
 
 
 def rollback_summary(thread_id: str, operations: Iterable[Any], preflight: Callable[[Any], dict], restore: Callable[[Any], dict]) -> dict:
-    """对一组操作执行预检并按逆序回滚，返回前端可直接展示的分级结果。"""
+    """按逆序逐项预检并回滚，返回前端可直接展示的分级结果。
+
+    不能先预检整条链再执行：例如 ``A→B`` 后又 ``B→C``，回滚前 B 必然不存在；
+    只有先完成 ``C→B``，前一条操作的回滚源才会出现。
+    """
     reversible = [op for op in operations if op.action in ("move", "rename", "delete") and op.status == "ok" and op.dest]
     results = []
-    ready = []
     for op in reversed(reversible):
         check = preflight(op)
-        if check.get("status") == "ok":
-            ready.append(op)
-        else:
+        if check.get("status") != "ok":
             results.append({"op_id": op.id, "status": check.get("status", "failed"), "detail": check.get("detail", "预检失败")})
-    for op in ready:
+            continue
         try:
             results.append({"op_id": op.id, **restore(op)})
         except Exception as exc:  # noqa: BLE001

@@ -8,6 +8,20 @@ export interface ThreadViewState {
   summary?: TaskSummary;
 }
 
+/** 前台回复气泡 id；回合号保证追问不会覆盖旧回答。 */
+export function assistantMessageId(threadId: string, turn: number): string {
+  return `assistant-${threadId}-${turn}`;
+}
+
+export function lastAssistantTurn(messages: ChatMessage[], threadId: string): number {
+  const prefix = `assistant-${threadId}-`;
+  return messages.reduce((maximum, message) => {
+    if (!message.id.startsWith(prefix)) return maximum;
+    const turn = Number(message.id.slice(prefix.length));
+    return Number.isFinite(turn) ? Math.max(maximum, turn) : maximum;
+  }, 0);
+}
+
 export function payloadText(payload: Record<string, unknown>, ...keys: string[]): string {
   for (const key of keys) {
     const value = payload[key];
@@ -114,6 +128,8 @@ export function isBackgroundEvent(
   detachedThreadIds: ReadonlySet<string> = new Set(),
 ): boolean {
   if (!eventThreadId) return false;
+  // 定时任务永远属于活动中心，即使当前没有聊天会话也不能劫持前台。
+  if (eventThreadId.startsWith('scheduled-')) return true;
   // 已转入后台（或已结束但仍有迟到事件）的会话，永远按后台路由，绝不污染新会话。
   if (detachedThreadIds.has(eventThreadId)) return true;
   return Boolean(activeThreadId && eventThreadId !== activeThreadId);
@@ -142,6 +158,10 @@ export function reduceThreadEvent(view: ThreadViewState, event: WSEvent, now = n
       break;
     case 'node': {
       const node = payloadText(event.payload, 'node', 'name') || '处理中';
+      if (!event.thread_id && node === 'connected') break;
+      if (node === 'approval') {
+        next.tasks = next.tasks.filter((task) => !(task.threadId === event.thread_id && task.status === 'waiting'));
+      }
       next.tasks = updateTask(next.tasks, { id: `${event.thread_id}-node`, title: 'Agent 工作流', detail: `正在执行：${node}`, status: 'running', updatedAt: now, threadId: event.thread_id });
       break;
     }
@@ -168,14 +188,14 @@ export function reduceThreadEvent(view: ThreadViewState, event: WSEvent, now = n
       }
       break;
     }
-    case 'done':
-    case 'error': {
-      // B1：后端终态统一为 done(status=failed|completed)，error 类型仅用于非终态诊断。
-      const failed = event.type === 'error' || event.payload.status === 'failed' || event.payload.status === 'cancelled';
+    case 'done': {
+      const failed = event.payload.status === 'failed' || event.payload.status === 'cancelled';
       const text = payloadText(event.payload, 'message', 'error', 'detail', 'content', 'result');
       if (text) next.messages = updateAssistant(next.messages, event.thread_id, text, false, failed);
       next.messages = next.messages.map((message) => message.id === `assistant-${event.thread_id}` ? { ...message, pending: false } : message);
-      next.tasks = next.tasks.map((task) => task.threadId === event.thread_id && task.status === 'running' ? { ...task, status: failed ? 'failed' : 'success', updatedAt: now } : task);
+      next.tasks = next.tasks
+        .filter((task) => !(task.threadId === event.thread_id && task.status === 'waiting'))
+        .map((task) => task.threadId === event.thread_id && task.status === 'running' ? { ...task, status: failed ? 'failed' : 'success', updatedAt: now } : task);
       next.busy = false;
       const summary = parseSummary(event.payload.summary);
       if (summary) {
@@ -184,6 +204,18 @@ export function reduceThreadEvent(view: ThreadViewState, event: WSEvent, now = n
           message.id === `assistant-${event.thread_id}` ? { ...message, summary, threadId: event.thread_id } : message,
         );
       }
+      break;
+    }
+    case 'error': {
+      // error 是非终态诊断（例如审批已过期）；保留 busy 与审批入口，等待用户重试。
+      const text = payloadText(event.payload, 'message', 'error', 'detail') || '请求未被接受';
+      next.messages.push({
+        id: `diagnostic-${event.thread_id}-${now}`,
+        role: 'system',
+        content: text,
+        timestamp: now,
+        error: true,
+      });
       break;
     }
   }

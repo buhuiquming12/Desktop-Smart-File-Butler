@@ -31,6 +31,18 @@ function trimTrailingSlash(value: string): string {
   return value.replace(/\/+$/, '');
 }
 
+export function normalizeApiBase(value: string): string {
+  const url = new URL(value.trim());
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error('REST 地址必须使用 http:// 或 https://');
+  return trimTrailingSlash(url.toString());
+}
+
+export function normalizeWsBase(value: string): string {
+  const url = new URL(value.trim());
+  if (url.protocol !== 'ws:' && url.protocol !== 'wss:') throw new Error('WebSocket 地址必须使用 ws:// 或 wss://');
+  return trimTrailingSlash(url.toString());
+}
+
 /** 读取 preload 注入的会话令牌；浏览器直连（无 preload）时为空串。 */
 function sessionToken(): string {
   return (typeof window !== 'undefined' && window.desktop?.sessionToken) || '';
@@ -214,7 +226,14 @@ export class AgentSocket {
 
   private open(): void {
     if (this.socket && (this.socket.readyState === WebSocket.OPEN || this.socket.readyState === WebSocket.CONNECTING)) return;
-    const socket = new WebSocket(this.url);
+    let socket: WebSocket;
+    try {
+      socket = new WebSocket(this.url);
+    } catch {
+      this.options.onError?.();
+      this.scheduleReconnect();
+      return;
+    }
     this.socket = socket;
     // 所有监听器都先确认自己仍是在用连接：disconnect() 或重连替换后，旧 socket 的
     // 迟到事件既不能污染状态，也不能再触发一次重连。

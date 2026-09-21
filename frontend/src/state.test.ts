@@ -1,4 +1,4 @@
-import { reconnectDelay } from './api/client';
+import { normalizeApiBase, normalizeWsBase, reconnectDelay } from './api/client.js';
 import {
   SLASH_COMMANDS,
   commandQuery,
@@ -6,7 +6,7 @@ import {
   helpText,
   isCommandName,
   matchCommands,
-} from './commands';
+} from './commands.js';
 import {
   BUSY_STALL_TIMEOUT_MS,
   addToApprovalQueue,
@@ -16,6 +16,7 @@ import {
   isBackgroundEvent,
   isNearBottom,
   isStalled,
+  lastAssistantTurn,
   parseApproval,
   reduceThreadEvent,
   resolveEventTarget,
@@ -24,7 +25,7 @@ import {
   shortThreadId,
   updateAssistant,
   type ThreadViewState,
-} from './state';
+} from './state.js';
 import type { PendingApproval, WSEvent } from './types';
 
 const event = (thread_id: string, type: WSEvent['type'], payload: Record<string, unknown>): WSEvent => ({ thread_id, type, payload });
@@ -155,6 +156,7 @@ if (!detached['old'] || !detached['old'].busy) throw new Error('detachThreadToVi
 if (resolveEventTarget('old', undefined, new Set(['old'])) !== 'background') throw new Error('迟到事件未按后台路由');
 if (resolveEventTarget('new', undefined, new Set(['old'])) !== 'foreground') throw new Error('新会话事件被误判为后台');
 if (!isBackgroundEvent('old', undefined, new Set(['old']))) throw new Error('detached 集合未被 isBackgroundEvent 识别');
+if (!isBackgroundEvent('scheduled-idle', undefined, new Set())) throw new Error('空闲时定时任务劫持了前台会话');
 
 // 任务切换：切换到后台会话时，从 views 中取对应消息。
 const threadViews: Record<string, ThreadViewState> = { 'bg-123': { messages: [{ id: 'm1', role: 'assistant', content: '后台结果', timestamp: '2026-01-01T00:00:00Z' }], tasks: [], busy: false } };
@@ -210,3 +212,33 @@ if (badSummaryView.summary !== undefined) throw new Error('非法摘要形状未
 // 活动中心展示结构化摘要的路径，供「复制结果 / 打开所在目录」使用。
 const summaryItems = buildActivityItems({}, undefined, { messages: [{ id: 'm1', role: 'assistant', content: '完成', timestamp: '2026-01-01T00:00:00Z' }], tasks: [], busy: false, summary: { ok: 1, failed: 0, skipped: 0, files: ['C:/x.txt'], operations: [] } }, []);
 if (summaryItems[0]?.resultPaths?.[0] !== 'C:/x.txt') throw new Error('当前会话 resultPaths 未透出摘要文件');
+
+// error 是非终态诊断：不得清 busy，也不得把仍运行的任务标失败。
+const diagnosticView = reduceThreadEvent(
+  { messages: [], tasks: [{ id: 'running', title: '任务', detail: '', status: 'running', updatedAt: '', threadId: 'd-1' }], busy: true },
+  event('d-1', 'error', { message: '审批已过期' }),
+).view;
+if (!diagnosticView.busy || diagnosticView.tasks[0]?.status !== 'running') throw new Error('非终态 error 错误结束了任务');
+if (diagnosticView.messages[0]?.role !== 'system') throw new Error('诊断错误未显示为系统消息');
+
+// 连接握手不是 Agent 工作流节点，不应凭空生成一条“执行中”任务。
+const handshakeView = reduceThreadEvent(
+  { messages: [], tasks: [], busy: false },
+  event('', 'node', { node: 'connected', status: 'ready' }),
+).view;
+if (handshakeView.tasks.length !== 0) throw new Error('连接握手被误当成运行中任务');
+
+// 从后台切回时要从历史消息恢复回合号，下一次追问才能创建新气泡。
+if (lastAssistantTurn([
+  { id: 'assistant-thread-1', role: 'assistant', content: '一', timestamp: '' },
+  { id: 'assistant-thread-3', role: 'assistant', content: '三', timestamp: '' },
+], 'thread') !== 3) throw new Error('未恢复历史助手回合号');
+
+if (normalizeApiBase('http://127.0.0.1:8000/') !== 'http://127.0.0.1:8000') throw new Error('REST 地址规范化失败');
+if (normalizeWsBase('ws://127.0.0.1:8000/') !== 'ws://127.0.0.1:8000') throw new Error('WS 地址规范化失败');
+try {
+  normalizeWsBase('http://127.0.0.1:8000');
+  throw new Error('错误协议未被拒绝');
+} catch (error) {
+  if (error instanceof Error && error.message === '错误协议未被拒绝') throw error;
+}

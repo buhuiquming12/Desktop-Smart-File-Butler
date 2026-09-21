@@ -1,4 +1,7 @@
 """定时任务线程池回归：同目录去重，以及提交失败时必须收回占位（B9）。"""
+import pytest
+
+from app.models import ScheduledJob
 from app.tools import scheduler
 
 
@@ -57,3 +60,16 @@ def test_directory_recovers_after_submit_failure(monkeypatch):
     scheduler._fire("C:/flaky", "two")
 
     assert len(healthy.calls) == 1, "提交失败后的目录再也没能触发"
+
+
+def test_invalid_cron_is_rejected_before_persistence(monkeypatch):
+    persisted = []
+    monkeypatch.setattr(scheduler.db, "upsert_job", persisted.append)
+    job = ScheduledJob(
+        job_id="bad-cron", directory="C:/tmp", instruction="整理", cron="not a cron"
+    )
+
+    with pytest.raises(ValueError):
+        scheduler.add_job(job)
+
+    assert persisted == []

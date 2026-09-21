@@ -363,12 +363,8 @@ class AgentRuntime:
             )
             for item in result.steps[:_MAX_PLAN_STEPS]:
                 if item.tool == "set_preference" and "key" in item.args:
-                    key = str(item.args["key"]).lower()
-                    if any(
-                        secret in key
-                        for secret in ("api_key", "token", "secret", "password")
-                    ):
-                        raise ValueError("拒绝把密钥、令牌或密码保存为用户偏好")
+                    # 与 REST 共用同一条数据边界校验，禁止 Agent 修改沙箱保留键。
+                    db.validate_public_preference_key(str(item.args["key"]))
             steps = [step.model_dump() for step in result.steps[:_MAX_PLAN_STEPS]]
             if not steps:
                 return {
@@ -840,3 +836,14 @@ class AgentRuntime:
     def state(self, thread_id: str) -> Dict[str, Any]:
         snapshot = self.graph.get_state(self.config(thread_id))
         return dict(snapshot.values) if snapshot and snapshot.values else {}
+
+    def cancel(self, thread_id: str) -> None:
+        """把取消写入 checkpoint，避免重启后会话又显示为 running/waiting。"""
+        self.graph.update_state(
+            self.config(thread_id),
+            {
+                "status": "cancelled",
+                "pending_approval": None,
+                "final_response": "任务已停止。已完成的文件操作仍可在操作日志中撤销。",
+            },
+        )

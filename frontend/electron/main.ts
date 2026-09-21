@@ -44,6 +44,18 @@ function errorPage(reason: string): string {
 // ---- Python 后端 sidecar（P2 打包链路）----
 let backendProcess: ChildProcess | null = null;
 
+function noSpawnRequested(): boolean {
+  return process.env.BUTLER_NO_SPAWN?.trim() === '1';
+}
+
+/** 支持带引号的可执行文件/参数路径；避免 `C:\Program Files\...` 被按空格拆坏。 */
+function splitCommandLine(value: string): string[] {
+  return value.match(/"[^"]*"|'[^']*'|[^\s]+/g)?.map((part) => {
+    const quoted = (part.startsWith('"') && part.endsWith('"')) || (part.startsWith("'") && part.endsWith("'"));
+    return quoted ? part.slice(1, -1) : part;
+  }) ?? [];
+}
+
 /** 从多个根向上查找含 app/main.py 的 backend 目录，兼容打包后的多层嵌套布局。 */
 function findBackendDir(): string | null {
   if (process.env.BUTLER_BACKEND_DIR) {
@@ -76,7 +88,7 @@ function resolvePython(dir: string): string {
 }
 
 function startBackend(): boolean {
-  if (process.env.BUTLER_NO_SPAWN) return true;  // 用户自行启动后端
+  if (noSpawnRequested()) return true;  // 用户自行启动后端
   const dir = findBackendDir();
   if (!dir) {
     console.warn('未找到后端目录（backend/app/main.py），跳过 sidecar 启动');
@@ -87,7 +99,7 @@ function startBackend(): boolean {
   let command: string;
   let args: string[];
   if (process.env.BUTLER_BACKEND_CMD) {
-    const parts = process.env.BUTLER_BACKEND_CMD.split(' ').filter(Boolean);
+    const parts = splitCommandLine(process.env.BUTLER_BACKEND_CMD);
     command = parts[0] ?? 'python';
     args = parts.slice(1);
   } else {
@@ -124,10 +136,23 @@ async function readSession(): Promise<SessionInfo | null> {
     const parsed = JSON.parse(raw) as { token?: string; host?: string; port?: number };
     if (!parsed.token) return null;
     const host = parsed.host && parsed.host !== '0.0.0.0' ? parsed.host : '127.0.0.1';
-    const backendUrl = parsed.port ? `http://${host}:${parsed.port}` : fallbackBackendUrl;
+    const urlHost = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+    const backendUrl = parsed.port ? `http://${urlHost}:${parsed.port}` : fallbackBackendUrl;
     return { token: parsed.token, backendUrl };
   } catch {
     return null;
+  }
+}
+
+async function sessionIsReady(session: SessionInfo): Promise<boolean> {
+  try {
+    const response = await fetch(`${session.backendUrl}/api/config`, {
+      headers: { 'X-Butler-Token': session.token },
+      signal: AbortSignal.timeout(1_000),
+    });
+    return response.ok;
+  } catch {
+    return false;
   }
 }
 
@@ -135,7 +160,7 @@ async function waitForSession(timeoutMs = 30_000): Promise<SessionInfo | null> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const session = await readSession();
-    if (session) return session;
+    if (session && await sessionIsReady(session)) return session;
     if (Date.now() >= deadline) return null;
     await new Promise((resolve) => setTimeout(resolve, 300));
   }
@@ -220,7 +245,7 @@ ipcMain.handle('butler:choose-directory', async () => {
 async function boot(): Promise<void> {
   mainWindow = createWindow();  // 立即出窗，显示启动页
 
-  if (!process.env.BUTLER_NO_SPAWN) {
+  if (!noSpawnRequested()) {
     // 删除旧会话文件，确保读到本次新后端写入的新令牌。
     await rm(sessionFilePath(), { force: true }).catch(() => undefined);
   }

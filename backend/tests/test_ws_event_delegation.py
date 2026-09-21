@@ -27,6 +27,9 @@ class _Recorder:
     async def send(self, client_id: str, event: WSEvent) -> None:
         self.sent.append((client_id, event))
 
+    async def broadcast(self, event: WSEvent) -> None:
+        self.sent.append(("broadcast", event))
+
     def types(self) -> List[str]:
         return [event.type for _, event in self.sent]
 
@@ -126,3 +129,18 @@ def test_emit_update_without_client_is_noop(recorder: _Recorder, monkeypatch: py
     asyncio.run(main._emit_update(None, "t1", {"planning": {"status": "running"}}))
     asyncio.run(main._emit_token(None, "t1", _Chunk("x")))
     assert recorder.sent == []
+
+
+def test_scheduled_dispatch_broadcasts_to_connected_ui(
+    recorder: _Recorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(main, "get_runtime", lambda: _Runtime())
+
+    asyncio.run(
+        main._dispatch_broadcast(
+            "scheduled-1", ("updates", {"planning": {"status": "running"}})
+        )
+    )
+
+    assert recorder.sent[0][0] == "broadcast"
+    assert recorder.sent[0][1].thread_id == "scheduled-1"

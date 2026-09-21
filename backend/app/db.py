@@ -177,12 +177,37 @@ def operations_for_thread(thread_id: str) -> List[OperationLog]:
 
 # ---------- 偏好记忆 ----------
 
-def set_preference(key: str, value: str) -> None:
+def validate_public_preference_key(key: str) -> str:
+    """校验来自 REST / Agent 的普通偏好键。
+
+    ``__`` 前缀由后端内部配置占用。校验必须位于共享边界，不能只放在 API
+    路由中，否则 Agent 工具可以绕过路由直接改写沙箱等安全配置。
+    """
+    normalized = key.strip()
+    if not normalized or len(normalized) > 200:
+        raise ValueError("偏好键不能为空且最多 200 字符")
+    if normalized.startswith("__"):
+        raise ValueError("保留键不可通过普通偏好接口修改")
+    if any(
+        secret in normalized.lower()
+        for secret in ("api_key", "token", "secret", "password")
+    ):
+        raise ValueError("密钥、令牌和密码不能保存为偏好")
+    return normalized
+
+
+def set_preference(
+    key: str, value: str, *, allow_reserved: bool = False
+) -> None:
+    """保存偏好；保留键仅允许受控的后端配置代码显式写入。"""
+    normalized = key.strip()
+    if not allow_reserved:
+        normalized = validate_public_preference_key(normalized)
     with _conn() as c:
         c.execute(
             "INSERT INTO preferences (key, value) VALUES (?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, value),
+            (normalized, value),
         )
 
 

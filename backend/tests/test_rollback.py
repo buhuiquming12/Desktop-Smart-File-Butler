@@ -154,3 +154,20 @@ def test_rollback_thread_endpoint(sandbox: Path) -> None:
     body = resp.json()
     assert body["ok"] == 2 and body["total"] == 2
     assert (sandbox / "h0.txt").exists() and (sandbox / "h1.txt").exists()
+
+
+def test_thread_rollback_restores_dependent_move_rename_chain(sandbox: Path) -> None:
+    """A→B→C 必须逆序动态预检；不能在 B 尚未恢复时就判第一步失败。"""
+    source = sandbox / "chain.txt"
+    source.write_text("chain", encoding="utf-8")
+    with db.operation_thread("thread-chain"):
+        moved = Path(filesystem.move_file(str(source), str(sandbox / "archive")))
+        renamed = Path(filesystem.rename_file(str(moved), "renamed.txt"))
+
+    client = TestClient(main.app)
+    resp = client.post("/api/threads/thread-chain/rollback", headers=_auth())
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["ok"] == 2
+    assert source.exists() and source.read_text(encoding="utf-8") == "chain"
+    assert not moved.exists() and not renamed.exists()

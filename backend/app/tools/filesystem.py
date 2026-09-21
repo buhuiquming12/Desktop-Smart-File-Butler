@@ -103,6 +103,7 @@ def scan_directory(directory: str, recursive: bool = False) -> List[FileMeta]:
     max_depth = _MAX_SCAN_DEPTH if recursive else 1
     items: List[FileMeta] = []
     bounded_by: Optional[str] = None
+    depth_limited = False
     # 显式栈遍历：root 的直接子项算第 1 层。
     stack: List[tuple[str, int]] = [(str(root), 1)]
     while stack and bounded_by is None:
@@ -135,12 +136,14 @@ def scan_directory(directory: str, recursive: bool = False) -> List[FileMeta]:
                     if depth < max_depth:
                         stack.append((entry.path, depth + 1))
                     elif recursive:
-                        # 到达深度上限：不再下探，但同级条目要照常收集，不得提前中断。
-                        bounded_by = f"深度达到上限 {_MAX_SCAN_DEPTH} 层"
+                        # 只截断当前分支，栈中的浅层兄弟目录仍必须继续扫描。
+                        depth_limited = True
         except OSError as exc:
             logger.warning("跳过无法读取的目录: %s (%s)", current, exc)
     if bounded_by:
         logger.warning("目录扫描提前结束（%s）: %s", bounded_by, root)
+    elif depth_limited:
+        logger.warning("目录扫描已按深度上限 %d 截断深层分支: %s", _MAX_SCAN_DEPTH, root)
     return items
 
 
