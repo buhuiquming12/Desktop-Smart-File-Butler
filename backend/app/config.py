@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+import json
 from pathlib import Path
 from typing import List
 
@@ -45,7 +46,12 @@ class Settings(BaseSettings):
     def sandbox_root_paths(self) -> List[Path]:
         """解析并规范化允许操作的根目录列表。"""
         roots: List[Path] = []
-        for raw in self.sandbox_roots.split(";"):
+        try:
+            decoded = json.loads(self.sandbox_roots)
+            values = decoded if isinstance(decoded, list) else []
+        except (json.JSONDecodeError, TypeError):
+            values = self.sandbox_roots.split(";")
+        for raw in values:
             raw = raw.strip()
             if not raw:
                 continue

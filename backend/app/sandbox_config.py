@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import List
 
@@ -21,8 +22,13 @@ ROOTS_KEY = "__sandbox_roots__"
 
 
 def _parse(raw: str) -> List[Path]:
+    try:
+        decoded = json.loads(raw)
+        values = decoded if isinstance(decoded, list) and all(isinstance(v, str) for v in decoded) else []
+    except (json.JSONDecodeError, TypeError):
+        values = raw.split(";")  # legacy format
     roots: List[Path] = []
-    for part in raw.split(";"):
+    for part in values:
         part = part.strip()
         if not part:
             continue
@@ -66,6 +72,6 @@ def save_roots(paths: List[str]) -> List[str]:
     seen: set[str] = set()
     unique = [p for p in normalized if not (p in seen or seen.add(p))]
     db.set_preference(
-        ROOTS_KEY, ";".join(unique), allow_reserved=True
+        ROOTS_KEY, json.dumps(unique, ensure_ascii=False), allow_reserved=True
     )  # 空串表示清除，回退 .env
     return unique

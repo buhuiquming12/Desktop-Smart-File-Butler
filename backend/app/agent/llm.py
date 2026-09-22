@@ -202,7 +202,27 @@ def _is_provider_capability_error(exc: BaseException) -> bool:
     """
     if isinstance(exc, (NotImplementedError, OutputParserException)):
         return True
-    return getattr(exc, "status_code", None) == 400
+    status = getattr(exc, "status_code", None)
+    response = getattr(exc, "response", None)
+    if status is None and response is not None:
+        status = getattr(response, "status_code", None)
+    if status not in (400, 404, 422):
+        return False
+    pieces = [str(exc)]
+    body = getattr(exc, "body", None)
+    if body is not None:
+        pieces.append(json.dumps(body, ensure_ascii=False, default=str))
+    if response is not None:
+        pieces.append(str(getattr(response, "text", "")))
+    message = " ".join(pieces).casefold()
+    markers = (
+        "tools unsupported", "tool unsupported", "function calling unsupported",
+        "does not support tools", "doesn't support tools", "tool_choice is not supported",
+        "unknown parameter: tools", "unrecognized request argument supplied: tools",
+        "response_format unsupported", "does not support response_format",
+        "structured output is not supported", "not support function",
+    )
+    return any(marker in message for marker in markers)
 
 
 class StructuredOutputRunnable:

@@ -102,7 +102,7 @@ def test_native_success_does_not_degrade() -> None:
 
 
 def test_bad_request_degrades_to_prompt_json() -> None:
-    fake = _FakeLLM(replies=[_payload()], native_behavior=BadRequest("invalid_request"))
+    fake = _FakeLLM(replies=[_payload()], native_behavior=BadRequest("unknown parameter: tools"))
     structured = _build(fake)
 
     assert structured.invoke([HumanMessage(content="x")]) == Plan(goal="归档")
@@ -123,7 +123,7 @@ def test_output_parser_error_degrades() -> None:
 
 
 def test_degradation_persists_across_calls() -> None:
-    fake = _FakeLLM(replies=[_payload(), _payload(goal="第二次")], native_behavior=BadRequest("x"))
+    fake = _FakeLLM(replies=[_payload(), _payload(goal="第二次")], native_behavior=BadRequest("tools unsupported"))
     structured = _build(fake)
 
     structured.invoke([HumanMessage(content="1")])
@@ -145,11 +145,20 @@ def test_transient_error_propagates_without_degrading() -> None:
     assert fake.prompt_calls == []
 
 
+def test_unrelated_400_propagates_without_degrading() -> None:
+    fake = _FakeLLM(native_behavior=BadRequest("model does not exist"))
+    structured = _build(fake)
+    with pytest.raises(BadRequest, match="model does not exist"):
+        structured.invoke([HumanMessage(content="x")])
+    assert structured.using_native is True
+    assert fake.prompt_calls == []
+
+
 # ------------------------------- 提示词路径 -------------------------------
 
 
 def test_instruction_carries_schema_and_keeps_original_messages() -> None:
-    fake = _FakeLLM(replies=[_payload()], native_behavior=BadRequest("x"))
+    fake = _FakeLLM(replies=[_payload()], native_behavior=BadRequest("function calling unsupported"))
     structured = _build(fake)
 
     structured.invoke([HumanMessage(content="原始请求")])
@@ -163,7 +172,7 @@ def test_instruction_carries_schema_and_keeps_original_messages() -> None:
 def test_retries_after_invalid_json_and_feeds_error_back() -> None:
     fake = _FakeLLM(
         replies=["抱歉，我来解释一下：先扫描目录。", _payload()],
-        native_behavior=BadRequest("x"),
+        native_behavior=BadRequest("tools unsupported"),
     )
     structured = _build(fake)
 
@@ -174,7 +183,7 @@ def test_retries_after_invalid_json_and_feeds_error_back() -> None:
 
 
 def test_raises_with_context_after_all_attempts_exhausted() -> None:
-    fake = _FakeLLM(replies=["不是 JSON", "仍然不是 JSON"], native_behavior=BadRequest("x"))
+    fake = _FakeLLM(replies=["不是 JSON", "仍然不是 JSON"], native_behavior=BadRequest("tools unsupported"))
     structured = _build(fake)
 
     with pytest.raises(ValueError, match="Plan"):
@@ -186,7 +195,7 @@ def test_raises_with_context_after_all_attempts_exhausted() -> None:
 def test_schema_violation_triggers_retry() -> None:
     """是合法 JSON 但不符合 schema（缺 goal）时，也必须重试而不是直接返回。"""
     fake = _FakeLLM(replies=[json.dumps({"steps": []}), _payload()],
-                    native_behavior=BadRequest("x"))
+                    native_behavior=BadRequest("tools unsupported"))
     structured = _build(fake)
 
     assert structured.invoke([HumanMessage(content="x")]) == Plan(goal="归档")
@@ -295,7 +304,8 @@ def test_manual_downgrade_does_not_prevent_later_auto_native() -> None:
 
 
 def test_capability_error_classification() -> None:
-    assert llm_module._is_provider_capability_error(BadRequest("x")) is True
+    assert llm_module._is_provider_capability_error(BadRequest("unknown parameter: tools")) is True
+    assert llm_module._is_provider_capability_error(BadRequest("invalid model name")) is False
     assert llm_module._is_provider_capability_error(NotImplementedError()) is True
     assert llm_module._is_provider_capability_error(ServerError("x")) is False
     assert llm_module._is_provider_capability_error(TimeoutError()) is False

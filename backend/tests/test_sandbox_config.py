@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 import pytest
 
@@ -80,3 +81,15 @@ def test_agent_cannot_overwrite_reserved_sandbox_key(dirs) -> None:
     assert sandbox_config.effective_roots() == [root_a.resolve()]
     with pytest.raises(SandboxViolation):
         resolve_in_sandbox(str(root_b / "b.txt"), must_exist=True)
+
+
+def test_legacy_roots_read_then_save_migrates_to_json(dirs) -> None:
+    root_a, root_b = dirs
+    db.set_preference(sandbox_config.ROOTS_KEY, f"{root_a};{root_b}", allow_reserved=True)
+    assert sandbox_config.effective_roots() == [root_a.resolve(), root_b.resolve()]
+    semicolon_root = root_a / "folder;legal"
+    semicolon_root.mkdir()
+    sandbox_config.save_roots([str(semicolon_root), str(root_b)])
+    stored = db.get_preference(sandbox_config.ROOTS_KEY)
+    assert json.loads(stored or "[]") == [str(semicolon_root.resolve()), str(root_b.resolve())]
+    assert sandbox_config.effective_roots() == [semicolon_root.resolve(), root_b.resolve()]
