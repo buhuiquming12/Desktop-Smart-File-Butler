@@ -8,43 +8,38 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Dict, Iterable, Optional, Set, Tuple
 
-import os
-import secrets
 import sys
-import weakref
 from pathlib import Path
-from urllib.parse import urlsplit
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 from starlette.requests import Request
 from starlette.responses import JSONResponse
-from starlette.websockets import WebSocketState
 
-import httpx
-
-from . import db, llm_config, sandbox_config
+from . import db
 from .api import events as ws_events
-from .api import rest as rest_api
+from .api.auth import (
+    get_session_token,
+    origin_allowed as _origin_allowed,
+    session_file_path as _session_file_path,
+    token_valid as _token_valid,
+    write_session_file as _write_session_file,
+)
+from .api.connections import ConnectionManager
+from .api.management import build_management_router
 from .agent.graph import AgentRuntime
 from .config import get_settings
 from .logging_conf import get_logger, setup_logging
 from .models import (
     ApprovalResponse,
     ChatRequest,
-    JobCreate,
-    LLMModelsRequest,
-    LLMSettingsUpdate,
-    PreferenceUpdate,
-    SandboxSettingsUpdate,
-    ScheduledJob,
     WSEvent,
     WSEventType,
 )
-from .security import SandboxViolation, resolve_in_sandbox
-from .tools import extract, filesystem, scheduler
+from .runtime import threads as thread_registry
+from .tools import scheduler
 
 settings = get_settings()
 setup_logging(settings.log_dir)
@@ -54,74 +49,10 @@ _runtime: Optional[AgentRuntime] = None
 _runtime_lock = threading.Lock()
 _background_tasks: Set[asyncio.Task[Any]] = set()
 # 用户请求中止的会话 id；执行循环在每个 update 边界检查并停止（P1-4）。
-_cancel_requested: Set[str] = set()
-# 弱引用避免攻击者持续提交随机 thread_id 时让锁表永久增长。正在持有或等待锁的
-# 协程都有强引用，因此不会在使用期间被回收。
-_thread_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
-# REST/WS 接受聊天后、首个 checkpoint 写入前也允许取消；计数兼容同一 thread 的
-# 多个排队请求，避免用一个 bool 时先结束的请求误删后一个请求的活动标记。
-_active_threads: Dict[str, int] = {}
+_cancel_requested = thread_registry.cancel_requested
+_thread_locks = thread_registry.thread_locks
+_active_threads = thread_registry.active_threads
 _main_loop: Optional[asyncio.AbstractEventLoop] = None
-
-# ---------------- 会话令牌与来源校验（P0-2） ----------------
-#
-# 威胁：CORS 中间件不作用于 WebSocket，本机任意网页均可连上 /ws 驱动 Agent，
-# 或 PUT /api/settings/llm 把 openai_base_url 改到攻击者服务器，再触发一次对话，
-# 后端便会带着已保存的 API Key 以 Bearer 请求该地址——等于把密钥读走。
-#
-# 防线（两层，令牌为硬门槛，来源校验为纵深防御）：
-#   1. 启动时生成一次性令牌，写入用户目录下的会话文件；Electron 主进程读取后经
-#      preload 注入渲染进程。REST 用请求头 X-Butler-Token 携带，WS 用查询参数 token。
-#      跨源网页拿不到该令牌，因此无法伪造请求。
-#   2. 仅放行本机 origin（http/https + 127.0.0.1/localhost/::1）；opaque 的 "null"
-#      origin（本地任意 html 文件）一律拒绝。
-_SESSION_TOKEN = secrets.token_urlsafe(32)
-_LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
-
-
-def get_session_token() -> str:
-    """返回本次进程的会话令牌。"""
-    return _SESSION_TOKEN
-
-
-def _session_file_path() -> Path:
-    override = os.environ.get("BUTLER_SESSION_FILE")
-    if override:
-        return Path(override).expanduser()
-    return Path.home() / ".desktop-smart-file-butler" / "session.json"
-
-
-def _write_session_file() -> None:
-    """把令牌与端口写入会话文件，供 Electron 主进程读取后注入渲染进程。"""
-    path = _session_file_path()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"token": _SESSION_TOKEN, "host": settings.host, "port": settings.port}
-        path.write_text(json.dumps(payload), encoding="utf-8")
-        try:
-            os.chmod(path, 0o600)  # best-effort：Windows 上权限位有限
-        except OSError:
-            pass
-        logger.info("会话令牌已写入 %s（令牌本身不记录到日志）", path)
-    except OSError:
-        logger.exception("写入会话令牌文件失败: %s", path)
-
-
-def _origin_allowed(origin: Optional[str]) -> bool:
-    """判断请求来源是否为本机。缺省 Origin（非浏览器 / 同源 GET）放行，令牌仍是硬门槛。"""
-    if not origin:
-        return True
-    if origin == "null":
-        return False
-    try:
-        parsed = urlsplit(origin)
-    except ValueError:
-        return False
-    return parsed.scheme in ("http", "https") and parsed.hostname in _LOCAL_HOSTS
-
-
-def _token_valid(token: Optional[str]) -> bool:
-    return bool(token) and secrets.compare_digest(token, _SESSION_TOKEN)
 
 
 def get_runtime() -> AgentRuntime:
@@ -146,94 +77,23 @@ def reset_runtime() -> None:
             retire()
 
 
-class ConnectionManager:
-    """维护 Electron 渲染进程的 WebSocket 连接。"""
-
-    def __init__(self) -> None:
-        self._connections: Dict[str, WebSocket] = {}
-
-    async def connect(self, client_id: str, websocket: WebSocket) -> None:
-        await websocket.accept()
-        old = self._connections.get(client_id)
-        self._connections[client_id] = websocket
-        if old and old is not websocket:
-            try:
-                await old.close(code=1000, reason="由新连接替换")
-            except RuntimeError:
-                pass
-
-    def disconnect(self, client_id: str, websocket: WebSocket) -> None:
-        if self._connections.get(client_id) is websocket:
-            self._connections.pop(client_id, None)
-
-    async def send(self, client_id: str, event: WSEvent) -> None:
-        """向指定客户端推送事件；对端已断开时静默丢弃，绝不向上抛（B2）。
-
-        单个客户端的连接问题不得中断 Agent 执行：这里没有任何重试，事件发不出去
-        就丢掉，前端的重连 + 兜底超时负责恢复（见 AgentSocket 与 App 的 busy 看门狗）。
-        """
-        websocket = self._connections.get(client_id)
-        if websocket is None:
-            return
-        # 握手未完成或已被对端关闭：直接清理映射，避免向 dead client 反复推送。
-        if websocket.application_state is not WebSocketState.CONNECTED:
-            self.disconnect(client_id, websocket)
-            return
-        try:
-            await websocket.send_json(event.model_dump(mode="json"))
-        except (RuntimeError, WebSocketDisconnect):
-            # 发送瞬间对端断开；后续事件会落到上面的分支。
-            logger.debug("推送时发现连接已断开，已清理 client=%s", client_id)
-            self.disconnect(client_id, websocket)
-        except Exception:  # noqa: BLE001 - 推送失败不得冒泡到会话执行循环
-            logger.exception("推送事件失败 client=%s type=%s", client_id, event.type)
-            self.disconnect(client_id, websocket)
-
-    async def broadcast(self, event: WSEvent) -> None:
-        """向当前所有渲染进程广播后台/定时任务事件。"""
-        client_ids = list(self._connections)
-        if client_ids:
-            await asyncio.gather(*(self.send(client_id, event) for client_id in client_ids))
-
-
 connections = ConnectionManager()
 
 
 def _thread_lock(thread_id: str) -> asyncio.Lock:
-    """同一 thread 的启动/恢复必须串行，防止重复审批或并发对话重复执行工具。"""
-    lock = _thread_locks.get(thread_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        _thread_locks[thread_id] = lock
-    return lock
+    return thread_registry.thread_lock(thread_id)
 
 
 def _register_thread(thread_id: str) -> None:
-    _active_threads[thread_id] = _active_threads.get(thread_id, 0) + 1
+    thread_registry.register(thread_id)
 
 
 def _unregister_thread(thread_id: str) -> None:
-    remaining = _active_threads.get(thread_id, 0) - 1
-    if remaining > 0:
-        _active_threads[thread_id] = remaining
-    else:
-        _active_threads.pop(thread_id, None)
+    thread_registry.unregister(thread_id)
 
 
 def _request_cancel(thread_id: str) -> bool:
-    """仅给真实活动/待审批会话登记取消，避免陈旧标记误杀未来同 ID 会话。"""
-    if _active_threads.get(thread_id, 0) > 0:
-        _cancel_requested.add(thread_id)
-        return True
-    try:
-        state = get_runtime().state(thread_id)
-    except Exception:  # noqa: BLE001 - 取消不存在的会话不应触发新的服务故障
-        logger.exception("检查待取消会话失败 thread=%s", thread_id)
-        return False
-    if state.get("status") in {"perceiving", "planning", "running", "waiting_approval"}:
-        _cancel_requested.add(thread_id)
-        return True
-    return False
+    return thread_registry.request_cancel(thread_id, lambda value: get_runtime().state(value))
 
 
 def _scheduled_runner(directory: str, instruction: str) -> None:
@@ -319,6 +179,9 @@ async def _auth_guard(request: Request, call_next: Any) -> Any:
         if not _token_valid(request.headers.get("x-butler-token")):
             return JSONResponse({"detail": "缺少或非法的会话令牌"}, status_code=401)
     return await call_next(request)
+
+
+app.include_router(build_management_router(reset_runtime))
 
 
 def _next_update(iterator: Iterable[Dict[str, Any]]) -> Tuple[bool, Optional[Dict[str, Any]]]:
@@ -610,143 +473,7 @@ async def _resolve_cancelled_approval(
         logger.exception("清理待审批取消状态失败 thread=%s", thread_id)
 
 
-# ---------------- REST ----------------
-
-
-@app.get("/api/health")
-def health() -> Dict[str, Any]:
-    config = llm_config.get_effective_config()
-    return {
-        "status": "ok",
-        "model_provider": config.provider,
-        "sandbox_configured": bool(sandbox_config.effective_roots()),
-    }
-
-
-@app.get("/api/config")
-def public_config() -> Dict[str, Any]:
-    """仅返回非敏感配置；API key 永不暴露给渲染进程。"""
-    config = llm_config.get_effective_config()
-    ocr = extract.ocr_capability()
-    return {
-        "model_provider": config.provider,
-        "openai_model": config.openai_model,
-        "openai_api_key_set": bool(config.openai_api_key),
-        "ollama_model": config.ollama_model,
-        "ollama_base_url": config.ollama_base_url,
-        "sandbox_roots": [str(path) for path in sandbox_config.effective_roots()],
-        "ocr": ocr,
-        "ocr_enabled": bool(ocr.get("available")),
-    }
-
-
-# ---------------- 沙箱根目录（前端可配，DB 覆盖 .env） ----------------
-
-
-@app.get("/api/settings/sandbox")
-def get_sandbox_settings() -> Dict[str, Any]:
-    """返回当前生效的沙箱根目录，以及是否来自 DB 覆盖。"""
-    override = db.get_preference(sandbox_config.ROOTS_KEY)
-    return {
-        "roots": [str(p) for p in sandbox_config.effective_roots()],
-        "source": "database" if override else "env",
-        "env_roots": [str(p) for p in settings.sandbox_root_paths],
-    }
-
-
-@app.put("/api/settings/sandbox")
-def update_sandbox_settings(body: SandboxSettingsUpdate) -> Dict[str, Any]:
-    """保存沙箱根目录覆盖项（权限变更）。空列表清除覆盖、回退 .env。
-
-    因 effective_roots 每次读库，保存后对后续所有文件操作立即生效。
-    """
-    try:
-        sandbox_config.save_roots(body.roots)
-    except sandbox_config.InvalidSandboxRoot as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return get_sandbox_settings()
-
-
-# ---------------- 模型配置 ----------------
-
-
-@app.get("/api/settings/llm")
-def get_llm_settings() -> Dict[str, Any]:
-    """返回当前生效的模型配置。API Key 不回传，仅以布尔标记是否已配置。"""
-    config = llm_config.get_effective_config()
-    return {
-        "provider": config.provider,
-        "openai_base_url": config.openai_base_url,
-        "openai_model": config.openai_model,
-        "openai_api_key_set": bool(config.openai_api_key),
-        "ollama_base_url": config.ollama_base_url,
-        "ollama_model": config.ollama_model,
-        "structured_output_mode": config.structured_output_mode,
-    }
-
-
-@app.put("/api/settings/llm")
-def update_llm_settings(body: LLMSettingsUpdate) -> Dict[str, Any]:
-    """保存模型配置覆盖项并立即生效（下一次会话重建 LLM）。"""
-    provided = body.model_dump(exclude_unset=True)
-    if "provider" in provided and provided["provider"]:
-        provider = str(provided["provider"]).lower()
-        if provider not in ("openai", "ollama"):
-            raise HTTPException(status_code=422, detail="provider 仅支持 openai 或 ollama")
-        provided["provider"] = provider
-
-    if provided.get("structured_output_mode"):
-        mode = str(provided["structured_output_mode"]).lower()
-        if mode not in llm_config.STRUCTURED_OUTPUT_MODES:
-            raise HTTPException(
-                status_code=422, detail="structured_output_mode 仅支持 auto 或 prompt"
-            )
-        provided["structured_output_mode"] = mode
-
-    llm_config.save_overrides({k: (v if v is not None else "") for k, v in provided.items()})
-    reset_runtime()
-    return get_llm_settings()
-
-
-@app.post("/api/settings/llm/models")
-async def list_llm_models(body: LLMModelsRequest) -> Dict[str, Any]:
-    """探测 OpenAI 兼容 / Ollama 服务的可用模型列表。
-
-    未显式提供的字段回退到已保存配置；密钥留空则使用已保存密钥。
-    """
-    config = llm_config.get_effective_config()
-    provider = (body.provider or config.provider).lower()
-
-    try:
-        if provider == "ollama":
-            base = (body.base_url or config.ollama_base_url or "").rstrip("/")
-            if not base:
-                raise HTTPException(status_code=422, detail="缺少 Ollama Base URL")
-            async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.get(f"{base}/api/tags")
-                resp.raise_for_status()
-                data = resp.json()
-            models = sorted({item.get("name", "") for item in data.get("models", []) if item.get("name")})
-            return {"provider": "ollama", "models": models}
-
-        # OpenAI 兼容协议
-        base = (body.base_url or config.openai_base_url or "https://api.openai.com/v1").rstrip("/")
-        api_key = body.api_key or config.openai_api_key
-        if not api_key:
-            raise HTTPException(status_code=422, detail="缺少 API Key")
-        headers = {"Authorization": f"Bearer {api_key}"}
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(f"{base}/models", headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-        items = data.get("data", data if isinstance(data, list) else [])
-        models = sorted({item.get("id", "") for item in items if item.get("id")})
-        return {"provider": "openai", "models": models}
-    except httpx.HTTPStatusError as exc:
-        detail = f"服务返回 {exc.response.status_code}"
-        raise HTTPException(status_code=502, detail=f"获取模型失败：{detail}") from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"无法连接模型服务：{exc}") from exc
+# ---------------- 会话 REST ----------------
 
 
 @app.post("/api/chat", status_code=status.HTTP_202_ACCEPTED)
@@ -786,86 +513,6 @@ async def approval(response: ApprovalResponse) -> Dict[str, str]:
         raise HTTPException(status_code=409, detail="审批已过期或不匹配")
     _track(_resume_approval(response))
     return {"thread_id": response.thread_id, "status": "accepted"}
-
-
-@app.get("/api/operations")
-def operations(limit: int = Query(100, ge=1, le=500)) -> list[Dict[str, Any]]:
-    return [item.model_dump(mode="json") for item in db.recent_operations(limit)]
-
-
-@app.post("/api/operations/{op_id}/rollback")
-def rollback_operation(op_id: int) -> Dict[str, Any]:
-    """回滚单条操作（move/rename/delete）：把文件从 dest 移回 target。"""
-    op = db.get_operation(op_id)
-    if op is None:
-        raise HTTPException(status_code=404, detail="操作记录不存在")
-    try:
-        result = filesystem.restore_operation(op)
-    except (SandboxViolation, FileNotFoundError) as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    if result["status"] == "failed":
-        raise HTTPException(status_code=409, detail=result["detail"])
-    return {"op_id": op_id, **result}
-
-
-@app.post("/api/threads/{thread_id}/rollback")
-def rollback_thread(thread_id: str) -> Dict[str, Any]:
-    """先预检全部目标，再按逆序回滚，返回可直接展示的分级汇总。"""
-    ops = db.operations_for_thread(thread_id)
-    reversible = [op for op in ops if op.action in ("move", "rename", "delete") and op.status == "ok" and op.dest]
-    if not reversible:
-        raise HTTPException(status_code=404, detail="没有可回滚的操作")
-    return rest_api.rollback_summary(thread_id, reversible, filesystem.preflight_restore, filesystem.restore_operation)
-
-
-@app.get("/api/preferences")
-def preferences() -> list[Dict[str, str]]:
-    return [item.model_dump() for item in db.all_preferences()]
-
-
-@app.put("/api/preferences/{key}")
-def update_preference(key: str, body: PreferenceUpdate) -> Dict[str, str]:
-    try:
-        normalized_key = db.validate_public_preference_key(key)
-        db.set_preference(normalized_key, body.value)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return {"key": normalized_key, "value": body.value}
-
-
-@app.get("/api/jobs")
-def jobs() -> list[Dict[str, Any]]:
-    return [item.model_dump() for item in db.list_jobs()]
-
-
-@app.post("/api/jobs", status_code=status.HTTP_201_CREATED)
-def create_job(body: JobCreate) -> Dict[str, Any]:
-    try:
-        directory_path = resolve_in_sandbox(body.directory, must_exist=True)
-        directory = str(directory_path)
-        scheduler.validate_cron(body.cron)
-    except (SandboxViolation, FileNotFoundError, NotADirectoryError, ValueError) as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    if not directory_path.is_dir():
-        raise HTTPException(status_code=422, detail="定时任务目标必须是目录")
-
-    job = ScheduledJob(
-        job_id=uuid.uuid4().hex,
-        directory=directory,
-        instruction=body.instruction,
-        cron=body.cron,
-        enabled=body.enabled,
-    )
-    scheduler.add_job(job)
-    return job.model_dump()
-
-
-@app.delete("/api/jobs/{job_id}")
-def remove_job(job_id: str) -> Dict[str, str]:
-    if not any(item.job_id == job_id for item in db.list_jobs()):
-        raise HTTPException(status_code=404, detail="定时任务不存在")
-    scheduler.remove_job(job_id)
-    return {"job_id": job_id, "status": "deleted"}
 
 
 # ---------------- WebSocket ----------------
