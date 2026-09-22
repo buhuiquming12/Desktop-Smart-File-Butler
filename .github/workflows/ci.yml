@@ -98,10 +98,10 @@ jobs:
         run: python backend/build_sidecar.py
       - name: Sidecar smoke test
         run: backend/dist/butler-backend.exe --self-test
-      - name: 构建 Electron unpacked 包
+      - name: 构建 Electron portable 包
         working-directory: frontend
-        run: npm run build
+        run: npm run dist
       - uses: actions/upload-artifact@v4
         with:
-          name: desktop-windows-unpacked
-          path: frontend/release/win-unpacked
+          name: desktop-windows-portable
+          path: frontend/release/*.exe
