@@ -33,6 +33,8 @@ frontend/.test-dist/
 *.tsbuildinfo
 *.local
 package-lock.json
+!frontend/package-lock.json
+backend/*.spec
 
 # ============ 本地配置 / 数据 ============
 .env

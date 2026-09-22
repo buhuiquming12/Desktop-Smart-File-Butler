@@ -10,7 +10,21 @@ const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const developmentUrl = process.env.VITE_DEV_SERVER_URL;
 // 生产模式下前端由后端 StaticFiles 同源托管（P0-1），Electron loadURL 到后端，
 // 使渲染进程 origin 与 /api、/ws 一致，摆脱 CORS 与 opaque(null) origin。
-const fallbackBackendUrl = (process.env.BUTLER_BACKEND_URL ?? 'http://127.0.0.1:8000').replace(/\/+$/, '');
+const DEFAULT_BACKEND_URL = 'http://127.0.0.1:8000';
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
+function loopbackBackendUrl(raw: string): string {
+  try {
+    const value = new URL(raw);
+    if (!['http:', 'https:'].includes(value.protocol) || !LOOPBACK_HOSTS.has(value.hostname.toLowerCase())) {
+      throw new Error('backend URL must be loopback');
+    }
+    return value.toString().replace(/\/+$/, '');
+  } catch {
+    console.warn('忽略非本机 BUTLER_BACKEND_URL');
+    return DEFAULT_BACKEND_URL;
+  }
+}
+const fallbackBackendUrl = loopbackBackendUrl(process.env.BUTLER_BACKEND_URL ?? DEFAULT_BACKEND_URL);
 
 // 供 preload 同步读取的会话信息；后端就绪后填充。
 let currentSession: { token: string; backendUrl: string } = { token: '', backendUrl: fallbackBackendUrl };
@@ -34,9 +48,12 @@ code{background:#eef;padding:1px 5px;border-radius:4px}</style></head><body><div
 }
 const LOADING_PAGE = htmlPage('<div class="sp"></div><h1>正在启动本地服务…</h1><p>首次启动需加载模型与索引组件，可能需要几秒。</p>');
 function errorPage(reason: string): string {
+  const help = app.isPackaged
+    ? '<p>请重启应用；若仍失败，请查看应用数据目录中的日志。桌面包不需要安装 Python。</p>'
+    : '<p>请确认后端可启动；也可手动运行：<br><code>cd backend &amp;&amp; python -m uvicorn app.main:app --port 8000</code></p>';
   return htmlPage(
     `<h1>无法连接本地后端</h1><p>${reason}</p>` +
-    `<p>请确认后端可启动；也可手动运行后端后重开应用：<br><code>cd backend &amp;&amp; python -m uvicorn app.main:app --port 8000</code></p>` +
+    help +
     `<p>如已自行启动后端，可设置环境变量 <code>BUTLER_NO_SPAWN=1</code> 让应用不再自行拉起。</p>`,
   );
 }
@@ -89,26 +106,38 @@ function resolvePython(dir: string): string {
 
 function startBackend(): boolean {
   if (noSpawnRequested()) return true;  // 用户自行启动后端
-  const dir = findBackendDir();
-  if (!dir) {
-    console.warn('未找到后端目录（backend/app/main.py），跳过 sidecar 启动');
-    return false;
-  }
   const url = new URL(fallbackBackendUrl);
   const port = url.port || '8000';
   let command: string;
   let args: string[];
+  let dir: string;
   if (process.env.BUTLER_BACKEND_CMD) {
     const parts = splitCommandLine(process.env.BUTLER_BACKEND_CMD);
     command = parts[0] ?? 'python';
     args = parts.slice(1);
+    dir = process.cwd();
+  } else if (app.isPackaged) {
+    command = path.join(process.resourcesPath, 'backend', process.platform === 'win32' ? 'butler-backend.exe' : 'butler-backend');
+    if (!existsSync(command)) return false;
+    args = [];
+    dir = path.dirname(command);
   } else {
+    const found = findBackendDir();
+    if (!found) return false;
+    dir = found;
     command = resolvePython(dir);
     args = ['-m', 'uvicorn', 'app.main:app', '--host', url.hostname || '127.0.0.1', '--port', port];
   }
   try {
     console.log('启动后端 sidecar：', command, args.join(' '), '于', dir);
-    backendProcess = spawn(command, args, { cwd: dir, stdio: 'inherit', env: process.env });
+    const userData = app.getPath('userData');
+    backendProcess = spawn(command, args, { cwd: dir, stdio: 'inherit', env: {
+      ...process.env,
+      HOST: url.hostname || '127.0.0.1', PORT: port,
+      DB_PATH: process.env.DB_PATH ?? path.join(userData, 'data', 'butler.db'),
+      LOG_DIR: process.env.LOG_DIR ?? path.join(userData, 'logs'),
+      BUTLER_SESSION_FILE: sessionFilePath(),
+    } });
     backendProcess.on('error', (err) => console.error('后端 sidecar 启动失败：', err));
     backendProcess.on('exit', (code) => { console.log('后端 sidecar 退出，code=', code); backendProcess = null; });
     return true;
@@ -136,6 +165,7 @@ async function readSession(): Promise<SessionInfo | null> {
     const parsed = JSON.parse(raw) as { token?: string; host?: string; port?: number };
     if (!parsed.token) return null;
     const host = parsed.host && parsed.host !== '0.0.0.0' ? parsed.host : '127.0.0.1';
+    if (!LOOPBACK_HOSTS.has(host.toLowerCase())) return null;
     const urlHost = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
     const backendUrl = parsed.port ? `http://${urlHost}:${parsed.port}` : fallbackBackendUrl;
     return { token: parsed.token, backendUrl };
@@ -274,12 +304,23 @@ async function boot(): Promise<void> {
   }
 }
 
-app.whenReady().then(async () => {
-  await boot();
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) void boot();
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (!mainWindow) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
   });
-});
+  app.whenReady().then(async () => {
+    await boot();
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0) void boot();
+    });
+  });
+}
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();

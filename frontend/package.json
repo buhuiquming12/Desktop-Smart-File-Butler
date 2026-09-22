@@ -10,9 +10,10 @@
     "dev": "concurrently -k \"vite\" \"wait-on tcp:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
     "build": "tsc -b && vite build && electron-builder --dir",
     "build:web": "tsc -b && vite build",
+    "build:sidecar": "python ../backend/build_sidecar.py",
     "preview": "vite preview",
     "typecheck": "tsc -b --pretty false",
-    "test": "tsc -p tsconfig.test.json --pretty false && node .test-dist/state.test.js"
+    "test": "tsc -p tsconfig.test.json --pretty false && node .test-dist/state.test.js && node .test-dist/api.test.js"
   },
   "dependencies": {
     "react": "19.3.0",
@@ -38,6 +39,9 @@
       "dist/**/*",
       "dist-electron/**/*",
       "package.json"
+    ],
+    "extraResources": [
+      { "from": "../backend/dist/butler-backend.exe", "to": "backend/butler-backend.exe" }
     ],
     "directories": {
       "output": "release"
