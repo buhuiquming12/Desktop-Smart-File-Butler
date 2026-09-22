@@ -16,6 +16,28 @@ export interface ChatRequest {
   client_id?: string;
 }
 
+export interface ChatResponse {
+  thread_id: string;
+  status: string;
+}
+
+export interface ThreadState {
+  thread_id?: string;
+  status: string;
+  pending_approval?: Record<string, unknown> | null;
+  observations?: Array<Record<string, unknown>>;
+  final_response?: string;
+  error?: string;
+  summary?: TaskSummary;
+}
+
+export interface RollbackSummary {
+  ok: number;
+  skipped: number;
+  failed: number;
+  details?: Array<Record<string, unknown>>;
+}
+
 export interface ApprovalResponse {
   thread_id: string;
   approval_id: string;

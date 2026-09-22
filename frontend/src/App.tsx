@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AgentSocket, ApiClient, DEFAULT_API_BASE, DEFAULT_WS_BASE, normalizeApiBase, normalizeWsBase } from './api/client';
+import { AgentSocket, ApiClient, defaultApiBase, normalizeApiBase, normalizeWsBase, reconciliationEvents, rollbackFeedback, sendChatRest, wsBaseFromApi } from './api/client';
 import { helpText, isCommandName, type SlashCommandName } from './commands';
 import { ActivityCenter } from './components/ActivityCenter';
 import { ApprovalModal } from './components/ApprovalModal';
@@ -25,6 +25,7 @@ import type {
   SetupHints,
   TaskItem,
   TaskSummary,
+  ThreadState,
   WSEvent,
 } from './types';
 import {
@@ -51,8 +52,19 @@ function createId(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function readStored(key: string, fallback: string): string {
-  return localStorage.getItem(key) ?? fallback;
+function initialApiBase(): string {
+  const fallback = defaultApiBase();
+  const stored = localStorage.getItem('file-butler-api-base');
+  if (!stored) return fallback;
+  try { return normalizeApiBase(stored); } catch { return fallback; }
+}
+
+function initialWsBase(apiBase: string): string {
+  const stored = localStorage.getItem('file-butler-ws-base');
+  if (stored) {
+    try { return normalizeWsBase(stored); } catch { /* derive below */ }
+  }
+  return wsBaseFromApi(apiBase);
 }
 
 function ensureClientId(): string {
@@ -65,8 +77,8 @@ function ensureClientId(): string {
 
 export function App() {
   const clientId = useMemo(ensureClientId, []);
-  const [apiBase, setApiBase] = useState(() => readStored('file-butler-api-base', DEFAULT_API_BASE));
-  const [wsBase, setWsBase] = useState(() => readStored('file-butler-ws-base', DEFAULT_WS_BASE));
+  const [apiBase, setApiBase] = useState(initialApiBase);
+  const [wsBase, setWsBase] = useState(() => initialWsBase(initialApiBase()));
   const [connectionState, setConnectionState] = useState<ConnectionState>('connecting');
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [tasks, setTasks] = useState<TaskItem[]>([]);
@@ -95,9 +107,12 @@ export function App() {
   const [settingsLoading, setSettingsLoading] = useState(false);
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const socketRef = useRef<AgentSocket | null>(null);
+  const threadViewsRef = useRef<Record<string, ThreadViewState>>({});
   // B2 心跳：最后一次收到后端事件的时刻，供 busy 看门狗判定是否已失联。
   const lastActivityRef = useRef<number>(Date.now());
   const api = useMemo(() => new ApiClient(apiBase), [apiBase]);
+
+  useEffect(() => { threadViewsRef.current = threadViews; }, [threadViews]);
 
   // 正在运行的后台/定时会话：它们的进度只存在 threadViews 里（活动中心逐一列出），
   // 因此用「结束」按钮上的计数把它们暴露出来，否则用户根本不知道还有东西在跑。
@@ -255,6 +270,15 @@ export function App() {
     }
   }, [notify, updateAssistant, updateTask]);
 
+  const reconcileThread = useCallback(async (targetId: string) => {
+    try {
+      const state: ThreadState = await api.getThread(targetId);
+      for (const event of reconciliationEvents(targetId, state)) handleSocketEvent(event);
+    } catch {
+      // A brand-new WS request may not have written its first checkpoint yet.
+    }
+  }, [api, handleSocketEvent]);
+
   useEffect(() => {
     setConnectionState('connecting');
     const socket = new AgentSocket({
@@ -265,6 +289,11 @@ export function App() {
       onOpen: () => {
         lastActivityRef.current = Date.now();
         setConnectionState('connected');
+        const running = Object.entries(threadViewsRef.current)
+          .filter(([, view]) => view.busy)
+          .map(([id]) => id);
+        const active = threadIdRef.current;
+        for (const id of new Set([...(active ? [active] : []), ...running])) void reconcileThread(id);
       },
       onClose: () => setConnectionState('disconnected'),
       onError: () => setConnectionState('error'),
@@ -275,7 +304,7 @@ export function App() {
       socket.disconnect();
       if (socketRef.current === socket) socketRef.current = null;
     };
-  }, [clientId, handleSocketEvent, wsBase]);
+  }, [clientId, handleSocketEvent, reconcileThread, wsBase]);
 
   /** 手动重连：连接断开时由界面上的「立即重试」触发。 */
   const reconnectSocket = useCallback(() => {
@@ -348,7 +377,10 @@ export function App() {
     if (socketRef.current?.send(socketPayload)) return;
 
     const request = threadId ? { message, thread_id: threadId, client_id: clientId } : { message, client_id: clientId };
-    void api.sendChat(request).catch((error: unknown) => {
+    void sendChatRest(api, request, (acceptedId) => {
+      threadIdRef.current = acceptedId;
+      setThreadId(acceptedId);
+    }).catch((error: unknown) => {
       setBusy(false);
       setMessages((current) => [...current, {
         id: createId('system'),
@@ -498,8 +530,9 @@ export function App() {
       return;
     }
     try {
-      await api.rollbackThread(id);
-      notify('已撤销本次会话中可撤销的文件操作，详情见「操作日志」。', 'success');
+      const result = await api.rollbackThread(id);
+      const feedback = rollbackFeedback(result);
+      notify(feedback.message, feedback.kind);
       void loadSettingsData();
     } catch (error) {
       notify(error instanceof Error ? `撤销失败：${error.message}` : '撤销失败', 'error');

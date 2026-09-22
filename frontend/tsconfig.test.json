@@ -12,5 +12,5 @@
     "exactOptionalPropertyTypes": true,
     "esModuleInterop": true
   },
-  "files": ["src/state.test.ts", "src/vite-env.d.ts"]
+  "files": ["src/state.test.ts", "src/api.test.ts", "src/vite-env.d.ts"]
 }

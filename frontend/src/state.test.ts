@@ -1,4 +1,4 @@
-import { normalizeApiBase, normalizeWsBase, reconnectDelay } from './api/client.js';
+import { normalizeApiBase, normalizeWsBase, reconnectDelay, wsBaseFromApi } from './api/client.js';
 import {
   SLASH_COMMANDS,
   commandQuery,
@@ -236,6 +236,13 @@ if (lastAssistantTurn([
 
 if (normalizeApiBase('http://127.0.0.1:8000/') !== 'http://127.0.0.1:8000') throw new Error('REST 地址规范化失败');
 if (normalizeWsBase('ws://127.0.0.1:8000/') !== 'ws://127.0.0.1:8000') throw new Error('WS 地址规范化失败');
+if (wsBaseFromApi('http://127.0.0.1:9123') !== 'ws://127.0.0.1:9123') throw new Error('未从 preload REST 地址派生 WS 地址');
+try {
+  normalizeApiBase('https://evil.example/api');
+  throw new Error('远程地址未被拒绝');
+} catch (error) {
+  if (error instanceof Error && error.message === '远程地址未被拒绝') throw error;
+}
 try {
   normalizeWsBase('http://127.0.0.1:8000');
   throw new Error('错误协议未被拒绝');

@@ -2,6 +2,7 @@ import type {
   ApprovalResponse,
   BackendConfig,
   ChatRequest,
+  ChatResponse,
   HealthResponse,
   LLMModelsRequest,
   LLMModelsResponse,
@@ -10,12 +11,16 @@ import type {
   OperationLog,
   Preference,
   SandboxSettings,
+  RollbackSummary,
   ScheduledJob,
   WSEvent,
+  ThreadState,
 } from '../types';
 
 export const DEFAULT_API_BASE = 'http://127.0.0.1:8000';
 export const DEFAULT_WS_BASE = 'ws://127.0.0.1:8000';
+
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
 
 export class ApiError extends Error {
   readonly status: number;
@@ -34,13 +39,30 @@ function trimTrailingSlash(value: string): string {
 export function normalizeApiBase(value: string): string {
   const url = new URL(value.trim());
   if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error('REST 地址必须使用 http:// 或 https://');
+  if (!LOOPBACK_HOSTS.has(url.hostname.toLowerCase())) throw new Error('本地后端地址仅允许 localhost、127.0.0.1 或 ::1');
   return trimTrailingSlash(url.toString());
 }
 
 export function normalizeWsBase(value: string): string {
   const url = new URL(value.trim());
   if (url.protocol !== 'ws:' && url.protocol !== 'wss:') throw new Error('WebSocket 地址必须使用 ws:// 或 wss://');
+  if (!LOOPBACK_HOSTS.has(url.hostname.toLowerCase())) throw new Error('本地 WebSocket 地址仅允许 loopback 主机');
   return trimTrailingSlash(url.toString());
+}
+
+export function wsBaseFromApi(apiBase: string): string {
+  const url = new URL(normalizeApiBase(apiBase));
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+  return trimTrailingSlash(url.toString());
+}
+
+export function defaultApiBase(): string {
+  const injected = typeof window !== 'undefined' ? window.desktop?.backendUrl : '';
+  try {
+    return normalizeApiBase(injected || DEFAULT_API_BASE);
+  } catch {
+    return DEFAULT_API_BASE;
+  }
 }
 
 /** 读取 preload 注入的会话令牌；浏览器直连（无 preload）时为空串。 */
@@ -98,8 +120,12 @@ export class ApiClient {
     return this.request('/api/config');
   }
 
-  sendChat(request: ChatRequest): Promise<unknown> {
+  sendChat(request: ChatRequest): Promise<ChatResponse> {
     return this.request('/api/chat', { method: 'POST', body: JSON.stringify(request) });
+  }
+
+  getThread(threadId: string): Promise<ThreadState> {
+    return this.request(`/api/threads/${encodeURIComponent(threadId)}`);
   }
 
   respondToApproval(response: ApprovalResponse): Promise<unknown> {
@@ -132,7 +158,7 @@ export class ApiClient {
     return this.request(`/api/operations/${encodeURIComponent(String(opId))}/rollback`, { method: 'POST' });
   }
 
-  rollbackThread(threadId: string): Promise<unknown> {
+  rollbackThread(threadId: string): Promise<RollbackSummary> {
     return this.request(`/api/threads/${encodeURIComponent(threadId)}/rollback`, { method: 'POST' });
   }
 
@@ -167,6 +193,43 @@ export class ApiClient {
   updateSandboxSettings(roots: string[]): Promise<SandboxSettings> {
     return this.request('/api/settings/sandbox', { method: 'PUT', body: JSON.stringify({ roots }) });
   }
+}
+
+export async function sendChatRest(
+  api: ApiClient,
+  request: ChatRequest,
+  onThread: (threadId: string) => void,
+): Promise<ChatResponse> {
+  const response = await api.sendChat(request);
+  onThread(response.thread_id);
+  return response;
+}
+
+export function reconciliationEvents(threadId: string, state: ThreadState): WSEvent[] {
+  const events: WSEvent[] = (state.observations ?? []).map((observation) => ({
+    type: 'tool_result', thread_id: threadId, payload: {
+      tool: observation.tool,
+      detail: typeof observation.error === 'string' && observation.error
+        ? observation.error
+        : typeof observation.description === 'string' ? observation.description : '已从后端恢复执行结果',
+      success: observation.status === 'ok',
+    },
+  }));
+  if (state.pending_approval) events.push({ type: 'approval_required', thread_id: threadId, payload: state.pending_approval });
+  if (['completed', 'failed', 'cancelled'].includes(state.status)) {
+    events.push({ type: 'done', thread_id: threadId, payload: {
+      status: state.status, message: state.final_response ?? '', error: state.error ?? '',
+      observations: state.observations ?? [], summary: state.summary,
+    } });
+  }
+  return events;
+}
+
+export function rollbackFeedback(result: RollbackSummary): { message: string; kind: 'success' | 'info' | 'error' } {
+  return {
+    message: `撤销完成：成功 ${result.ok}，跳过 ${result.skipped}，失败 ${result.failed}`,
+    kind: result.failed > 0 ? 'error' : result.skipped > 0 ? 'info' : 'success',
+  };
 }
 
 export type SocketMessage =
