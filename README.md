@@ -132,15 +132,23 @@ Planner 随后生成规则，而不是枚举数百条文件路径：
 ├── .github/workflows/ci.yml
 ├── backend/
 │   ├── app/
-│   │   ├── agent/              # LangGraph、状态、Prompt、LLM 适配
+│   │   ├── agent/
+│   │   │   ├── graph.py        # LangGraph 节点与流程编排
+│   │   │   ├── checkpoints.py  # checkpoint 创建、解析和保留策略
+│   │   │   └── tool_executor.py # 工具分发、批处理、分类与摘要
+│   │   ├── api/
+│   │   │   ├── auth.py         # 本地令牌与 Origin 校验
+│   │   │   ├── connections.py  # WebSocket 连接注册表
+│   │   │   └── management.py   # 设置、审计、回滚和定时任务路由
 │   │   ├── policy/             # 后端授权和累计审批策略
+│   │   ├── runtime/            # 活动 thread、锁和取消状态
 │   │   ├── tools/
 │   │   │   ├── filesystem.py   # 文件操作和回滚
 │   │   │   ├── manifests.py    # 完整扫描清单与确定性匹配
 │   │   │   ├── path_locks.py   # 目录级 mutation locks
 │   │   │   ├── extract.py      # PDF、DOCX、文本、OCR 提取
 │   │   │   └── scheduler.py
-│   │   ├── main.py             # FastAPI、REST、WebSocket、Runtime Manager
+│   │   ├── main.py             # FastAPI 装配与 Agent 流协调
 │   │   ├── db.py               # SQLite 数据访问
 │   │   ├── sandbox_config.py
 │   │   └── security.py
@@ -156,6 +164,7 @@ Planner 随后生成规则，而不是枚举数百条文件路径：
     ├── src/
     │   ├── App.tsx
     │   ├── api/client.ts       # REST、WebSocket、reconciliation
+    │   ├── hooks/              # 后端连接与设置状态控制器
     │   └── components/
     ├── package.json
     └── package-lock.json

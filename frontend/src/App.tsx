@@ -1,28 +1,20 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AgentSocket, ApiClient, defaultApiBase, normalizeApiBase, normalizeWsBase, reconciliationEvents, rollbackFeedback, sendChatRest, wsBaseFromApi } from './api/client';
+import { AgentSocket, reconciliationEvents, rollbackFeedback, sendChatRest } from './api/client';
 import { helpText, isCommandName, type SlashCommandName } from './commands';
 import { ActivityCenter } from './components/ActivityCenter';
 import { ApprovalModal } from './components/ApprovalModal';
 import { ChatPanel } from './components/ChatPanel';
 import { NewConversationModal } from './components/NewConversationModal';
-import { Settings, type SettingsTab } from './components/Settings';
+import { Settings } from './components/Settings';
 import { ToastStack, type ToastItem, type ToastKind } from './components/ToastStack';
+import { useBackendConfig } from './hooks/useBackendConfig';
+import { useSettingsController } from './hooks/useSettingsController';
 import type {
   ActivityItem,
   ApprovalDecision,
-  BackendConfig,
   ChatMessage,
   ConnectionState,
-  LLMModelsRequest,
-  LLMModelsResponse,
-  LLMSettings,
-  LLMSettingsUpdate,
-  OperationLog,
   PendingApproval,
-  Preference,
-  SandboxSettings,
-  ScheduledJob,
-  SetupHints,
   TaskItem,
   TaskSummary,
   ThreadState,
@@ -52,33 +44,7 @@ function createId(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function initialApiBase(): string {
-  const fallback = defaultApiBase();
-  const stored = localStorage.getItem('file-butler-api-base');
-  if (!stored) return fallback;
-  try { return normalizeApiBase(stored); } catch { return fallback; }
-}
-
-function initialWsBase(apiBase: string): string {
-  const stored = localStorage.getItem('file-butler-ws-base');
-  if (stored) {
-    try { return normalizeWsBase(stored); } catch { /* derive below */ }
-  }
-  return wsBaseFromApi(apiBase);
-}
-
-function ensureClientId(): string {
-  const current = localStorage.getItem('file-butler-client-id');
-  if (current) return current;
-  const value = typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : createId('client');
-  localStorage.setItem('file-butler-client-id', value);
-  return value;
-}
-
 export function App() {
-  const clientId = useMemo(ensureClientId, []);
-  const [apiBase, setApiBase] = useState(initialApiBase);
-  const [wsBase, setWsBase] = useState(() => initialWsBase(initialApiBase()));
   const [connectionState, setConnectionState] = useState<ConnectionState>('connecting');
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [tasks, setTasks] = useState<TaskItem[]>([]);
@@ -94,23 +60,12 @@ export function App() {
   const [newChatModalOpen, setNewChatModalOpen] = useState(false);
   const [toasts, setToasts] = useState<ToastItem[]>([]);
   const toastIdRef = useRef(0);
-  const [setupHints, setSetupHints] = useState<SetupHints>({ checked: false, backendOk: false, modelOk: null, sandboxOk: null, ocrOk: null });
   const [busy, setBusy] = useState(false);
   const [approvalSubmitting, setApprovalSubmitting] = useState(false);
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [settingsTab, setSettingsTab] = useState<SettingsTab>('general');
-  const [preferences, setPreferences] = useState<Preference[]>([]);
-  const [llmSettings, setLLMSettings] = useState<LLMSettings | null>(null);
-  const [sandboxSettings, setSandboxSettings] = useState<SandboxSettings | null>(null);
-  const [jobs, setJobs] = useState<ScheduledJob[]>([]);
-  const [logs, setLogs] = useState<OperationLog[]>([]);
-  const [settingsLoading, setSettingsLoading] = useState(false);
-  const [settingsError, setSettingsError] = useState<string | null>(null);
   const socketRef = useRef<AgentSocket | null>(null);
   const threadViewsRef = useRef<Record<string, ThreadViewState>>({});
   // B2 心跳：最后一次收到后端事件的时刻，供 busy 看门狗判定是否已失联。
   const lastActivityRef = useRef<number>(Date.now());
-  const api = useMemo(() => new ApiClient(apiBase), [apiBase]);
 
   useEffect(() => { threadViewsRef.current = threadViews; }, [threadViews]);
 
@@ -133,6 +88,16 @@ export function App() {
     setToasts((current) => [...current, { id, content, kind }]);
     window.setTimeout(() => setToasts((current) => current.filter((toast) => toast.id !== id)), 3500);
   }, []);
+
+  const {
+    api,
+    apiBase,
+    wsBase,
+    clientId,
+    setupHints,
+    refreshSetupCheck,
+    saveEndpoints,
+  } = useBackendConfig(notify);
 
   const updateAssistant = useCallback((eventThreadId: string, content: string, append: boolean, error = false) => {
     setMessages((current) => {
@@ -330,38 +295,27 @@ export function App() {
     return () => clearInterval(timer);
   }, [busy]);
 
-  // 首次使用检查：启动后调用健康检查与配置接口，判断后端连接、模型、沙箱目录、OCR。
-  // 纯浏览器开发环境拿不到 /api/config 令牌时对应项为 null（不误报“未配置”）。
-  const refreshSetupCheck = useCallback(async () => {
-    let backendOk = false;
-    try {
-      const health = await api.getHealth();
-      backendOk = health?.status === 'ok';
-    } catch {
-      backendOk = false;
-    }
-    let config: BackendConfig | null = null;
-    try {
-      config = await api.getConfig();
-    } catch {
-      config = null;
-    }
-    setSetupHints({
-      checked: true,
-      backendOk,
-      modelOk: config === null
-        ? null
-        : config.model_provider === 'ollama'
-          ? Boolean(config.ollama_model)
-          : Boolean(config.openai_model) && config.openai_api_key_set !== false,
-      sandboxOk: config === null ? null : Array.isArray(config.sandbox_roots) && config.sandbox_roots.length > 0,
-      ocrOk: config === null ? null : Boolean(config.ocr_enabled),
-    });
-  }, [api]);
-
-  useEffect(() => {
-    void refreshSetupCheck();
-  }, [refreshSetupCheck]);
+  const {
+    open: settingsOpen,
+    tab: settingsTab,
+    preferences,
+    llmSettings,
+    sandboxSettings,
+    jobs,
+    logs,
+    loading: settingsLoading,
+    error: settingsError,
+    close: closeSettings,
+    show: openSettings,
+    load: loadSettingsData,
+    saveLLM,
+    fetchModels,
+    saveSandbox,
+    savePreference,
+    createJob,
+    deleteJob,
+    rollbackOperation,
+  } = useSettingsController(api, refreshSetupCheck);
 
   const sendChat = useCallback((message: string) => {
     if (threadId) {
@@ -495,30 +449,6 @@ export function App() {
     }
   }, [api, approvalQueue, notify, updateTask]);
 
-  const loadSettingsData = useCallback(async () => {
-    setSettingsLoading(true);
-    setSettingsError(null);
-    const results = await Promise.allSettled([api.getPreferences(), api.getJobs(), api.getOperations(), api.getLLMSettings(), api.getSandboxSettings()]);
-    const [preferenceResult, jobResult, logResult, llmResult, sandboxResult] = results;
-    if (preferenceResult.status === 'fulfilled') setPreferences(preferenceResult.value);
-    if (jobResult.status === 'fulfilled') setJobs(jobResult.value);
-    if (logResult.status === 'fulfilled') setLogs(logResult.value);
-    if (llmResult.status === 'fulfilled') setLLMSettings(llmResult.value);
-    if (sandboxResult.status === 'fulfilled') setSandboxSettings(sandboxResult.value);
-    const rejected = results.find((result) => result.status === 'rejected');
-    if (rejected?.status === 'rejected') setSettingsError(rejected.reason instanceof Error ? rejected.reason.message : '部分数据加载失败');
-    setSettingsLoading(false);
-  }, [api]);
-
-  useEffect(() => {
-    if (settingsOpen) void loadSettingsData();
-  }, [loadSettingsData, settingsOpen]);
-
-  const openSettings = useCallback((tab: SettingsTab): void => {
-    setSettingsTab(tab);
-    setSettingsOpen(true);
-  }, []);
-
   /**
    * 撤销指定会话（默认当前会话）已完成的文件操作（复用 /api/threads/{id}/rollback）。
    * 由聊天输入、任务结果卡与活动中心共用。
@@ -620,90 +550,6 @@ export function App() {
     handlers[name]();
   }, [endWorkflows, openSettings, requestNewConversation, rollbackThread, showHelp]);
 
-  const saveEndpoints = (newApiBase: string, newWsBase: string): void => {
-    if (!newApiBase || !newWsBase) return;
-    try {
-      const apiEndpoint = normalizeApiBase(newApiBase);
-      const wsEndpoint = normalizeWsBase(newWsBase);
-      localStorage.setItem('file-butler-api-base', apiEndpoint);
-      localStorage.setItem('file-butler-ws-base', wsEndpoint);
-      setApiBase(apiEndpoint);
-      setWsBase(wsEndpoint);
-      notify('连接地址已保存，正在重连…');
-    } catch (error) {
-      notify(error instanceof Error ? error.message : '连接地址格式错误', 'error');
-    }
-  };
-
-  const saveLLM = async (update: LLMSettingsUpdate): Promise<void> => {
-    setSettingsError(null);
-    try {
-      const saved = await api.updateLLMSettings(update);
-      setLLMSettings(saved);
-      void refreshSetupCheck();
-    } catch (error) {
-      setSettingsError(error instanceof Error ? error.message : '保存模型配置失败');
-      throw error;
-    }
-  };
-
-  const fetchModels = (request: LLMModelsRequest): Promise<LLMModelsResponse> => api.listLLMModels(request);
-
-  const saveSandbox = async (roots: string[]): Promise<void> => {
-    setSettingsError(null);
-    try {
-      const saved = await api.updateSandboxSettings(roots);
-      setSandboxSettings(saved);
-      void refreshSetupCheck();
-    } catch (error) {
-      setSettingsError(error instanceof Error ? error.message : '保存沙箱目录失败');
-      throw error;
-    }
-  };
-
-  const savePreference = async (preference: Preference): Promise<void> => {
-    setSettingsError(null);
-    try {
-      const saved = await api.updatePreference(preference);
-      setPreferences((current) => [...current.filter((item) => item.key !== saved.key), saved]);
-    } catch (error) {
-      setSettingsError(error instanceof Error ? error.message : '保存偏好失败');
-      throw error;
-    }
-  };
-
-  const createJob = async (job: Omit<ScheduledJob, 'job_id'>): Promise<void> => {
-    setSettingsError(null);
-    try {
-      const saved = await api.createJob(job);
-      setJobs((current) => [...current, saved]);
-    } catch (error) {
-      setSettingsError(error instanceof Error ? error.message : '创建定时任务失败');
-      throw error;
-    }
-  };
-
-  const deleteJob = async (jobId: string): Promise<void> => {
-    setSettingsError(null);
-    try {
-      await api.deleteJob(jobId);
-      setJobs((current) => current.filter((item) => item.job_id !== jobId));
-    } catch (error) {
-      setSettingsError(error instanceof Error ? error.message : '删除定时任务失败');
-    }
-  };
-
-  const rollbackOperation = async (opId: number): Promise<void> => {
-    setSettingsError(null);
-    try {
-      await api.rollbackOperation(opId);
-      await loadSettingsData();
-    } catch (error) {
-      setSettingsError(error instanceof Error ? error.message : '撤销失败');
-      throw error;
-    }
-  };
-
   // 当前会话最近一次任务的结构化摘要：从最后一条带摘要的助手消息取。
   const currentSummary = useMemo<TaskSummary | undefined>(() => {
     for (let index = messages.length - 1; index >= 0; index -= 1) {
@@ -790,7 +636,7 @@ export function App() {
         logs={logs}
         loading={settingsLoading}
         error={settingsError}
-        onClose={() => setSettingsOpen(false)}
+        onClose={closeSettings}
         onSaveEndpoints={saveEndpoints}
         onSaveLLM={saveLLM}
         onSaveSandbox={saveSandbox}
