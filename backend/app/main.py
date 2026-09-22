@@ -10,6 +10,7 @@ from typing import Any, AsyncIterator, Dict, Iterable, Optional, Set, Tuple
 
 import os
 import secrets
+import sys
 import weakref
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -43,7 +44,7 @@ from .models import (
     WSEventType,
 )
 from .security import SandboxViolation, resolve_in_sandbox
-from .tools import filesystem, scheduler
+from .tools import extract, filesystem, scheduler
 
 settings = get_settings()
 setup_logging(settings.log_dir)
@@ -134,10 +135,15 @@ def get_runtime() -> AgentRuntime:
 
 
 def reset_runtime() -> None:
-    """丢弃已构造的运行时，使下一次会话按最新模型配置重建 LLM。"""
+    """退休旧运行时；新请求用新实例，旧实例待活动流结束后关闭。"""
     global _runtime
     with _runtime_lock:
+        previous = _runtime
         _runtime = None
+    if previous is not None:
+        retire = getattr(previous, "retire", None)
+        if callable(retire):
+            retire()
 
 
 class ConnectionManager:
@@ -239,9 +245,10 @@ def _scheduled_runner(directory: str, instruction: str) -> None:
         logger.error("定时任务无法启动：主事件循环不可用 thread=%s", thread_id)
         return
     try:
-        iterator = get_runtime().start_stream(message, thread_id)
+        runtime = get_runtime()
+        iterator = runtime.start_stream(message, thread_id)
         future = asyncio.run_coroutine_threadsafe(
-            _run_stream(iterator, thread_id, None, broadcast=True), loop
+            _run_stream(iterator, thread_id, None, runtime=runtime, broadcast=True), loop
         )
         state = future.result()
         if state.get("status") == "waiting_approval":
@@ -270,6 +277,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         _thread_locks.clear()
         _active_threads.clear()
         _cancel_requested.clear()
+        reset_runtime()
         logger.info("桌面智能文件管家后端已停止")
 
 
@@ -370,16 +378,18 @@ async def _emit_token(client_id: Optional[str], thread_id: str, data: Any) -> No
     await ws_events.emit_token(connections.send, client_id, thread_id, data)
 
 
-async def _dispatch(client_id: Optional[str], thread_id: str, item: Any) -> None:
+async def _dispatch(client_id: Optional[str], thread_id: str, item: Any, runtime: Optional[AgentRuntime] = None) -> None:
     """区分多路 stream 输出：("messages"|"updates", data) 元组，或单模式 updates 字典。"""
-    await ws_events.dispatch(connections.send, get_runtime().state, client_id, thread_id, item)
+    selected = runtime or get_runtime()
+    await ws_events.dispatch(connections.send, selected.state, client_id, thread_id, item)
 
 
-async def _dispatch_broadcast(thread_id: str, item: Any) -> None:
+async def _dispatch_broadcast(thread_id: str, item: Any, runtime: Optional[AgentRuntime] = None) -> None:
     async def send_all(_: str, outgoing: WSEvent) -> None:
         await connections.broadcast(outgoing)
 
-    await ws_events.dispatch(send_all, get_runtime().state, "broadcast", thread_id, item)
+    selected = runtime or get_runtime()
+    await ws_events.dispatch(send_all, selected.state, "broadcast", thread_id, item)
 
 
 async def _run_stream(
@@ -387,10 +397,16 @@ async def _run_stream(
     thread_id: str,
     client_id: Optional[str],
     *,
+    runtime: Optional[AgentRuntime] = None,
     broadcast: bool = False,
     defer_cancel_once: bool = False,
 ) -> Dict[str, Any]:
     """逐项消费同步 LangGraph 流，同时向 Electron 推送进度。"""
+    selected = runtime or get_runtime()
+    retain = getattr(selected, "retain_stream", None)
+    release = getattr(selected, "release_stream", None)
+    if callable(retain):
+        retain()
     try:
         while True:
             if thread_id in _cancel_requested:
@@ -401,8 +417,7 @@ async def _run_stream(
                 else:
                     _cancel_requested.discard(thread_id)
                     logger.info("会话 %s 被用户中止", thread_id)
-                    runtime = get_runtime()
-                    cancel_state = getattr(runtime, "cancel", None)
+                    cancel_state = getattr(selected, "cancel", None)
                     if callable(cancel_state):
                         try:
                             cancel_state(thread_id)
@@ -412,23 +427,23 @@ async def _run_stream(
                         WSEventType.done, thread_id,
                         status="cancelled",
                         message="任务已停止。当前步骤前的操作已保留，可在操作日志中查看或撤销。",
-                        summary=ws_events.build_task_summary(runtime.state(thread_id).get("observations", [])),
+                        summary=ws_events.build_task_summary(selected.state(thread_id).get("observations", [])),
                     )
                     if broadcast:
                         await connections.broadcast(terminal)
                     elif client_id:
                         await connections.send(client_id, terminal)
-                    return runtime.state(thread_id)
+                    return selected.state(thread_id)
             has_item, item = await asyncio.to_thread(_next_update, iterator)
             if not has_item:
                 break
             if item:
                 if broadcast:
-                    await _dispatch_broadcast(thread_id, item)
+                    await _dispatch_broadcast(thread_id, item, selected)
                 else:
-                    await _dispatch(client_id, thread_id, item)
+                    await _dispatch(client_id, thread_id, item, selected)
 
-        state = get_runtime().state(thread_id)
+        state = selected.state(thread_id)
         if state.get("status") == "waiting_approval":
             pending = state.get("pending_approval") or {}
             if pending:
@@ -463,6 +478,9 @@ async def _run_stream(
             client_id, thread_id, f"任务执行失败：{exc}", detail=str(exc), broadcast=broadcast
         )
         return {"thread_id": thread_id, "status": "failed", "error": str(exc)}
+    finally:
+        if callable(release):
+            release()
 
 
 def _log_task_failure(task: asyncio.Task[Any]) -> None:
@@ -491,24 +509,26 @@ async def _start_chat(
     client_id = request.client_id or fallback_client
     if not registered:
         _register_thread(thread_id)
+    runtime: Optional[AgentRuntime] = None
     try:
         async with _thread_lock(thread_id):
             # 启动也在终态兜底内：模型未配置时 AgentRuntime 构造就可能失败。
             try:
-                iterator = get_runtime().start_stream(request.message.strip(), thread_id)
+                runtime = get_runtime()
+                iterator = runtime.start_stream(request.message.strip(), thread_id)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("启动会话失败 thread=%s", thread_id)
                 await _fail_terminal(client_id, thread_id, f"无法启动会话：{exc}", detail=str(exc))
                 return thread_id
 
-            await _run_stream(iterator, thread_id, client_id)
+            await _run_stream(iterator, thread_id, client_id, runtime=runtime)
             return thread_id
     finally:
         _unregister_thread(thread_id)
         # 正常/失败终态不应遗留取消标记；等待审批时则必须保留，让随后取得锁的
         # _resolve_cancelled_approval 能以 reject 清掉 interrupt 后写入 cancelled。
         try:
-            state = get_runtime().state(thread_id)
+            state = runtime.state(thread_id) if runtime is not None else {}
         except Exception:  # noqa: BLE001
             state = {}
         if not state.get("pending_approval"):
@@ -524,7 +544,8 @@ async def _resume_approval(
     broadcast = response.thread_id.startswith("scheduled-")
     async with _thread_lock(response.thread_id):
         try:
-            state = get_runtime().state(response.thread_id)
+            runtime = get_runtime()
+            state = runtime.state(response.thread_id)
             pending = state.get("pending_approval") or {}
             if not pending:
                 raise HTTPException(status_code=409, detail="该会话没有待审批操作")
@@ -533,7 +554,7 @@ async def _resume_approval(
 
             cancelling = cancelling or response.thread_id in _cancel_requested
             decision = "reject" if cancelling else response.decision.value
-            iterator = get_runtime().resume_stream(response.thread_id, decision)
+            iterator = runtime.resume_stream(response.thread_id, decision)
         except HTTPException as exc:
             if fallback_client is None:
                 raise
@@ -559,6 +580,7 @@ async def _resume_approval(
             iterator,
             response.thread_id,
             fallback_client,
+            runtime=runtime,
             broadcast=broadcast,
             defer_cancel_once=cancelling,
         )
@@ -605,6 +627,7 @@ def health() -> Dict[str, Any]:
 def public_config() -> Dict[str, Any]:
     """仅返回非敏感配置；API key 永不暴露给渲染进程。"""
     config = llm_config.get_effective_config()
+    ocr = extract.ocr_capability()
     return {
         "model_provider": config.provider,
         "openai_model": config.openai_model,
@@ -612,7 +635,8 @@ def public_config() -> Dict[str, Any]:
         "ollama_model": config.ollama_model,
         "ollama_base_url": config.ollama_base_url,
         "sandbox_roots": [str(path) for path in sandbox_config.effective_roots()],
-        "ocr_enabled": bool(settings.tesseract_cmd),
+        "ocr": ocr,
+        "ocr_enabled": bool(ocr.get("available")),
     }
 
 
@@ -739,7 +763,7 @@ def thread_state(thread_id: str) -> Dict[str, Any]:
     state = get_runtime().state(thread_id)
     if not state:
         raise HTTPException(status_code=404, detail="会话不存在")
-    return state
+    return {**state, "summary": ws_events.build_task_summary(state.get("observations", []))}
 
 
 @app.post("/api/threads/{thread_id}/cancel", status_code=status.HTTP_202_ACCEPTED)
@@ -949,6 +973,9 @@ def _frontend_dist() -> Optional[Path]:
     override = os.environ.get("FRONTEND_DIST")
     if override:
         candidate = Path(override).expanduser()
+        return candidate if candidate.is_dir() else None
+    if getattr(sys, "frozen", False):
+        candidate = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)) / "frontend" / "dist"
         return candidate if candidate.is_dir() else None
     # backend/app/main.py -> parents[2] 为仓库根目录
     candidate = Path(__file__).resolve().parents[2] / "frontend" / "dist"
