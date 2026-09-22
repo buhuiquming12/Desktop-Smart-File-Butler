@@ -6,6 +6,12 @@
 
 > 示例：“整理下载目录，把 PDF 移到 PDF 文件夹，并按文件名加上 `archive-` 前缀。”
 
+## 求职与设计文档
+
+- [系统架构与设计说明](docs/ARCHITECTURE.md)：系统组件、Agent 流程、安全边界、状态恢复、并发与桌面发布架构。
+- [简历项目描述](docs/RESUME.md)：推荐简历版本、后端岗位版、AI Agent 岗位版与 30 秒 / 1 分钟口述稿。
+- [面试问答](docs/INTERVIEW_GUIDE.md)：围绕架构、Manifest、PolicyEngine、Prompt Injection、并发、恢复、Runtime、Electron 和 CI 的项目追问。
+
 ## 核心能力
 
 - 自然语言驱动的扫描、分类、移动、重命名、摘要和软删除。
