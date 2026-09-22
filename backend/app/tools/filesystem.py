@@ -22,6 +22,7 @@ def preflight_restore(op: OperationLog) -> dict:
 import os
 import shutil
 import stat as stat_module
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
@@ -31,6 +32,7 @@ from ..db import log_operation
 from ..logging_conf import get_logger
 from ..models import FileMeta, OperationLog
 from ..security import SandboxViolation, resolve_in_sandbox, sandbox_root_for
+from .path_locks import path_locks
 
 logger = get_logger(__name__)
 
@@ -44,6 +46,24 @@ _REVERSIBLE_ACTIONS = {"move", "rename", "delete"}
 # 再兜一层更早生效的上限，保证内存与耗时可控。
 _MAX_SCAN_ITEMS = 5000
 _MAX_SCAN_DEPTH = 12
+
+
+@dataclass
+class ScanResult:
+    items: List[FileMeta]
+    scanned_count: int
+    truncated: bool = False
+    reason: str = "none"
+
+    # Backward-compatible sequence behavior for existing callers.
+    def __iter__(self):
+        return iter(self.items)
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, index):
+        return self.items[index]
 
 
 def _is_link_like(entry: "os.DirEntry[str]") -> bool:
@@ -87,7 +107,7 @@ def _entry_meta(entry: "os.DirEntry[str]", is_dir: bool) -> Optional[FileMeta]:
     )
 
 
-def scan_directory(directory: str, recursive: bool = False) -> List[FileMeta]:
+def scan_directory(directory: str, recursive: bool = False) -> ScanResult:
     """扫描目录，返回文件元数据列表。
 
     ``recursive=True`` 时有硬上限（B9）：最多收集 ``_MAX_SCAN_ITEMS`` 项、最深
@@ -103,6 +123,7 @@ def scan_directory(directory: str, recursive: bool = False) -> List[FileMeta]:
     max_depth = _MAX_SCAN_DEPTH if recursive else 1
     items: List[FileMeta] = []
     bounded_by: Optional[str] = None
+    permission_error = False
     depth_limited = False
     # 显式栈遍历：root 的直接子项算第 1 层。
     stack: List[tuple[str, int]] = [(str(root), 1)]
@@ -124,7 +145,10 @@ def scan_directory(directory: str, recursive: bool = False) -> List[FileMeta]:
                     meta = _entry_meta(entry, is_dir)
                     if meta is not None:
                         items.append(meta)
-                    if len(items) >= _MAX_SCAN_ITEMS:
+                    # 先观察到第 max+1 项才能证明清单确实被截断；恰好 max 项
+                    # 且遍历已结束时必须报告 truncated=false。
+                    if len(items) > _MAX_SCAN_ITEMS:
+                        items.pop()
                         bounded_by = f"条目数达到上限 {_MAX_SCAN_ITEMS}"
                         break
                     if not is_dir:
@@ -140,11 +164,13 @@ def scan_directory(directory: str, recursive: bool = False) -> List[FileMeta]:
                         depth_limited = True
         except OSError as exc:
             logger.warning("跳过无法读取的目录: %s (%s)", current, exc)
+            permission_error = True
     if bounded_by:
         logger.warning("目录扫描提前结束（%s）: %s", bounded_by, root)
     elif depth_limited:
         logger.warning("目录扫描已按深度上限 %d 截断深层分支: %s", _MAX_SCAN_DEPTH, root)
-    return items
+    reason = "max_items" if bounded_by else "max_depth" if depth_limited else "permission_error" if permission_error else "none"
+    return ScanResult(items, len(items), reason != "none", reason)
 
 
 def make_dir(path: str) -> str:
@@ -189,20 +215,20 @@ def move_file(src: str, dest_dir: str, new_name: str | None = None) -> str:
     if src_path.is_dir():
         raise IsADirectoryError(f"move_file 仅支持文件: {src_path}")
     dest_root = resolve_in_sandbox(dest_dir)
-    dest_root.mkdir(parents=True, exist_ok=True)
-    if not dest_root.is_dir():
-        raise NotADirectoryError(f"目标不是目录: {dest_root}")
-
-    name = _safe_child_name(new_name) if new_name else src_path.name
-    dest = resolve_in_sandbox(str(dest_root / name))
-    dest = _unique_dest(dest)
-    try:
-        shutil.move(str(src_path), str(dest))
-        log_operation("move", str(src_path), "ok", dest=str(dest))
-        return str(dest)
-    except OSError as exc:
-        log_operation("move", str(src_path), "failed", dest=str(dest), detail=str(exc))
-        raise
+    with path_locks.acquire(src_path.parent, dest_root):
+        dest_root.mkdir(parents=True, exist_ok=True)
+        if not dest_root.is_dir():
+            raise NotADirectoryError(f"目标不是目录: {dest_root}")
+        name = _safe_child_name(new_name) if new_name else src_path.name
+        dest = resolve_in_sandbox(str(dest_root / name))
+        dest = _unique_dest(dest)
+        try:
+            shutil.move(str(src_path), str(dest))
+            log_operation("move", str(src_path), "ok", dest=str(dest))
+            return str(dest)
+        except OSError as exc:
+            log_operation("move", str(src_path), "failed", dest=str(dest), detail=str(exc))
+            raise
 
 
 def rename_file(src: str, new_name: str) -> str:
@@ -211,15 +237,16 @@ def rename_file(src: str, new_name: str) -> str:
     if src_path.is_dir():
         raise IsADirectoryError(f"rename_file 仅支持文件: {src_path}")
     name = _safe_child_name(new_name)
-    dest = resolve_in_sandbox(str(src_path.with_name(name)))
-    dest = _unique_dest(dest)
-    try:
-        src_path.rename(dest)
-        log_operation("rename", str(src_path), "ok", dest=str(dest))
-        return str(dest)
-    except OSError as exc:
-        log_operation("rename", str(src_path), "failed", dest=str(dest), detail=str(exc))
-        raise
+    with path_locks.acquire(src_path.parent):
+        dest = resolve_in_sandbox(str(src_path.with_name(name)))
+        dest = _unique_dest(dest)
+        try:
+            src_path.rename(dest)
+            log_operation("rename", str(src_path), "ok", dest=str(dest))
+            return str(dest)
+        except OSError as exc:
+            log_operation("rename", str(src_path), "failed", dest=str(dest), detail=str(exc))
+            raise
 
 
 def delete_file(path: str) -> str:
@@ -232,9 +259,11 @@ def delete_file(path: str) -> str:
     root = sandbox_root_for(target)
     trash = root / TRASH_DIRNAME
     try:
-        trash.mkdir(parents=True, exist_ok=True)
-        dest = _unique_dest(trash / target.name)
-        shutil.move(str(target), str(dest))
+        lock_dirs = (target.parent, trash)
+        with path_locks.acquire(*lock_dirs):
+            trash.mkdir(parents=True, exist_ok=True)
+            dest = _unique_dest(trash / target.name)
+            shutil.move(str(target), str(dest))
         log_operation("delete", str(target), "ok", dest=str(dest))
         return str(dest)
     except OSError as exc:
@@ -264,10 +293,11 @@ def restore_operation(op: OperationLog) -> dict:
         return {"status": "skipped", "detail": f"源 {current} 已不存在，可能已被移动或再次删除"}
 
     try:
-        original.parent.mkdir(parents=True, exist_ok=True)
-        final = _unique_dest(original)
-        renamed = final != original
-        shutil.move(str(current), str(final))
+        with path_locks.acquire(current.parent, original.parent):
+            original.parent.mkdir(parents=True, exist_ok=True)
+            final = _unique_dest(original)
+            renamed = final != original
+            shutil.move(str(current), str(final))
         db.log_operation(
             "rollback", str(current), "ok", dest=str(final),
             detail=f"撤销 {op.action} #{op.id}" + ("（原位置被占用，已改名）" if renamed else ""),

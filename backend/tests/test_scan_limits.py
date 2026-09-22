@@ -74,6 +74,20 @@ def test_scan_stops_at_item_cap(sandbox: Path, monkeypatch: pytest.MonkeyPatch) 
 
     items = filesystem.scan_directory(str(sandbox), recursive=True)
     assert len(items) == 10, f"未按上限截断，收集了 {len(items)} 项"
+    assert items.truncated is True
+    assert items.reason == "max_items"
+
+
+def test_exact_item_cap_is_not_reported_as_truncated(sandbox: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(filesystem, "_MAX_SCAN_ITEMS", 10)
+    target = sandbox / "exact"
+    target.mkdir()
+    for index in range(10):
+        (target / f"f{index:03d}.txt").write_text("x", encoding="utf-8")
+    result = filesystem.scan_directory(str(target), recursive=True)
+    assert len(result) == 10
+    assert result.truncated is False
+    assert result.reason == "none"
 
 
 def test_scan_stops_at_depth_cap(sandbox: Path, monkeypatch: pytest.MonkeyPatch) -> None:

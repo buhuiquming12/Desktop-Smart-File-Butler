@@ -81,6 +81,30 @@ def extract_txt(path: Path, max_chars: int | None = _MAX_CHARS) -> str:
 _OCR_TIMEOUT_SEC = 30  # 单张图片 OCR 超时，避免坏图/超大图无限阻塞批量任务（P2）
 
 
+def ocr_capability(required_languages: tuple[str, ...] = ("eng", "chi_sim")) -> dict[str, object]:
+    """探测真实二进制与语言包，而不是用配置字符串推断能力。"""
+    try:
+        import pytesseract
+    except ImportError:
+        return {"status": "not_configured", "available": False, "languages": []}
+    cmd = get_settings().tesseract_cmd
+    if cmd:
+        pytesseract.pytesseract.tesseract_cmd = cmd
+    try:
+        version = str(pytesseract.get_tesseract_version())
+    except (pytesseract.TesseractNotFoundError, FileNotFoundError, OSError):
+        return {"status": "binary_not_found", "available": False, "languages": []}
+    try:
+        languages = list(pytesseract.get_languages(config=""))
+    except Exception:  # noqa: BLE001
+        languages = []
+    missing = [lang for lang in required_languages if lang not in languages]
+    if missing:
+        return {"status": "language_pack_missing", "available": True, "version": version,
+                "languages": languages, "missing_languages": missing}
+    return {"status": "available", "available": True, "version": version, "languages": languages}
+
+
 def extract_image_ocr(path: Path) -> str:
     try:
         import pytesseract
@@ -124,8 +148,10 @@ def extract_text(file_path: str, max_chars: int | None = _MAX_CHARS) -> str:
 
     if ext == "pdf":
         text = extract_pdf(p, max_chars)
-    elif ext in {"docx", "doc"}:
+    elif ext == "docx":
         text = extract_docx(p, max_chars)
+    elif ext == "doc":
+        text = "[不支持旧版 .doc；请先转换为 .docx]"
     elif ext in _TEXT_EXTS:
         text = extract_txt(p, max_chars)
     elif ext in {"png", "jpg", "jpeg", "bmp", "tiff", "webp"}:

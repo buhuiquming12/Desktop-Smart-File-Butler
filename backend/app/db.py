@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import contextvars
+import json
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -95,6 +96,14 @@ def init_db() -> None:
                     cron        TEXT NOT NULL,
                     enabled     INTEGER NOT NULL DEFAULT 1
                 );
+
+                CREATE TABLE IF NOT EXISTS scan_manifests (
+                    scan_id    TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    directory  TEXT NOT NULL,
+                    items_json TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL
+                );
                 """
             )
             # 迁移：为老用户已存在的 operation_log 补 thread_id 列（CREATE IF NOT EXISTS
@@ -173,6 +182,31 @@ def operations_for_thread(thread_id: str) -> List[OperationLog]:
             (thread_id,),
         ).fetchall()
     return [_row_to_operation(r) for r in rows]
+
+
+# ---------- 扫描清单 ----------
+
+def save_manifest(scan_id: str, directory: str, items: list[dict], metadata: dict) -> None:
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO scan_manifests(scan_id, created_at, directory, items_json, metadata_json) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (scan_id, datetime.now(timezone.utc).isoformat(), directory,
+             json.dumps(items, ensure_ascii=False), json.dumps(metadata, ensure_ascii=False)),
+        )
+
+
+def get_manifest(scan_id: str) -> Optional[dict]:
+    with _conn() as c:
+        row = c.execute("SELECT * FROM scan_manifests WHERE scan_id=?", (scan_id,)).fetchone()
+    if not row:
+        return None
+    return {
+        "scan_id": row["scan_id"],
+        "directory": row["directory"],
+        "items": json.loads(row["items_json"]),
+        "metadata": json.loads(row["metadata_json"]),
+    }
 
 
 # ---------- 偏好记忆 ----------
