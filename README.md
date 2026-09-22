@@ -1,100 +1,225 @@
-# 桌面智能文件管家 (Desktop Smart File Butler)
+# 桌面智能文件管家（Desktop Smart File Butler）
 
-通过自然语言指令，让 AI Agent 自动扫描、分类、重命名、归档、摘要你的文件。
+一个基于 Electron、React、TypeScript、FastAPI 和 LangGraph 的本地智能文件管理 Agent。用户可以通过自然语言扫描、分类、移动、重命名、摘要和删除本地文件，并使用人工审批、撤销、定时任务、后台执行及 WebSocket 状态同步。
 
-> 例："整理我的下载文件夹，把图片按月份归档，PDF 提取摘要后放到文档区。"
+项目当前优先保证文件操作的正确性、安全边界、可恢复性和桌面端可发布性。大批量文件不由 LLM 枚举：LLM 负责理解意图与生成规则，Python 根据完整扫描清单确定实际文件集合。
 
-## 架构总览
+> 示例：“整理下载目录，把 PDF 移到 PDF 文件夹，并按文件名加上 `archive-` 前缀。”
 
+## 核心能力
+
+- 自然语言驱动的扫描、分类、移动、重命名、摘要和软删除。
+- 完整扫描结果保存为 manifest，以 `scan_id` 交给确定性批量工具处理。
+- `batch_move`、`batch_rename`、`batch_classify` 不依赖 Planner 的有限预览。
+- 请求级累计审批：重新规划不会重置 move、rename、delete 的累计数量。
+- 删除进入沙箱内的 `.butler-trash/`；move、rename、delete 支持审计和回滚。
+- SQLite 持久化会话、LangGraph checkpoint、审批、操作日志和扫描清单。
+- WebSocket 实时状态同步；断线重连后通过 REST 恢复 thread 快照。
+- 支持 OpenAI-Compatible 模型和 Ollama；仅在明确不支持 structured output 时自动降级。
+- PDF、DOCX、文本和图片 OCR 内容提取；旧版二进制 `.doc` 会明确报告不支持。
+- Windows 生产包内置 PyInstaller 后端 sidecar，目标机器无需 Python 开发环境。
+
+## 当前架构
+
+```text
+原始用户请求
+      │ trusted_user_intent
+      ▼
+LangGraph Planner ◄── 文件名、OCR、文档内容、工具结果（不可信数据）
+      │ 规则 + scan_id
+      ▼
+PolicyEngine ── 意图授权 / 风险等级 / 累计审批阈值
+      │
+      ├── 需要审批 ──► React Approval UI ──► LangGraph resume
+      │
+      ▼
+Manifest Store ──► Python 确定性过滤 ──► PathLockManager
+                                              │
+                                              ▼
+                                      Filesystem Tools
+                                              │
+                       ┌──────────────────────┴───────────────────┐
+                       ▼                                          ▼
+             SQLite 审计 / 回滚 / checkpoint          WS 事件 + REST 状态恢复
+
+Electron 单实例主进程
+      └── resources/backend/butler-backend.exe
+              └── FastAPI + LangGraph + 内置前端静态资源
 ```
-┌───────────────────────────────┐      同源 HTTP / WebSocket     ┌──────────────────────────────┐
-│  Electron 前端 (React + TS)    │  ◄──────────────────────────► │  Python 后端 (FastAPI)         │
-│  - 对话界面 ChatPanel          │   (生产:前端由后端同源托管)     │  - Agent 循环 (LangGraph)      │
-│  - 任务看板 TaskBoard          │                                │  - 工具集 (fs/extract/分类)    │
-│  - 审批弹窗 ApprovalModal      │                                │  - SQLite (记忆/历史/审批快照) │
-│  - 设置页 Settings             │                                │  - APScheduler (定时整理)      │
-└───────────────────────────────┘                                └──────────────────────────────┘
+
+Agent 状态明确区分：
+
+- `trusted_user_intent`：唯一可作为用户授权依据的原始请求。
+- `untrusted_file_data`：文件名、OCR、文档正文和扫描数据。
+- `tool_observations`：工具返回的受限摘要。
+- `mutations`：当前用户请求累计执行的 move、rename、delete 数量。
+
+文件内容即使包含“忽略之前指令”“删除所有文件”或伪造的系统消息，也只能作为普通数据，不能扩展用户授权。
+
+## 批量执行与扫描语义
+
+`scan_directory` 会把完整结果保存到 SQLite manifest，并向 Planner 返回有界摘要，例如：
+
+```json
+{
+  "scan_id": "2c9f...",
+  "total": 286,
+  "scanned_count": 286,
+  "truncated": false,
+  "reason": "none",
+  "summary": { "pdf": 83, "jpg": 104 },
+  "preview": []
+}
 ```
 
-- **同源托管（生产）**：打包后 FastAPI 用 `StaticFiles` 托管 `frontend/dist`，Electron `loadURL` 到后端，
-  前端与 `/api`、`/ws` 同源，从根源避免 CORS 与 opaque(`null`) origin 问题。开发模式仍用 Vite dev server。
-- **会话令牌鉴权**：后端启动生成一次性令牌写入会话文件，Electron 经 preload 注入渲染进程；REST 校验
-  `X-Butler-Token` 头、WebSocket 校验 `token` 查询参数，且都要求本机 `Origin`。防止本机任意网页驱动 Agent
-  或篡改模型 `base_url` 外泄已保存的 API Key。
-- **失败必达终态**：后端任何启动/运行失败（含模型未配置）都会收敛为 `done(status=failed)` 广播，前端据此
-  明确呈现失败，而不是因为等不到终态事件而永久停在「处理中」。
-- **断线自愈**：WebSocket 断开后按指数退避自动重连（0.5s 起、上限 15s，带抖动），连接状态在聊天面板可见；
-  断线期间漏掉的事件不补发，由下述失联兜底负责告知用户。
-- **失联兜底**：前端以「最后一次收到事件的时刻」为心跳，60s 内无任何事件即解除忙态并给出可读提示。
+Planner 随后生成规则，而不是枚举数百条文件路径：
 
-Agent 循环（LangGraph StateGraph）：
-
-```
-perceive(感知) → plan(规划) → act(工具调用) → reflect(反思) ─┐
-     ▲                            │                          │
-     └──────── 继续/重规划 ───────┴──── 需审批? ──► approval(interrupt) ┘
+```json
+{
+  "tool": "batch_move",
+  "args": {
+    "scan_id": "2c9f...",
+    "filter": { "extensions": ["pdf"] },
+    "dest_dir": "C:/Users/me/Downloads/PDF"
+  }
+}
 ```
 
-高危操作在 `approval` 节点触发 LangGraph `interrupt()`，图状态被**持久化到 SQLite**，等待前端弹窗确认后用
-`Command(resume=...)` 恢复。需审批的场景：
+具体匹配由 Python 完成。批量结果包含 `matched`、`success`、`failed`、`skipped`、`truncated`、`reason` 和有限预览。
 
-- **删除**：删除不做物理删除，而是移入沙箱内 `.butler-trash/`，因此可撤销。
-- **批量移动/重命名**：一次计划中 move/rename 步数超过阈值（默认 20，偏好 `batch_approval_threshold` 可配）
-  时统一审批一次，弹窗展示 diff 摘要；拒绝则一个文件都不动。
-- **后台会话的审批不会丢**：定时任务等在非当前会话里触发的审批照常弹窗，弹窗顶部标注「第 1 / N 项」队列
-  进度，处理后自动弹出下一项；否则用户没有入口去批准那个高危操作。
+默认扫描上限为 5000 项、12 层。超过限制时会明确返回：
+
+- `truncated: true`
+- `reason: max_items` 或 `max_depth`
+
+权限错误使用 `permission_error`；完整扫描使用 `none`。恰好扫描到 5000 项且不存在第 5001 项时不会误报截断。扫描不会进入 `.butler-trash/`，也不会跟进目录符号链接或 Windows junction。
+
+## 审批、并发和回滚
+
+审批由后端 `PolicyEngine` 决定，LLM 无权自行取消安全门槛。
+
+- 删除始终属于高风险操作。
+- move、rename 按同一个用户请求累计；模型把 60 个操作拆成多次 replan 也不能绕过阈值。
+- 默认批量审批阈值为 20，可通过偏好 `batch_approval_threshold` 调整。
+- 已批准的 mutation 上限保存在 Agent state 中，不因重新规划丢失。
+- mutation 前会重新核对原始用户意图，文件内容不能授权新的文件操作。
+
+文件写操作由按规范化目录分片的 `PathLockManager` 保护。同一目录的 move、rename、delete、rollback 和摘要输出串行执行，不同目录仍可并行；锁在异常后也会释放。
+
+按会话撤销会展示真实结果，例如：
+
+```text
+撤销完成：成功 7，跳过 2，失败 1
+```
+
+只要存在失败项，前端就不会显示为纯成功状态。
+
+## 连接、鉴权与状态恢复
+
+- 后端启动时生成一次性 session token，Electron 通过 preload 注入 Renderer。
+- REST 使用 `X-Butler-Token`，WebSocket 使用 `token` 查询参数。
+- API 和 WebSocket 地址只允许 `localhost`、`127.0.0.1` 或 `::1`，避免把本地 token 发送到远程服务器。
+- API 地址优先级：用户显式的本地设置 > preload 注入的 `backendUrl` > `http://127.0.0.1:8000`。
+- WebSocket 地址从 API 地址自动派生：`http → ws`，`https → wss`。
+- WebSocket 按指数退避重连；连接恢复后调用 `GET /api/threads/{thread_id}`，恢复 observations、pending approval 和最终状态。
+- WebSocket 不可用时，`POST /api/chat` 的 REST fallback 会保存服务端返回的新 `thread_id`，后续追问、取消和撤销仍属于同一会话。
+
+当前恢复机制使用 thread 状态快照，不提供逐事件 `event_id` replay。
 
 ## 目录结构
 
-```
-├── README.md
-├── .github/workflows/ci.yml     # CI：后端 pytest + 前端 tsc typecheck
+```text
+├── .github/workflows/ci.yml
 ├── backend/
-│   ├── requirements.txt
-│   ├── .env.example
-│   └── app/
-│       ├── main.py              # FastAPI 入口：REST + WebSocket + 令牌鉴权 + 静态托管
-│       ├── config.py            # 环境变量配置
-│       ├── llm_config.py        # 模型配置：DB 覆盖 .env
-│       ├── sandbox_config.py    # 沙箱根目录：DB 覆盖 .env（界面可配）
-│       ├── models.py            # Pydantic 数据模型
-│       ├── db.py                # SQLite 访问层（WAL）
-│       ├── security.py          # 路径沙箱校验
-│       ├── logging_conf.py
-│       ├── agent/
-│       │   ├── state.py         # 图状态定义
-│       │   ├── llm.py           # LLM 工厂 (OpenAI / Ollama)
-│       │   ├── prompts.py
-│       │   └── graph.py         # LangGraph Agent 循环（含 LLM 分类、map-reduce 摘要）
-│       └── tools/
-│           ├── filesystem.py    # 扫描/移动/重命名/建夹/删除(回收站)/回滚
-│           ├── extract.py       # PDF/Word/TXT/图片 OCR（分段 + 超时）
-│           ├── categories.py    # 扩展名粗分类（LLM 不可用时的回退）
-│           └── scheduler.py     # APScheduler 定时任务
-│       └── tests/               # pytest（沙箱/审批/回滚/递归/鉴权/摘要/分类/扫描上限/会话清理/事件委派等）
+│   ├── app/
+│   │   ├── agent/              # LangGraph、状态、Prompt、LLM 适配
+│   │   ├── policy/             # 后端授权和累计审批策略
+│   │   ├── tools/
+│   │   │   ├── filesystem.py   # 文件操作和回滚
+│   │   │   ├── manifests.py    # 完整扫描清单与确定性匹配
+│   │   │   ├── path_locks.py   # 目录级 mutation locks
+│   │   │   ├── extract.py      # PDF、DOCX、文本、OCR 提取
+│   │   │   └── scheduler.py
+│   │   ├── main.py             # FastAPI、REST、WebSocket、Runtime Manager
+│   │   ├── db.py               # SQLite 数据访问
+│   │   ├── sandbox_config.py
+│   │   └── security.py
+│   ├── tests/
+│   ├── build_sidecar.py        # PyInstaller 构建入口
+│   ├── sidecar.py              # 冻结后的后端程序入口
+│   └── requirements.txt
 └── frontend/
-    ├── package.json
-    ├── vite.config.ts
     ├── electron/
-    │   ├── main.ts              # Electron 主进程：拉起后端 sidecar + 令牌注入 + 窗口
-    │   └── preload.ts
-    └── src/
-        ├── App.tsx
-        ├── api/client.ts        # REST + WebSocket 客户端（自动携带令牌）
-        └── components/          # ChatPanel / TaskBoard / ApprovalModal / Settings
+    │   ├── main.ts             # 单实例、sidecar 生命周期、窗口启动
+    │   ├── preload.cts
+    │   └── singleInstance.ts
+    ├── src/
+    │   ├── App.tsx
+    │   ├── api/client.ts       # REST、WebSocket、reconciliation
+    │   └── components/
+    ├── package.json
+    └── package-lock.json
 ```
 
-## 模型与目录：可在设置界面配置
+## 开发环境
 
-`.env` 提供默认值，**设置界面的改动保存到 SQLite 并覆盖 .env、立即生效**：
+推荐环境：
 
-- **模型配置**：provider / Base URL / 模型名 / API Key，可拉取可用模型列表后选择。API Key 仅保存在本地后端，
-  不回传前端、不显示明文，界面只标记是否已配置。
-- **可操作的文件夹（沙箱根目录）**：用 Electron 原生目录选择器添加/移除。这是权限变更，界面有明确警告。
+- Python 3.12
+- Node.js 20
+- Windows 负责生成 Windows Electron portable 包
 
-## 使用外部大模型 API
+### 安装后端依赖
 
-默认通过 `langchain-openai` 调用，支持 OpenAI 兼容协议。可在设置界面配置，或在 `backend/.env` 写默认值：
+```powershell
+cd backend
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+Copy-Item .env.example .env
+```
+
+macOS/Linux 激活命令为：
+
+```bash
+source backend/.venv/bin/activate
+```
+
+### 安装前端依赖
+
+项目已提交 `package-lock.json`，请使用可复现安装：
+
+```powershell
+cd frontend
+npm ci
+```
+
+不需要 `--legacy-peer-deps`。
+
+### 启动开发版
+
+```powershell
+cd frontend
+npm run dev
+```
+
+开发模式下 Electron 会查找仓库中的 `backend/`，优先使用 `BUTLER_PYTHON`，否则查找后端虚拟环境或系统 Python，并启动 `python -m uvicorn app.main:app`。
+
+可用环境变量：
+
+| 变量 | 说明 |
+|---|---|
+| `BUTLER_NO_SPAWN=1` | 不由 Electron 启动后端 |
+| `BUTLER_PYTHON` | 指定开发环境 Python 解释器 |
+| `BUTLER_BACKEND_DIR` | 指定包含 `app/main.py` 的 backend 目录 |
+| `BUTLER_BACKEND_CMD` | 完全覆盖后端启动命令 |
+| `BUTLER_BACKEND_URL` | 指定本地后端 URL；非 loopback 地址会被拒绝 |
+| `BUTLER_SESSION_FILE` | 覆盖 Electron 与后端共享的 session 文件路径 |
+
+## 模型与 OCR 配置
+
+模型可在设置界面配置，也可以在 `backend/.env` 提供默认值：
 
 ```dotenv
 MODEL_PROVIDER=openai
@@ -103,113 +228,137 @@ OPENAI_MODEL=服务商提供的模型名
 OPENAI_BASE_URL=https://服务商提供的兼容接口/v1
 ```
 
-`OPENAI_BASE_URL` 留空时使用 OpenAI 官方端点。兼容服务必须支持结构化输出能力；不支持时规划阶段会快速失败并显示原因。
-未配置 API Key 时同样会立即以可读错误结束本轮并解除前端忙态，而不是一直停在「处理中」。
-分类与文档摘要也复用该模型（分类改用 LLM 直接给中文类别；长文档走 map-reduce 分段摘要，不再只摘开头）。
+支持 OpenAI-Compatible API 和 Ollama。structured output 的 `auto` 模式只在错误明确表示不支持 `tools`、function calling 或 `response_format` 时降级到提示词 JSON；模型名错误、参数错误和普通 HTTP 400 会原样报告。
 
-## 安装与运行
+OCR 需要安装 [Tesseract](https://github.com/tesseract-ocr/tesseract)，并可配置：
 
-### 1. 后端
+```dotenv
+TESSERACT_CMD=C:\Program Files\Tesseract-OCR\tesseract.exe
+```
 
-```bash
+后端会实际探测 Tesseract binary、版本和语言包，并区分 `not_configured`、`available`、`binary_not_found`、`language_pack_missing`，不再仅根据配置字符串判断。
+
+## 沙箱目录配置
+
+所有文件操作只能发生在沙箱根目录中。设置界面保存的根目录使用 JSON 数组：
+
+```json
+["C:/Users/me/Downloads", "D:/Archive"]
+```
+
+数据库中的旧分号格式仍可读取，下一次保存会自动迁移为 JSON。`.env` 中也推荐使用 JSON：
+
+```dotenv
+SANDBOX_ROOTS='["C:/Users/me/Downloads", "D:/Archive"]'
+```
+
+为了兼容旧部署，`.env` 中的分号格式仍然可读。
+
+## 构建 Windows 桌面包
+
+生产包采用真正的 sidecar 模式：先把 FastAPI/LangGraph 后端冻结成独立 exe，再由 electron-builder 放入 `resources/backend/`。
+
+```powershell
+# 1. 安装依赖
 cd backend
-python -m venv .venv
-# Windows
-.venv\Scripts\activate
-# macOS/Linux: source .venv/bin/activate
-
 pip install -r requirements.txt
+cd ..\frontend
+npm ci
 
-# 配置环境变量
-cp .env.example .env      # Windows: copy .env.example .env
-# 至少填入 SANDBOX_ROOTS；模型可在此填默认值，也可之后在设置界面配置
+# 2. 构建前端静态资源
+npm run build:web
+
+# 3. 构建 backend/dist/butler-backend.exe
+npm run build:sidecar
+
+# 4. 构建 Windows portable 包
+npm run dist
 ```
 
-OCR 需系统安装 [Tesseract](https://github.com/tesseract-ocr/tesseract)，并在 `.env` 设置 `TESSERACT_CMD`
-（Windows 例：`C:\Program Files\Tesseract-OCR\tesseract.exe`）。
+主要产物：
 
-> 后端依赖含 `langgraph-checkpoint-sqlite`，用于把会话/待审批状态持久化到 `data/checkpoints.sqlite`，重启不丢。
-
-### 2. 前端（开发）
-
-```bash
-cd frontend
-npm install
-npm run dev
+```text
+backend/dist/butler-backend.exe
+frontend/release/桌面智能文件管家 <version>.exe
+frontend/release/win-unpacked/resources/backend/butler-backend.exe
 ```
 
-Electron 主进程会**自动拉起后端 sidecar**（默认用 `backend/.venv` 的 `python -m uvicorn app.main:app`），
-无需再手动开 uvicorn。若你想自己管理后端进程，设 `BUTLER_NO_SPAWN=1` 后自行启动即可。
+可单独执行 sidecar smoke test：
 
-sidecar 相关环境变量：
-
-| 变量 | 说明 |
-|------|------|
-| `BUTLER_NO_SPAWN=1` | 不自动拉起后端（你自行启动） |
-| `BUTLER_PYTHON` | 指定 Python 解释器路径 |
-| `BUTLER_BACKEND_DIR` | 指定后端目录（默认向上自动查找 `backend/app/main.py`） |
-| `BUTLER_BACKEND_CMD` | 完全自定义启动命令（可指向 PyInstaller 打出的独立 exe） |
-
-### 3. 打包
-
-```bash
-cd frontend
-npm run build
-# 产物：release/win-unpacked/桌面智能文件管家.exe
+```powershell
+backend\dist\butler-backend.exe --self-test
 ```
 
-启动时先显示启动页，后端就绪后再加载界面；若 30s 内后端未就绪会显示可读的错误页（而非白屏）。
+生产环境不再向上查找仓库中的 Python 后端，而是直接启动 `process.resourcesPath/backend/butler-backend.exe`。Electron 使用 single-instance lock；第二个实例不会删除 session、再次占用后端端口或启动第二份 sidecar，而是聚焦已有窗口。
 
-> ⚠ **分发限制**：打包产物只含前端，**不内嵌 Python 运行时与后端代码**。在本机能运行是因为 sidecar 向上找到了
-> 仓库里的 `backend/` 和 `.venv`。要在无 Python 环境的机器上分发，还需用 PyInstaller 把后端打成独立 exe，
-> 并通过 `BUTLER_BACKEND_CMD` 指向它——这部分尚未实现。
+## 测试
 
-### 4. 测试
+```powershell
+# 后端
+cd backend
+python -m pytest -q
 
-```bash
-cd backend && python -m pytest -q      # 后端测试
-cd frontend && npm run typecheck        # 前端类型检查
+# 前端类型、状态/API 测试、Electron 生命周期测试
+cd ..\frontend
+npm run typecheck
+npm test
+
+# Web 生产构建
+npm run build:web
 ```
 
-> ⚠ 本地 `backend/.env` 会掩盖「缺配置」类失败：CI 上没有 `.env`，同样的用例在本地过、在 CI 挂。
-> 改动涉及模型配置时，请在清空 API Key 的条件下再跑一遍（bash：`OPENAI_API_KEY= python -m pytest -q`）。
+当前回归测试覆盖：
+
+- 200+ 文件批量处理不会遗漏 Planner preview 之外的文件。
+- 多次 replan 无法绕过累计审批阈值。
+- 文件内容 Prompt Injection 不能触发未授权 mutation。
+- 并发 move 不会选择相同目标文件名。
+- 扫描上限和截断原因。
+- `.doc` 与 `.docx` 的正确能力边界。
+- Runtime reset 与运行中 workflow 隔离。
+- REST fallback、WebSocket reconciliation 和 rollback 部分失败。
+- structured output 错误分类、sandbox 配置迁移、OCR 探测。
+- preload backend URL、loopback 限制和 Electron 单实例生命周期。
+
+CI 包含：
+
+- Ubuntu：backend pytest。
+- Ubuntu：`npm ci`、typecheck、前端测试、Web build。
+- Windows：sidecar build、sidecar smoke test、Electron portable build、artifact 上传。
+
+最近一次本地完整验证结果为 `185 passed, 1 skipped`；跳过项是当前 Windows 权限不允许创建测试所需目录链接的场景。前端 typecheck、tests、Vite build、sidecar self-test 和 Windows portable build 均通过。
 
 ## 安全说明
 
-- **路径沙箱**：所有文件操作仅限沙箱根目录（`.env` 的 `SANDBOX_ROOTS` 或设置界面配置），越界一律拒绝。
-- **会话令牌 + 来源校验**：REST/WebSocket 均需本机 origin + 一次性令牌；跨源网页无法取得令牌，无法驱动 Agent。
-- **人工审批**：删除、超阈值批量移动/重命名需前端弹窗确认后才执行；移动/重命名默认自动改名，禁止覆盖。
-- **可撤销**：删除进回收站；move/rename/delete 均可按单条或按会话回滚，回滚也写审计日志。
-- **审计日志**：每次文件操作记录到 SQLite `operation_log` 表与 `logs/butler.log`；API Key 不入日志。
+- **原始意图是唯一授权源**：文件内容、OCR、文件名和工具返回都不可信。
+- **后端策略不可绕过**：风险和审批由 `PolicyEngine` 判断，不由 LLM 决定。
+- **路径沙箱**：越界文件访问一律拒绝；链接不会用来绕过沙箱。
+- **本地连接限制**：Renderer 不会把 session token 发送到非 loopback 服务。
+- **禁止覆盖**：目标重名时生成唯一名称，并在目标目录锁内完成选择和 mutation。
+- **可撤销与审计**：操作及回滚都写入 SQLite；删除使用项目回收站。
+- **密钥保护范围**：API Key 不返回前端、不进入日志，但当前仍以明文保存在本地 SQLite；数据库文件应视为敏感数据。
 
-## 运行上限与保留策略
-
-| 项目 | 默认 | 说明 |
-|------|------|------|
-| 目录扫描 | 最多 5000 项 / 最深 12 层 | 递归扫描的硬上限，触顶即停止并记日志（便于核查「清单为何不全」）；不进入 `.butler-trash/`，不跟进符号链接与 Windows 目录联接（防目录环，也防顺着链接枚举到沙箱之外） |
-| 清单展示 | 500 条 | 扫描结果交给规划器前再截断一次，并标记 `truncated`，避免超大清单撑爆上下文 |
-| 会话检查点 | 保留最近 100 个会话 / 30 天 | 构造 Agent 运行时清理一次旧的 LangGraph checkpoint；**待审批会话无条件保留**——删掉等于让用户再也批准不了那个操作 |
-| 定时任务 | 同目录串行，线程池 4 | 同一目录上一次触发未结束时跳过本次；提交失败立即释放目录占用，不会让该目录永久失效 |
-| 断线重连 | 0.5s 起指数退避，上限 15s | 带抖动；连上即重置退避 |
-| 失联判定 | 60s 无事件 | 解除忙态并提示，避免无限等待 |
-
-## 兼容性与密钥提示
-
-- `llm_config` 为本地 SQLite 配置表，API Key 目前按明文保存。请将数据库文件视为敏感文件；生产环境建议迁移到操作系统凭据管理器，并限制数据目录权限。API Key 不会出现在日志、公开配置接口或 WebSocket 事件中。
-- 当前依赖版本（TypeScript 7、Vite 8、Electron 44）经过项目现有构建链验证，存在较新的 Node/Electron API 兼容性约束。除非有专门的兼容性验证，不主动升级主版本。
-
-## 配置项（.env）
+## 配置项
 
 | 变量 | 说明 | 示例 |
-|------|------|------|
+|---|---|---|
 | `MODEL_PROVIDER` | 模型提供方 | `openai` / `ollama` |
-| `OPENAI_API_KEY` | OpenAI 密钥 | `sk-...` |
-| `OPENAI_MODEL` | 外部 API 模型名 | `gpt-4o-mini` |
-| `OPENAI_BASE_URL` | OpenAI 兼容 API 地址（可选） | `https://api.example.com/v1` |
-| `OLLAMA_BASE_URL` | Ollama 地址（可选备用） | `http://127.0.0.1:11434` |
+| `OPENAI_API_KEY` | OpenAI-Compatible API 密钥 | `sk-...` |
+| `OPENAI_MODEL` | 模型名 | `gpt-4o-mini` |
+| `OPENAI_BASE_URL` | OpenAI-Compatible API 地址 | `https://api.example.com/v1` |
+| `OLLAMA_BASE_URL` | Ollama 地址 | `http://127.0.0.1:11434` |
 | `OLLAMA_MODEL` | Ollama 模型 | `qwen2.5` |
-| `SANDBOX_ROOTS` | 允许操作的根目录（`;` 分隔），也可在设置界面覆盖 | `C:\Users\me\Downloads;C:\Users\me\Desktop` |
-| `TESSERACT_CMD` | Tesseract 可执行路径 | `C:\...\tesseract.exe` |
+| `STRUCTURED_OUTPUT_MODE` | `auto` 或 `prompt` | `auto` |
+| `SANDBOX_ROOTS` | JSON 根目录数组；兼容旧分号格式 | `'["C:/Users/me/Downloads"]'` |
+| `TESSERACT_CMD` | Tesseract 可执行文件 | `C:\...\tesseract.exe` |
 | `DB_PATH` | SQLite 路径 | `./data/butler.db` |
+| `HOST` / `PORT` | 后端监听地址和端口 | `127.0.0.1` / `8000` |
 
-> 模型配置与沙箱根目录也可在设置界面修改，保存后覆盖 `.env` 默认值并立即生效。
+## 当前已知限制
+
+- WebSocket 使用状态快照 reconciliation，尚未实现 `event_id` 和断线事件 replay。
+- manifest 暂无 TTL、容量配额和定期压缩策略。
+- 用户意图授权当前是保守的后端词法策略，尚未升级为完整的强类型 intent contract。
+- Windows portable 已通过本机构建及内置 sidecar 自检，但正式发布仍应在全新 Windows VM 上做安装级验证。
+- 尚未配置正式代码签名、生产图标和发布者证书。
+- 单实例有生命周期测试，尚无同时启动两个真实 Electron GUI 进程的自动化 E2E。
