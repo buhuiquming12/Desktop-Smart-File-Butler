@@ -13,7 +13,7 @@
     "build:sidecar": "python ../backend/build_sidecar.py",
     "preview": "vite preview",
     "typecheck": "tsc -b --pretty false",
-    "test": "tsc -p tsconfig.test.json --pretty false && node .test-dist/state.test.js && node .test-dist/api.test.js"
+    "test": "tsc -p tsconfig.test.json --pretty false && tsc -p tsconfig.electron-test.json --pretty false && node .test-dist/state.test.js && node .test-dist/api.test.js && node .electron-test-dist/singleInstance.test.js"
   },
   "dependencies": {
     "react": "19.3.0",

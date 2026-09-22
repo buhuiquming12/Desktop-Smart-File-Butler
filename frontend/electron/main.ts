@@ -5,6 +5,7 @@ import { readFile, rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { coordinateSingleInstance } from './singleInstance.js';
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const developmentUrl = process.env.VITE_DEV_SERVER_URL;
@@ -305,22 +306,22 @@ async function boot(): Promise<void> {
 }
 
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
-if (!hasSingleInstanceLock) {
-  app.quit();
-} else {
-  app.on('second-instance', () => {
+coordinateSingleInstance(hasSingleInstanceLock, {
+  quit: () => app.quit(),
+  onSecondInstance: (focus) => app.on('second-instance', focus),
+  focusExisting: () => {
     if (!mainWindow) return;
     if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.show();
     mainWindow.focus();
-  });
-  app.whenReady().then(async () => {
+  },
+  startPrimary: () => { void app.whenReady().then(async () => {
     await boot();
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) void boot();
     });
-  });
-}
+  }); },
+});
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();

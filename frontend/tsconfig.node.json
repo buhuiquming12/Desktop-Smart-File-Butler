@@ -14,5 +14,6 @@
     "outDir": "dist-electron",
     "rootDir": "electron"
   },
-  "include": ["electron"]
+  "include": ["electron"],
+  "exclude": ["electron/*.test.ts"]
 }

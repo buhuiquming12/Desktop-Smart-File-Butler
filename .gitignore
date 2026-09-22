@@ -30,6 +30,7 @@ frontend/dist-electron/
 frontend/release/
 frontend/.vite/
 frontend/.test-dist/
+frontend/.electron-test-dist/
 *.tsbuildinfo
 *.local
 package-lock.json
