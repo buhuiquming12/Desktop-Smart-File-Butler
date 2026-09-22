@@ -12,7 +12,10 @@ ToolName = Literal[
     "classify_file",
     "make_dir",
     "move_file",
+    "batch_move",
     "rename_file",
+    "batch_rename",
+    "batch_classify",
     "delete_file",
     "write_summary",
     "set_preference",
@@ -53,6 +56,9 @@ class AgentState(TypedDict, total=False):
 
     thread_id: str
     user_request: str
+    trusted_user_intent: str
+    untrusted_file_data: List[Dict[str, Any]]
+    tool_observations: List[Dict[str, Any]]
     perception: Dict[str, Any]
     plan: List[Dict[str, Any]]
     step_index: int
@@ -74,3 +80,5 @@ class AgentState(TypedDict, total=False):
     error: str
     batch_approved: bool          # 本计划的批量 move/rename 已获审批（P1-2）
     batch_rejected: bool          # 本计划的批量 move/rename 被拒绝，全部跳过
+    mutations: Dict[str, int]
+    approved_mutation_limit: int
