@@ -23,6 +23,7 @@
 - WebSocket 实时状态同步；断线重连后通过 REST 恢复 thread 快照。
 - 支持 OpenAI-Compatible 模型和 Ollama；仅在明确不支持 structured output 时自动降级。
 - PDF、DOCX、文本和图片 OCR 内容提取；旧版二进制 `.doc` 会明确报告不支持。
+- 设置界面直接配置模型、授权目录、默认管理目录和 OCR 工具路径（含原生目录/文件选择器），保存后按新配置重新检测，无需重启应用。
 - Windows 生产包内置 PyInstaller 后端 sidecar，目标机器无需 Python 开发环境。
 
 ## 当前架构
@@ -156,7 +157,10 @@ Planner 随后生成规则，而不是枚举数百条文件路径：
 │   │   │   └── scheduler.py
 │   │   ├── main.py             # FastAPI 装配与 Agent 流协调
 │   │   ├── db.py               # SQLite 数据访问
-│   │   ├── sandbox_config.py
+│   │   ├── llm_config.py       # 模型配置（数据库覆盖 > .env）
+│   │   ├── sandbox_config.py   # 授权目录，即安全边界
+│   │   ├── workspace_config.py # 默认管理目录，必须落在授权目录内
+│   │   ├── external_tools_config.py # 外部工具路径（Tesseract 等）
 │   │   └── security.py
 │   ├── tests/
 │   ├── build_sidecar.py        # PyInstaller 构建入口
@@ -170,8 +174,9 @@ Planner 随后生成规则，而不是枚举数百条文件路径：
     ├── src/
     │   ├── App.tsx
     │   ├── api/client.ts       # REST、WebSocket、reconciliation
-    │   ├── hooks/              # 后端连接与设置状态控制器
-    │   └── components/
+    │   ├── hooks/              # 后端连接、会话与设置状态控制器
+    │   ├── components/         # 会话、审批、设置等界面组件
+    │   └── types.ts            # 前后端共享的显式类型
     ├── package.json
     └── package-lock.json
 ```
@@ -232,6 +237,22 @@ npm run dev
 | `BUTLER_BACKEND_URL` | 指定本地后端 URL；非 loopback 地址会被拒绝 |
 | `BUTLER_SESSION_FILE` | 覆盖 Electron 与后端共享的 session 文件路径 |
 
+## 设置界面与配置优先级
+
+设置界面（React → `useSettingsController` → `ApiClient` → `/api/settings/*` → 专用配置服务 → SQLite / `.env`）面向不编辑 `.env` 的普通用户。组件不直接访问数据库，Renderer 不接触 Node API，配置服务也不反向依赖 Agent。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` / `PUT` | `/api/settings/llm` | 模型提供方与密钥 |
+| `POST` | `/api/settings/llm/models` | 拉取可用模型列表 |
+| `GET` / `PUT` | `/api/settings/sandbox` | 授权目录 |
+| `GET` / `PUT` | `/api/settings/workspace` | 默认管理目录 |
+| `GET` / `PUT` | `/api/settings/tools` | 外部工具路径（当前为 Tesseract） |
+
+统一优先级为 **SQLite 运行时配置 > `.env` 默认值 > 系统默认**。读取路径不做缓存，因此保存后立即生效；除 LLM 配置外都不需要重建 Agent runtime，也都不需要重启应用。`PUT /api/settings/tools` 在保存成功后会立刻用新配置重新执行一次能力检测，响应里带回最新结果，因此前端「保存并检测」是一次往返。
+
+外部工具配置集中在 `external_tools_config.py`，用 `ToolSpec` 注册表描述「哪个键、属于哪个工具、是文件还是目录」，新增 ffmpeg、pandoc 等只需在注册表里加一行。写入前校验路径长度、非法字符、`is_file` / `is_dir`，失败返回 **422** 和中文提示（例如「Tesseract 可执行文件不存在：…」）；空字符串表示**清除该项覆盖并回退到 `.env`**，而不是错误。
+
 ## 模型与 OCR 配置
 
 模型可在设置界面配置，也可以在 `backend/.env` 提供默认值：
@@ -245,17 +266,49 @@ OPENAI_BASE_URL=https://服务商提供的兼容接口/v1
 
 支持 OpenAI-Compatible API 和 Ollama。structured output 的 `auto` 模式只在错误明确表示不支持 `tools`、function calling 或 `response_format` 时降级到提示词 JSON；模型名错误、参数错误和普通 HTTP 400 会原样报告。
 
-OCR 需要安装 [Tesseract](https://github.com/tesseract-ocr/tesseract)，并可配置：
+OCR 需要安装 [Tesseract](https://github.com/tesseract-ocr/tesseract)。两项配置都能在设置界面填写，也能用 `.env` 提供默认值（界面上的值优先）：
 
 ```dotenv
-TESSERACT_CMD=C:\Program Files\Tesseract-OCR\tesseract.exe
+# ===== OCR =====
+# Tesseract 可执行文件，可留空
+# 前端设置中的值优先于该环境变量
+TESSERACT_CMD=
+# Tesseract 语言包目录，例如：
+# C:\Program Files\Tesseract-OCR\tessdata
+TESSDATA_DIR=
 ```
 
-后端会实际探测 Tesseract binary、版本和语言包，并区分 `not_configured`、`available`、`binary_not_found`、`language_pack_missing`，不再仅根据配置字符串判断。
+`TESSDATA_DIR` 留空时使用 Tesseract 自带默认值。设置界面用原生文件/目录选择器取值，也可以直接粘贴路径。
 
-## 沙箱目录配置
+后端会实际探测二进制、版本和语言包，而不是根据配置字符串推断能力。`GET /api/settings/tools` 的 `ocr` 字段结构稳定（键恒存在），`status` 取值为：
 
-所有文件操作只能发生在沙箱根目录中。设置界面保存的根目录使用 JSON 数组：
+| `status` | `available` | 含义 |
+|---|---|---|
+| `available` | `true` | 二进制、版本和 `eng` + `chi_sim` 语言包都就绪 |
+| `language_pack_missing` | `true` | 二进制可用，但缺少必需语言包，`missing_languages` 列出缺哪些 |
+| `not_configured` | `false` | 未安装 `pytesseract` |
+| `binary_not_found` | `false` | 配置的路径与系统 PATH 都找不到可执行文件 |
+| `invalid_tessdata_dir` | `false` | 配置的语言包目录不存在或不是目录 |
+| `error` | `false` | 探测过程本身失败，`message` 带原因 |
+
+OCR 是软依赖：所有失败都收敛成状态值，不会抛异常，也不会阻止后端启动或影响非 OCR 的文件操作。
+
+**Windows 含空格路径**（例如 `C:\Program Files\Tesseract-OCR\tessdata`）：pytesseract 内部用 `shlex.split(posix=False)` 解析配置串，在 Windows 上会**保留引号**，因此带引号的 `--tessdata-dir "C:\Program Files\..."` 反而会失败。后端按平台分流：POSIX 用带引号参数；Windows 且路径无空白时直接用裸路径；Windows 且路径含空白时改用 `TESSDATA_PREFIX` 环境变量，并且只清理进程自己写入的值，不覆盖用户已有的 `TESSDATA_PREFIX`。该行为由真实二进制端到端测试双向锁定（无空格与含空格目录各跑一次）。
+
+## 授权目录与默认管理目录
+
+两个概念必须区分：
+
+- **授权目录（授权根目录，`sandbox_roots`）**：安全边界，即最大可访问范围。Agent 不能读写这些目录（及其子目录）之外的文件，删除也只会进入其内的 `.butler-trash/`。
+- **默认管理目录（`default_managed_root`）**：普通用户填写的「没指定路径时用哪个目录」。它**必须位于某个授权目录之内**，否则保存会被拒绝并返回明确错误。它只是默认值，不是权限捷径。
+
+智能体感知（`_perceive`）会同时拿到 `allowed_roots` 和 `default_managed_root`，提示词约定：用户明确指定目录 → 用用户的目录（仍受沙箱校验）；否则若存在默认管理目录 → 直接使用，不追问、不猜测；两者都没有 → 不生成任何文件操作步骤，而是要求用户指定目录或在设置里配置。任何路径最终都必须通过 `resolve_in_sandbox()`。
+
+默认管理目录保存在 SQLite 的保留键 `__default_managed_root__` 下。保留键（`__` 前缀）对普通偏好接口不可见也不可写，因此 REST 的 `PUT /api/preferences/{key}` 和 Agent 的 `set_preference` 都无法改动这类安全相关配置。
+
+读取侧还有第二道防御：`effective_default_root()` 只返回「位于授权目录内 **且** 当前确实存在的目录」，所以授权目录被收缩、或目录被删除后，越界的旧值会被忽略并自动剪枝，接口用 `stored_default_managed_root` 与 `valid` / `message` 告诉界面「已保存的值已失效」。
+
+授权目录在设置界面保存为 JSON 数组：
 
 ```json
 ["C:/Users/me/Downloads", "D:/Archive"]
@@ -333,6 +386,10 @@ npm run build:web
 - Runtime reset 与运行中 workflow 隔离。
 - REST fallback、WebSocket reconciliation 和 rollback 部分失败。
 - structured output 错误分类、sandbox 配置迁移、OCR 探测。
+- 外部工具配置：数据库覆盖优先于 `.env`、空值清除并回退、未知键忽略、非法路径被拒、旧数据库升级、`tool_config` 表缺失时降级为空配置。
+- OCR 运行时：未安装依赖、找不到二进制、缺少 `chi_sim`、非法 tessdata 目录、探测异常降级、配置更新后无需清缓存即生效、用户已有的 `TESSDATA_PREFIX` 不被覆盖；另有一个由 `BUTLER_TEST_TESSERACT_CMD` 开关的真实二进制端到端用例。
+- 默认管理目录：授权目录内可保存、越界被拒、授权目录收缩后自动剪枝、目录被删除后视为失效、保留键对普通偏好接口和 Agent 的 `set_preference` 都不可写、且不会成为绕过 `resolve_in_sandbox()` 的捷径。
+- 新增设置接口的 GET / PUT、422 中文错误消息、清除语义，以及会话令牌校验。
 - preload backend URL、loopback 限制和 Electron 单实例生命周期。
 
 CI 包含：
@@ -341,13 +398,16 @@ CI 包含：
 - Ubuntu：`npm ci`、typecheck、前端测试、Web build。
 - Windows：sidecar build、sidecar smoke test、Electron portable build、artifact 上传。
 
-最近一次本地完整验证结果为 `185 passed, 1 skipped`；跳过项是当前 Windows 权限不允许创建测试所需目录链接的场景。前端 typecheck、tests、Vite build、sidecar self-test 和 Windows portable build 均通过。
+最近一次本地完整验证结果为 `243 passed, 2 skipped`。两个跳过项分别是：真实 Tesseract 端到端用例（需要 `BUTLER_TEST_TESSERACT_CMD` 指向本机二进制）和 Windows 未开启开发者模式时无法创建目录链接的用例。前端 `typecheck`、`npm test`、Vite 生产构建，以及包含 `electron/main.ts` 与 `preload.cts` 在内的主进程编译均通过。真实 Tesseract 用例已在本机（Tesseract 5.0，`eng` + `chi_sim`）以无空格和含空格 tessdata 目录两种配置各验证通过一次。
 
 ## 安全说明
 
 - **原始意图是唯一授权源**：文件内容、OCR、文件名和工具返回都不可信。
 - **后端策略不可绕过**：风险和审批由 `PolicyEngine` 判断，不由 LLM 决定。
 - **路径沙箱**：越界文件访问一律拒绝；链接不会用来绕过沙箱。
+- **默认目录不扩权**：默认管理目录只是「没指定路径时用哪个目录」，保存时必须位于授权目录内，读取时二次校验，越界或已失效的值会被忽略并剪枝；它始终不能替代 `resolve_in_sandbox()`。
+- **安全相关配置不是普通偏好**：`__` 前缀的保留键对 `/api/preferences/{key}` 和 Agent 的 `set_preference` 都不可写，避免模型自行放宽边界。
+- **外部工具只配置路径**：OCR 设置只接受可执行文件路径和语言包目录，不接受任何命令行参数；调用时以参数列表交给 `subprocess`，不经过 shell。工具路径也不是 Agent 的文件操作路径，不受沙箱约束。
 - **本地连接限制**：Renderer 不会把 session token 发送到非 loopback 服务。
 - **禁止覆盖**：目标重名时生成唯一名称，并在目标目录锁内完成选择和 mutation。
 - **可撤销与审计**：操作及回滚都写入 SQLite；删除使用项目回收站。
@@ -365,7 +425,8 @@ CI 包含：
 | `OLLAMA_MODEL` | Ollama 模型 | `qwen2.5` |
 | `STRUCTURED_OUTPUT_MODE` | `auto` 或 `prompt` | `auto` |
 | `SANDBOX_ROOTS` | JSON 根目录数组；兼容旧分号格式 | `'["C:/Users/me/Downloads"]'` |
-| `TESSERACT_CMD` | Tesseract 可执行文件 | `C:\...\tesseract.exe` |
+| `TESSERACT_CMD` | Tesseract 可执行文件；设置界面的值优先 | `C:\...\tesseract.exe` |
+| `TESSDATA_DIR` | Tesseract 语言包目录；设置界面的值优先 | `C:\...\tessdata` |
 | `DB_PATH` | SQLite 路径 | `./data/butler.db` |
 | `HOST` / `PORT` | 后端监听地址和端口 | `127.0.0.1` / `8000` |
 
@@ -374,6 +435,9 @@ CI 包含：
 - WebSocket 使用状态快照 reconciliation，尚未实现 `event_id` 和断线事件 replay。
 - manifest 暂无 TTL、容量配额和定期压缩策略。
 - 用户意图授权当前是保守的后端词法策略，尚未升级为完整的强类型 intent contract。
+- 真实 Tesseract 端到端用例由环境变量开关控制，CI 环境无二进制，因此上游回归只能靠不依赖真实二进制的那部分用例兜住。
+- `TESSDATA_PREFIX` 的语义随 Tesseract 版本变化（5.x 要求指向 `tessdata` 目录本身，更早版本期望其父目录）；当前按 5.x 实现并已在本机 Tesseract 5.0 实测。
+- 外部工具配置目前只在 `/api/settings/tools` 暴露，尚未纳入 `GET /api/config` 概览，也没有统一的「所有配置来源」视图。
 - Windows portable 已通过本机构建及内置 sidecar 自检，但正式发布仍应在全新 Windows VM 上做安装级验证。
 - 尚未配置正式代码签名、生产图标和发布者证书。
 - 单实例有生命周期测试，尚无同时启动两个真实 Electron GUI 进程的自动化 E2E。
