@@ -89,6 +89,11 @@ def init_db() -> None:
                     value TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS tool_config (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS scheduled_jobs (
                     job_id      TEXT PRIMARY KEY,
                     directory   TEXT NOT NULL,
@@ -282,6 +287,37 @@ def set_llm_config(values: dict[str, str]) -> None:
             else:
                 c.execute(
                     "INSERT INTO llm_config (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key, value),
+                )
+
+
+# ---------- 外部工具配置（前端可写，覆盖 .env 默认值） ----------
+
+def get_tool_config() -> dict[str, str]:
+    """返回所有已保存的外部工具配置覆盖项（键值对）。
+
+    表尚未建立时（例如只读探针在 init_db 之前调用 OCR 能力检测）返回空字典并记日志：
+    外部工具是软依赖，读不到配置只应降级为“用默认值”，不能反过来拖垮调用方。
+    """
+    try:
+        with _conn() as c:
+            rows = c.execute("SELECT key, value FROM tool_config").fetchall()
+    except sqlite3.OperationalError:
+        logger.warning("tool_config 表不可用，按未配置处理（外部工具将回退 .env / 系统默认）")
+        return {}
+    return {r["key"]: r["value"] for r in rows}
+
+
+def set_tool_config(values: dict[str, str]) -> None:
+    """批量写入 / 更新外部工具配置覆盖项。值为空字符串表示清除该覆盖。"""
+    with _conn() as c:
+        for key, value in values.items():
+            if value == "":
+                c.execute("DELETE FROM tool_config WHERE key=?", (key,))
+            else:
+                c.execute(
+                    "INSERT INTO tool_config (key, value) VALUES (?, ?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     (key, value),
                 )

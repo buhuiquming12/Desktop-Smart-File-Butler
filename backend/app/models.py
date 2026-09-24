@@ -42,6 +42,17 @@ class SandboxSettingsUpdate(BaseModel):
     roots: List[str] = Field(default_factory=list, max_length=50)
 
 
+class ToolSettingsUpdate(BaseModel):
+    """前端保存外部工具路径（OCR 等）。字段留空表示不修改；显式传空字符串表示清除覆盖、回退 .env。"""
+    tesseract_cmd: Optional[str] = Field(default=None, max_length=500)
+    tessdata_dir: Optional[str] = Field(default=None, max_length=500)
+
+
+class WorkspaceSettingsUpdate(BaseModel):
+    """前端保存默认管理目录（Agent 在未指定路径时默认操作的位置）。空串表示清除。"""
+    default_managed_root: str = Field(default="", max_length=500)
+
+
 class LLMModelsRequest(BaseModel):
     """探测某个 OpenAI 兼容 / Ollama 服务的可用模型列表。
 

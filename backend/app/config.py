@@ -31,8 +31,10 @@ class Settings(BaseSettings):
     # 安全沙箱：用 ; 分隔的目录列表
     sandbox_roots: str = ""
 
-    # OCR
+    # OCR：可执行文件与语言包目录；均可留空，留空时按系统 PATH / Tesseract 默认查找。
+    # 前端设置界面保存的值（存 SQLite）优先于这里的 .env 默认值。
     tesseract_cmd: str = ""
+    tessdata_dir: str = ""
 
     # 存储
     db_path: str = "./data/butler.db"

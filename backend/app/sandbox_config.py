@@ -17,6 +17,9 @@ from typing import List
 
 from . import db
 from .config import get_settings
+from .logging_conf import get_logger
+
+logger = get_logger(__name__)
 
 ROOTS_KEY = "__sandbox_roots__"
 
@@ -74,4 +77,10 @@ def save_roots(paths: List[str]) -> List[str]:
     db.set_preference(
         ROOTS_KEY, json.dumps(unique, ensure_ascii=False), allow_reserved=True
     )  # 空串表示清除，回退 .env
+    # 授权目录收紧后，默认管理目录可能已经越界：就地清除，避免界面显示一个已失效的值
+    # （读取侧 effective_default_root 也会再拦一道，见 workspace_config）。
+    from .workspace_config import prune_out_of_bounds  # 局部导入避免循环引用
+
+    if prune_out_of_bounds():
+        logger.info("授权目录变更：默认管理目录越界，已清除")
     return unique

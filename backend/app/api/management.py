@@ -7,7 +7,7 @@ from typing import Any, Callable, Dict
 import httpx
 from fastapi import APIRouter, HTTPException, Query, status
 
-from .. import db, llm_config, sandbox_config
+from .. import db, external_tools_config, llm_config, sandbox_config, workspace_config
 from ..config import get_settings
 from ..models import (
     JobCreate,
@@ -16,6 +16,8 @@ from ..models import (
     PreferenceUpdate,
     SandboxSettingsUpdate,
     ScheduledJob,
+    ToolSettingsUpdate,
+    WorkspaceSettingsUpdate,
 )
 from ..security import SandboxViolation, resolve_in_sandbox
 from ..tools import extract, filesystem, scheduler
@@ -70,6 +72,60 @@ def build_management_router(reset_runtime: Callable[[], None]) -> APIRouter:
         except sandbox_config.InvalidSandboxRoot as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return sandbox_settings()
+
+    def workspace_settings() -> Dict[str, Any]:
+        """默认管理目录当前状态；stored 与生效值分开返回，便于界面提示“已失效”。"""
+        stored = workspace_config.stored_default_root()
+        effective = workspace_config.effective_default_root()
+        message = ""
+        if stored is not None and effective is None:
+            message = "已保存的默认管理目录不在授权目录内或已不存在，请重新选择。"
+        return {
+            "default_managed_root": str(effective) if effective else "",
+            "stored_default_managed_root": str(stored) if stored else "",
+            "valid": effective is not None,
+            "message": message,
+            "allowed_roots": [str(path) for path in sandbox_config.effective_roots()],
+        }
+
+    @router.get("/settings/workspace")
+    def get_workspace_settings() -> Dict[str, Any]:
+        return workspace_settings()
+
+    @router.put("/settings/workspace")
+    def update_workspace_settings(body: WorkspaceSettingsUpdate) -> Dict[str, Any]:
+        try:
+            workspace_config.save_default_root(body.default_managed_root)
+        except workspace_config.InvalidDefaultRoot as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return workspace_settings()
+
+    def tool_settings() -> Dict[str, Any]:
+        """OCR 等外部工具路径的当前生效值 + 真实能力检测结果。"""
+        config = external_tools_config.get_effective_config()
+        return {
+            "tesseract_cmd": config.tesseract_cmd,
+            "tessdata_dir": config.tessdata_dir,
+            "sources": external_tools_config.sources(),
+            "ocr": extract.ocr_capability(),
+        }
+
+    @router.get("/settings/tools")
+    def get_tool_settings() -> Dict[str, Any]:
+        return tool_settings()
+
+    @router.put("/settings/tools")
+    def update_tool_settings(body: ToolSettingsUpdate) -> Dict[str, Any]:
+        """保存外部工具路径；校验通过后立即用新配置重新检测能力（无需重启）。"""
+        provided = body.model_dump(exclude_unset=True)
+        try:
+            values = external_tools_config.validate_overrides(
+                {key: (value or "") for key, value in provided.items()}
+            )
+        except external_tools_config.InvalidToolConfig as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        external_tools_config.save_overrides(values)
+        return tool_settings()
 
     @router.get("/settings/llm")
     def get_llm_settings() -> Dict[str, Any]:

@@ -210,8 +210,12 @@ class AgentRuntime:
 
     def _perceive(self, state: AgentState) -> Dict[str, Any]:
         from ..sandbox_config import effective_roots
+        from ..workspace_config import effective_default_root
 
         roots = [str(p) for p in effective_roots()]
+        # 默认管理目录只是“用户没给路径时用哪个目录”，仍必须落在授权目录内；
+        # 越界时 effective_default_root() 返回 None（见 workspace_config）。
+        default_root = effective_default_root()
         preferences = [p.model_dump() for p in db.all_preferences()]
         history = [
             op.model_dump(mode="json") for op in db.recent_operations(limit=20)
@@ -219,6 +223,7 @@ class AgentRuntime:
         return {
             "perception": {
                 "allowed_roots": roots,
+                "default_managed_root": str(default_root) if default_root else "",
                 "preferences": preferences,
                 "recent_operations": history,
             },
