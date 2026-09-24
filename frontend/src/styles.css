@@ -206,6 +206,22 @@ h3 { margin: 0; font-size: 15px; }
 .log-row > div { min-width: 0; }.log-row strong { font-size: 11px; }.log-row p { margin: 3px 0; overflow: hidden; text-overflow: ellipsis; color: #62697a; font-family: ui-monospace, monospace; font-size: 11px; white-space: nowrap; }.log-row small { color: #999fac; font-size: 11px; }
 .log-status { min-width: 42px; padding: 3px 5px; border-radius: 5px; color: #646b7b; background: #f0f1f4; font-size: 11px; font-weight: 800; text-align: center; text-transform: uppercase; }
 .log-status--ok { color: #247b5b; background: #e9f7f1; }.log-status--failed { color: #b43b46; background: #fff0f1; }.log-status--rejected { color: #a66b1f; background: #fff5e7; }
+/* 设置里的工具行：选择器按钮与说明文字并排，不撑满整行 */
+.button-row, .root-add { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; }
+.root-add input { flex: 1 1 220px; }
+.button-row .primary-button, .button-row .secondary-button, .button-row .text-button { justify-self: auto; }
+.button-row .muted { margin: 0; }
+/* OCR 能力检测结果：✓ 可用 / △ 部分可用 / × 不可用 */
+.ocr-status { display: grid; gap: 8px; padding: 13px 14px; border: 1px solid var(--line); border-radius: 10px; background: #fbfbfd; }
+.ocr-status strong { font-size: 11px; }
+.ocr-status--ok { border-color: #cdebdf; background: #f4fbf8; }.ocr-status--ok strong { color: #247b5b; }
+.ocr-status--warn { border-color: #f3e0c2; background: #fffaf1; }.ocr-status--warn strong { color: #a66b1f; }
+.ocr-status--bad { border-color: #f3cfd2; background: #fff6f7; }.ocr-status--bad strong { color: #b43b46; }
+.ocr-status .muted { margin: 0; }
+.ocr-langs { display: flex; flex-wrap: wrap; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.ocr-lang { padding: 3px 8px; border-radius: 6px; font-size: 11px; font-weight: 700; }
+.ocr-lang--ok { color: #247b5b; background: #e9f7f1; }
+.ocr-lang--missing { color: #b43b46; background: #fff0f1; }
 
 @keyframes pulse { 50% { opacity: .35; transform: scale(.85); } }
 @keyframes typing { 0%, 70%, 100% { transform: translateY(0); } 35% { transform: translateY(-3px); } }

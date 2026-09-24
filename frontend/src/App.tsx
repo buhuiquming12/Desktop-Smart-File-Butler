@@ -301,6 +301,8 @@ export function App() {
     preferences,
     llmSettings,
     sandboxSettings,
+    workspaceSettings,
+    toolSettings,
     jobs,
     logs,
     loading: settingsLoading,
@@ -311,6 +313,9 @@ export function App() {
     saveLLM,
     fetchModels,
     saveSandbox,
+    saveWorkspace,
+    saveTools,
+    refreshTools,
     savePreference,
     createJob,
     deleteJob,
@@ -631,6 +636,8 @@ export function App() {
         wsBase={wsBase}
         llmSettings={llmSettings}
         sandboxSettings={sandboxSettings}
+        workspaceSettings={workspaceSettings}
+        toolSettings={toolSettings}
         preferences={preferences}
         jobs={jobs}
         logs={logs}
@@ -640,6 +647,9 @@ export function App() {
         onSaveEndpoints={saveEndpoints}
         onSaveLLM={saveLLM}
         onSaveSandbox={saveSandbox}
+        onSaveWorkspace={saveWorkspace}
+        onSaveTools={saveTools}
+        onRefreshTools={refreshTools}
         onFetchModels={fetchModels}
         onSavePreference={savePreference}
         onCreateJob={createJob}

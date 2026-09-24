@@ -8,6 +8,8 @@ export interface DesktopBridge {
   backendUrl: string;
   /** 打开原生目录选择器，返回所选目录绝对路径；取消则返回 null（P1-3）。 */
   chooseDirectory: () => Promise<string | null>;
+  /** 打开原生文件选择器，返回所选文件绝对路径；取消则返回 null（OCR 可执行文件等）。 */
+  chooseFile: () => Promise<string | null>;
   /** 在系统文件管理器中定位文件/目录（仅本地绝对路径，主进程会校验，P2）。 */
   revealPath: (filePath: string) => Promise<boolean>;
   versions: Readonly<{
@@ -31,6 +33,7 @@ const desktopBridge: DesktopBridge = Object.freeze({
   sessionToken: session.token ?? '',
   backendUrl: session.backendUrl ?? '',
   chooseDirectory: () => ipcRenderer.invoke('butler:choose-directory') as Promise<string | null>,
+  chooseFile: () => ipcRenderer.invoke('butler:choose-file') as Promise<string | null>,
   revealPath: (filePath: string) => ipcRenderer.invoke('butler:reveal-path', filePath) as Promise<boolean>,
   versions: Object.freeze({
     electron: process.versions.electron,

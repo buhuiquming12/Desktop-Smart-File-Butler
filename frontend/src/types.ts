@@ -157,6 +157,60 @@ export interface SandboxSettings {
   env_roots: string[];
 }
 
+/** 默认管理目录：Agent 在用户未指定路径时默认操作的位置（必须位于授权目录内）。 */
+export interface WorkspaceSettings {
+  /** 当前生效的默认管理目录；未配置或已失效时为空串。 */
+  default_managed_root: string;
+  /** 数据库里保存的值（可能已越界/已删除，仅用于提示“已失效”）。 */
+  stored_default_managed_root: string;
+  valid: boolean;
+  /** 失效原因（人话，可为空）。 */
+  message: string;
+  allowed_roots: string[];
+}
+
+export interface WorkspaceSettingsUpdate {
+  /** 空串表示清除默认管理目录。 */
+  default_managed_root: string;
+}
+
+/** 某个外部工具配置项的生效来源：界面保存的覆盖项 / .env 默认值。 */
+export type ToolConfigSource = 'database' | 'env';
+
+export type OCRStatus =
+  | 'available'
+  | 'not_configured'
+  | 'binary_not_found'
+  | 'language_pack_missing'
+  | 'invalid_tessdata_dir'
+  | 'error';
+
+/** OCR 能力检测结果（后端 ocr_capability()，键恒定存在）。 */
+export interface OCRCapability {
+  status: OCRStatus;
+  available: boolean;
+  version: string;
+  languages: string[];
+  missing_languages: string[];
+  tesseract_cmd: string;
+  tessdata_dir: string;
+  message: string;
+}
+
+/** 外部工具（当前含 Tesseract）路径设置 + 实时能力检测。 */
+export interface ToolSettings {
+  tesseract_cmd: string;
+  tessdata_dir: string;
+  sources: Partial<Record<'tesseract_cmd' | 'tessdata_dir', ToolConfigSource>>;
+  ocr: OCRCapability;
+}
+
+export interface ToolSettingsUpdate {
+  /** 留空表示不修改；显式传空字符串表示清除覆盖、回退 .env。 */
+  tesseract_cmd?: string;
+  tessdata_dir?: string;
+}
+
 /** 任务完成结构化摘要（后端 done 事件 payload.summary）。 */
 export interface TaskSummaryOperation {
   tool: string;
@@ -218,6 +272,8 @@ export interface DesktopBridge {
   sessionToken: string;
   backendUrl: string;
   chooseDirectory: () => Promise<string | null>;
+  /** 打开原生文件选择器（OCR 可执行文件等），取消返回 null。 */
+  chooseFile: () => Promise<string | null>;
   /** 在系统文件管理器中显示指定路径（仅本地绝对路径，经主进程参数校验后执行）。 */
   revealPath: (filePath: string) => Promise<boolean>;
   versions: { electron: string; chrome: string; node: string };

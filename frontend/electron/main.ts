@@ -273,6 +273,14 @@ ipcMain.handle('butler:choose-directory', async () => {
   return result.filePaths[0];
 });
 
+// 原生文件选择器（OCR 可执行文件等）。与目录选择器一样只回传一个绝对路径字符串，
+// 不接受渲染进程传入的过滤器 / 参数，也不向渲染进程暴露任何 Node API。
+ipcMain.handle('butler:choose-file', async () => {
+  const result = await dialog.showOpenDialog({ properties: ['openFile'], title: '选择文件' });
+  if (result.canceled || result.filePaths.length === 0) return null;
+  return result.filePaths[0];
+});
+
 async function boot(): Promise<void> {
   mainWindow = createWindow();  // 立即出窗，显示启动页
 

@@ -5,11 +5,16 @@ import type {
   LLMProvider,
   LLMSettings,
   LLMSettingsUpdate,
+  OCRCapability,
   OperationLog,
   Preference,
   SandboxSettings,
   ScheduledJob,
   StructuredOutputMode,
+  ToolSettings,
+  ToolSettingsUpdate,
+  WorkspaceSettings,
+  WorkspaceSettingsUpdate,
 } from '../types';
 
 export type SettingsTab = 'general' | 'model' | 'preferences' | 'schedules' | 'logs';
@@ -21,6 +26,8 @@ interface SettingsProps {
   wsBase: string;
   llmSettings: LLMSettings | null;
   sandboxSettings: SandboxSettings | null;
+  workspaceSettings: WorkspaceSettings | null;
+  toolSettings: ToolSettings | null;
   preferences: Preference[];
   jobs: ScheduledJob[];
   logs: OperationLog[];
@@ -30,6 +37,9 @@ interface SettingsProps {
   onSaveEndpoints: (apiBase: string, wsBase: string) => void;
   onSaveLLM: (update: LLMSettingsUpdate) => Promise<void>;
   onSaveSandbox: (roots: string[]) => Promise<void>;
+  onSaveWorkspace: (update: WorkspaceSettingsUpdate) => Promise<void>;
+  onSaveTools: (update: ToolSettingsUpdate) => Promise<void>;
+  onRefreshTools: () => Promise<void>;
   onFetchModels: (request: LLMModelsRequest) => Promise<LLMModelsResponse>;
   onSavePreference: (preference: Preference) => Promise<void>;
   onCreateJob: (job: Omit<ScheduledJob, 'job_id'>) => Promise<void>;
@@ -41,6 +51,47 @@ interface SettingsProps {
 /** move/rename/delete 且成功的操作可撤销（见 P1-1）。 */
 function isReversible(log: OperationLog): boolean {
   return (log.action === 'move' || log.action === 'rename' || log.action === 'delete') && log.status === 'ok';
+}
+
+/** OCR 必备语言包在界面上的展示名。 */
+const requiredOcrLanguages: Array<{ code: string; label: string }> = [
+  { code: 'eng', label: 'English' },
+  { code: 'chi_sim', label: '简体中文' },
+];
+
+const ocrLanguageLabels: Record<string, string> = {
+  eng: 'English',
+  chi_sim: '简体中文',
+  chi_sim_vert: '简体中文（竖排）',
+  chi_tra: '繁体中文',
+  osd: '方向检测',
+};
+
+function ocrLanguageLabel(code: string): string {
+  return ocrLanguageLabels[code] ?? code;
+}
+
+/** 把能力检测结果翻成一句话 + 语气（✓ 可用 / △ 部分可用 / × 不可用）。 */
+function ocrSummary(ocr: OCRCapability): { icon: string; tone: 'ok' | 'warn' | 'bad'; text: string } {
+  switch (ocr.status) {
+    case 'available':
+      return { icon: '✓', tone: 'ok', text: `Tesseract ${ocr.version} 已就绪` };
+    case 'language_pack_missing':
+      return {
+        icon: '△',
+        tone: 'warn',
+        text: `已找到 Tesseract ${ocr.version}，但缺少${ocr.missing_languages.map(ocrLanguageLabel).join('、')}语言包`,
+      };
+    case 'binary_not_found':
+      return { icon: '×', tone: 'bad', text: '未找到 Tesseract 可执行文件，请在上方选择 tesseract.exe' };
+    case 'invalid_tessdata_dir':
+      return { icon: '×', tone: 'bad', text: '语言包目录不存在或不是目录' };
+    case 'not_configured':
+      return { icon: '×', tone: 'bad', text: '未安装 pytesseract，本机无法使用 OCR' };
+    case 'error':
+    default:
+      return { icon: '×', tone: 'bad', text: 'OCR 检测失败' };
+  }
 }
 
 const tabs: Array<{ id: SettingsTab; label: string }> = [
@@ -134,6 +185,18 @@ export function Settings(props: SettingsProps) {
   const [savingSandbox, setSavingSandbox] = useState(false);
   const [manualRoot, setManualRoot] = useState('');
 
+  // 默认管理目录（未指定路径时 Agent 的落脚点）
+  const [managedRoot, setManagedRoot] = useState('');
+  const [savingManagedRoot, setSavingManagedRoot] = useState(false);
+  const [managedRootStatus, setManagedRootStatus] = useState<string | null>(null);
+
+  // OCR 外部工具路径
+  const [tesseractCmd, setTesseractCmd] = useState('');
+  const [tessdataDir, setTessdataDir] = useState('');
+  const [savingTools, setSavingTools] = useState(false);
+  const [checkingTools, setCheckingTools] = useState(false);
+  const [toolStatus, setToolStatus] = useState<string | null>(null);
+
   const addRoot = (dir: string): void => {
     const value = dir.trim();
     if (!value) return;
@@ -151,6 +214,64 @@ export function Settings(props: SettingsProps) {
       await props.onSaveSandbox(sandboxRoots);
     } finally {
       setSavingSandbox(false);
+    }
+  };
+
+  const pickManagedRoot = async (): Promise<void> => {
+    const chosen = await window.desktop?.chooseDirectory();
+    if (chosen) setManagedRoot(chosen);
+  };
+
+  const saveManagedRoot = async (): Promise<void> => {
+    setSavingManagedRoot(true);
+    setManagedRootStatus(null);
+    const value = managedRoot.trim();
+    try {
+      await props.onSaveWorkspace({ default_managed_root: value });
+      setManagedRootStatus(value ? '已保存：未指定路径时 Agent 会使用该目录' : '已清除默认管理目录');
+    } catch (error) {
+      setManagedRootStatus(error instanceof Error ? error.message : '保存失败');
+    } finally {
+      setSavingManagedRoot(false);
+    }
+  };
+
+  const pickTesseractCmd = async (): Promise<void> => {
+    const chosen = await window.desktop?.chooseFile();
+    if (chosen) setTesseractCmd(chosen);
+  };
+
+  const pickTessdataDir = async (): Promise<void> => {
+    const chosen = await window.desktop?.chooseDirectory();
+    if (chosen) setTessdataDir(chosen);
+  };
+
+  const saveTools = async (): Promise<void> => {
+    setSavingTools(true);
+    setToolStatus(null);
+    try {
+      await props.onSaveTools({
+        tesseract_cmd: tesseractCmd.trim(),
+        tessdata_dir: tessdataDir.trim(),
+      });
+      setToolStatus('已保存，并用新配置重新检测');
+    } catch (error) {
+      setToolStatus(error instanceof Error ? error.message : '保存失败');
+    } finally {
+      setSavingTools(false);
+    }
+  };
+
+  const recheckTools = async (): Promise<void> => {
+    setCheckingTools(true);
+    setToolStatus(null);
+    try {
+      await props.onRefreshTools();
+      setToolStatus('已重新检测');
+    } catch (error) {
+      setToolStatus(error instanceof Error ? error.message : '检测失败');
+    } finally {
+      setCheckingTools(false);
     }
   };
 
@@ -184,10 +305,25 @@ export function Settings(props: SettingsProps) {
   useEffect(() => {
     if (props.sandboxSettings) setSandboxRoots(props.sandboxSettings.roots);
   }, [props.sandboxSettings, props.open]);
+  useEffect(() => {
+    if (props.workspaceSettings) {
+      setManagedRoot(props.workspaceSettings.default_managed_root);
+    }
+  }, [props.workspaceSettings, props.open]);
+  useEffect(() => {
+    const settings = props.toolSettings;
+    if (!settings) return;
+    setTesseractCmd(settings.tesseract_cmd);
+    setTessdataDir(settings.tessdata_dir);
+  }, [props.toolSettings, props.open]);
 
   if (!props.open) return null;
 
   const apiKeySet = props.llmSettings?.openai_api_key_set ?? false;
+  const ocr = props.toolSettings?.ocr ?? null;
+  const ocrStatus = ocr ? ocrSummary(ocr) : null;
+  const toolSources = props.toolSettings?.sources;
+  const workspace = props.workspaceSettings;
 
   const fetchModels = async (): Promise<void> => {
     setFetchingModels(true);
@@ -290,8 +426,8 @@ export function Settings(props: SettingsProps) {
                 <p>Provider、模型名、Base URL 与 API Key 可在「模型配置」中修改。密钥仅保存在本地后端（<code>.env</code> 默认值或本地数据库覆盖项），保存后不会回传前端，也不会显示明文——界面只标记是否已配置。</p>
               </div>
               <div className="provider-card">
-                <strong>OCR 识别</strong>
-                <p>本地 OCR 负责图片与扫描件的文字提取。若环境未配置 Tesseract（<code>TESSERACT_CMD</code>），涉及提取图片文字的步骤会以「跳过」呈现，不影响其他文件操作；可在后端环境变量中配置后重新检查。</p>
+                <strong>OCR 文字识别（可选）</strong>
+                <p>图片与扫描件的文字提取依赖本机 Tesseract。下方「文件与工具」里可直接选择 Tesseract 程序与语言包目录，不必再手改 <code>.env</code>。</p>
               </div>
               <label>本地 REST API 地址<input value={apiBase} onChange={(event) => setApiBase(event.target.value)} placeholder="http://127.0.0.1:8000" /></label>
               <label>本地 WebSocket 地址<input value={wsBase} onChange={(event) => setWsBase(event.target.value)} placeholder="ws://127.0.0.1:8000" /></label>
@@ -299,16 +435,19 @@ export function Settings(props: SettingsProps) {
               {window.desktop && <p className="version-note">Electron {window.desktop.versions.electron} · {window.desktop.platform}</p>}
 
               <div className="section-divider" />
-              <div><h3>可操作的文件夹（沙箱根目录）</h3><p>Agent 只能读写这些文件夹内的文件，越界一律拒绝。</p></div>
+              <div><h3>文件管理</h3><p>文件管家只能访问授权目录及其子目录；没有明确指定路径时，则使用默认管理目录。</p></div>
+              <p className="muted">
+                授权目录决定文件管家能够访问哪些位置。默认管理目录用于没有明确指定路径时的文件整理任务。
+              </p>
               <div className="inline-error" role="note">
-                ⚠ 权限变更：新增目录会授权 Agent 移动、重命名、删除其中的文件。请只添加你信任 Agent 操作的目录。
+                ⚠ 权限变更：新增授权目录会允许 Agent 移动、重命名、删除其中的文件。请只添加你信任 Agent 操作的目录。
               </div>
               {props.sandboxSettings?.source === 'env' && sandboxRoots.length > 0 && (
                 <p className="muted">当前来自 .env 默认配置；保存后将改为界面配置覆盖。</p>
               )}
               <ul className="root-list">
                 {sandboxRoots.length === 0 ? (
-                  <li className="muted">未配置任何目录，所有文件操作都会被拒绝。</li>
+                  <li className="muted">未配置任何授权目录，所有文件操作都会被拒绝。</li>
                 ) : sandboxRoots.map((root) => (
                   <li key={root} className="root-row">
                     <code title={root}>{root}</code>
@@ -318,7 +457,7 @@ export function Settings(props: SettingsProps) {
                 ))}
               </ul>
               {window.desktop ? (
-                <button className="secondary-button" type="button" onClick={() => void pickDirectory()}>选择目录…</button>
+                <button className="secondary-button" type="button" onClick={() => void pickDirectory()}>添加授权目录…</button>
               ) : (
                 <div className="root-add">
                   <input value={manualRoot} onChange={(event) => setManualRoot(event.target.value)} placeholder="输入目录的绝对路径" />
@@ -326,8 +465,95 @@ export function Settings(props: SettingsProps) {
                 </div>
               )}
               <button className="primary-button" type="button" disabled={savingSandbox} onClick={() => void saveSandbox()}>
-                {savingSandbox ? '保存中…' : '保存沙箱目录'}
+                {savingSandbox ? '保存中…' : '保存授权目录'}
               </button>
+
+              <div className="provider-card">
+                <strong>默认管理目录</strong>
+                <p>说“整理一下文件”“看看我的文件”而没有指定位置时，Agent 就在这个目录里工作。它必须位于上面的授权目录内。</p>
+              </div>
+              {workspace && !workspace.valid && workspace.message && (
+                <p className="muted">△ {workspace.message}</p>
+              )}
+              <label>默认管理目录
+                <input
+                  value={managedRoot}
+                  onChange={(event) => setManagedRoot(event.target.value)}
+                  placeholder="例如 D:\\Downloads"
+                />
+              </label>
+              <div className="button-row">
+                {window.desktop && (
+                  <button className="secondary-button" type="button" onClick={() => void pickManagedRoot()}>选择目录…</button>
+                )}
+                <button className="primary-button" type="button" disabled={savingManagedRoot} onClick={() => void saveManagedRoot()}>
+                  {savingManagedRoot ? '保存中…' : '保存默认管理目录'}
+                </button>
+                {managedRoot.trim() !== '' && (
+                  <button className="text-button" type="button" onClick={() => setManagedRoot('')}>清除</button>
+                )}
+              </div>
+              {managedRootStatus && <p className="muted">{managedRootStatus}</p>}
+
+              <div className="section-divider" />
+              <div><h3>OCR 文字识别</h3><p>可选：指定本机 Tesseract 程序与语言包目录。保存后立即生效，无需重启。</p></div>
+              <label>Tesseract 程序
+                <input
+                  value={tesseractCmd}
+                  onChange={(event) => setTesseractCmd(event.target.value)}
+                  placeholder="留空则使用系统 PATH 中的 tesseract"
+                />
+              </label>
+              <div className="button-row">
+                {window.desktop && (
+                  <button className="secondary-button" type="button" onClick={() => void pickTesseractCmd()}>选择文件…</button>
+                )}
+                {toolSources?.tesseract_cmd === 'env' && tesseractCmd === '' && (
+                  <span className="muted">当前走系统 PATH 查找</span>
+                )}
+              </div>
+              <label>语言包目录
+                <input
+                  value={tessdataDir}
+                  onChange={(event) => setTessdataDir(event.target.value)}
+                  placeholder="例如 C:\\Program Files\\Tesseract-OCR\\tessdata"
+                />
+              </label>
+              <div className="button-row">
+                {window.desktop && (
+                  <button className="secondary-button" type="button" onClick={() => void pickTessdataDir()}>选择目录…</button>
+                )}
+              </div>
+              <button className="primary-button" type="button" disabled={savingTools} onClick={() => void saveTools()}>
+                {savingTools ? '保存并检测中…' : '保存并检测'}
+              </button>
+
+              {ocrStatus && ocr && (
+                <div className={`ocr-status ocr-status--${ocrStatus.tone}`} role="status">
+                  <strong>{ocrStatus.icon} {ocrStatus.text}</strong>
+                  <ul className="ocr-langs">
+                    {requiredOcrLanguages.map((item) => {
+                      const has = ocr.languages.includes(item.code);
+                      return (
+                        <li key={item.code} className={has ? 'ocr-lang ocr-lang--ok' : 'ocr-lang ocr-lang--missing'}>
+                          {has ? '✓' : '×'} {item.label}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                  {ocr.languages.length > 0 && (
+                    <p className="muted">检测到的语言包：{ocr.languages.map(ocrLanguageLabel).join('、')}</p>
+                  )}
+                  {ocr.message && <p className="muted">{ocr.message}</p>}
+                  <div className="button-row">
+                    <button className="secondary-button" type="button" disabled={checkingTools}
+                      onClick={() => void recheckTools()}>
+                      {checkingTools ? '检测中…' : '重新检测'}
+                    </button>
+                  </div>
+                </div>
+              )}
+              {toolStatus && <p className="muted">{toolStatus}</p>}
             </div>
           )}
 

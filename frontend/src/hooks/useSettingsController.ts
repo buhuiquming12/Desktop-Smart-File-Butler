@@ -11,6 +11,10 @@ import type {
   Preference,
   SandboxSettings,
   ScheduledJob,
+  ToolSettings,
+  ToolSettingsUpdate,
+  WorkspaceSettings,
+  WorkspaceSettingsUpdate,
 } from '../types';
 
 export function useSettingsController(
@@ -22,6 +26,8 @@ export function useSettingsController(
   const [preferences, setPreferences] = useState<Preference[]>([]);
   const [llmSettings, setLLMSettings] = useState<LLMSettings | null>(null);
   const [sandboxSettings, setSandboxSettings] = useState<SandboxSettings | null>(null);
+  const [workspaceSettings, setWorkspaceSettings] = useState<WorkspaceSettings | null>(null);
+  const [toolSettings, setToolSettings] = useState<ToolSettings | null>(null);
   const [jobs, setJobs] = useState<ScheduledJob[]>([]);
   const [logs, setLogs] = useState<OperationLog[]>([]);
   const [loading, setLoading] = useState(false);
@@ -36,13 +42,25 @@ export function useSettingsController(
       api.getOperations(),
       api.getLLMSettings(),
       api.getSandboxSettings(),
+      api.getWorkspaceSettings(),
+      api.getToolSettings(),
     ]);
-    const [preferenceResult, jobResult, logResult, llmResult, sandboxResult] = results;
+    const [
+      preferenceResult,
+      jobResult,
+      logResult,
+      llmResult,
+      sandboxResult,
+      workspaceResult,
+      toolResult,
+    ] = results;
     if (preferenceResult.status === 'fulfilled') setPreferences(preferenceResult.value);
     if (jobResult.status === 'fulfilled') setJobs(jobResult.value);
     if (logResult.status === 'fulfilled') setLogs(logResult.value);
     if (llmResult.status === 'fulfilled') setLLMSettings(llmResult.value);
     if (sandboxResult.status === 'fulfilled') setSandboxSettings(sandboxResult.value);
+    if (workspaceResult.status === 'fulfilled') setWorkspaceSettings(workspaceResult.value);
+    if (toolResult.status === 'fulfilled') setToolSettings(toolResult.value);
     const rejected = results.find((result) => result.status === 'rejected');
     if (rejected?.status === 'rejected') {
       setError(rejected.reason instanceof Error ? rejected.reason.message : '部分数据加载失败');
@@ -81,12 +99,53 @@ export function useSettingsController(
     try {
       const saved = await api.updateSandboxSettings(roots);
       setSandboxSettings(saved);
+      // 授权目录收紧可能让默认管理目录越界（后端会就地清除），这里同步最新状态。
+      try {
+        setWorkspaceSettings(await api.getWorkspaceSettings());
+      } catch {
+        // 默认目录状态拿不到不影响授权目录已保存这一事实，交给下次 load() 兜底。
+      }
       void refreshSetupCheck();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '保存沙箱目录失败');
       throw reason;
     }
   }, [api, refreshSetupCheck]);
+
+  const saveWorkspace = useCallback(async (update: WorkspaceSettingsUpdate): Promise<void> => {
+    setError(null);
+    try {
+      const saved = await api.updateWorkspaceSettings(update);
+      setWorkspaceSettings(saved);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '保存默认管理目录失败');
+      throw reason;
+    }
+  }, [api]);
+
+  /** 保存 OCR / 外部工具路径；返回体已带保存后重新检测的能力结果。 */
+  const saveTools = useCallback(async (update: ToolSettingsUpdate): Promise<void> => {
+    setError(null);
+    try {
+      const saved = await api.updateToolSettings(update);
+      setToolSettings(saved);
+      void refreshSetupCheck();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '保存外部工具配置失败');
+      throw reason;
+    }
+  }, [api, refreshSetupCheck]);
+
+  /** 重新检测 OCR 能力（不修改配置）。 */
+  const refreshTools = useCallback(async (): Promise<void> => {
+    setError(null);
+    try {
+      setToolSettings(await api.getToolSettings());
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '重新检测 OCR 失败');
+      throw reason;
+    }
+  }, [api]);
 
   const savePreference = useCallback(async (preference: Preference): Promise<void> => {
     setError(null);
@@ -140,6 +199,8 @@ export function useSettingsController(
     preferences,
     llmSettings,
     sandboxSettings,
+    workspaceSettings,
+    toolSettings,
     jobs,
     logs,
     loading,
@@ -150,6 +211,9 @@ export function useSettingsController(
     saveLLM,
     fetchModels,
     saveSandbox,
+    saveWorkspace,
+    saveTools,
+    refreshTools,
     savePreference,
     createJob,
     deleteJob,

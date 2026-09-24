@@ -13,6 +13,10 @@ import type {
   SandboxSettings,
   RollbackSummary,
   ScheduledJob,
+  ToolSettings,
+  ToolSettingsUpdate,
+  WorkspaceSettings,
+  WorkspaceSettingsUpdate,
   WSEvent,
   ThreadState,
 } from '../types';
@@ -192,6 +196,23 @@ export class ApiClient {
 
   updateSandboxSettings(roots: string[]): Promise<SandboxSettings> {
     return this.request('/api/settings/sandbox', { method: 'PUT', body: JSON.stringify({ roots }) });
+  }
+
+  getWorkspaceSettings(): Promise<WorkspaceSettings> {
+    return this.request('/api/settings/workspace');
+  }
+
+  updateWorkspaceSettings(update: WorkspaceSettingsUpdate): Promise<WorkspaceSettings> {
+    return this.request('/api/settings/workspace', { method: 'PUT', body: JSON.stringify(update) });
+  }
+
+  /** OCR 等外部工具路径；返回体已包含保存后重新检测的能力结果。 */
+  getToolSettings(): Promise<ToolSettings> {
+    return this.request('/api/settings/tools');
+  }
+
+  updateToolSettings(update: ToolSettingsUpdate): Promise<ToolSettings> {
+    return this.request('/api/settings/tools', { method: 'PUT', body: JSON.stringify(update) });
   }
 }
 
