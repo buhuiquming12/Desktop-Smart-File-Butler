@@ -79,6 +79,7 @@ if (outcomeLabel('budget_exhausted') !== '预算耗尽') throw new Error('预算
 if (eventOutcome({ status: 'completed' }) !== 'success') throw new Error('旧后端无 outcome 时应按 completed 处理');
 if (taskStatusForOutcome('partial') !== 'partial') throw new Error('部分完成在看板上被标为成功');
 if (taskStatusForOutcome('budget_exhausted') !== 'partial') throw new Error('预算耗尽在看板上被标为成功');
+if (taskStatusForOutcome('unknown') !== 'partial') throw new Error('无法确认被误标为失败/成功');
 if (taskStatusForOutcome('success') !== 'success') throw new Error('成功状态映射错误');
 
 // 终态把仍在运行的任务改成 partial，而不是“完成”。

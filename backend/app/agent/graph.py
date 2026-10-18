@@ -30,7 +30,7 @@ from .checkpoints import (
     cleanup_checkpoints,
 )
 from .llm import build_llm, build_structured_llm
-from .outcome import evaluate_completion
+from .outcome import evaluate_completion, record_verification
 from .prompts import PLANNER_SYSTEM_PROMPT, REFLECTION_SYSTEM_PROMPT
 from .state import AgentState, PlanOutput, ReflectionOutput
 from .tool_executor import SUMMARY_CHUNK_CHARS, SUMMARY_MAX_CHUNKS, ToolExecutor
@@ -291,7 +291,9 @@ class AgentRuntime:
             "completion": {},
             "batch_approved": False,
             "batch_rejected": False,
-            "trusted_user_intent": state.get("user_request", ""),
+            # 授权文本由 start_stream 决定（澄清续问会合并上一轮意图），perceive
+            # 不能再把它重置成“本轮最后一条消息”，否则澄清后的授权会被抹掉。
+            "trusted_user_intent": state.get("trusted_user_intent") or state.get("user_request", ""),
             "untrusted_file_data": [],
             "tool_observations": [],
             "mutations": state.get("mutations") or {"move": 0, "rename": 0, "delete": 0},
@@ -499,6 +501,8 @@ class AgentRuntime:
             steps = [step.model_dump() for step in result.steps[:_MAX_PLAN_STEPS]]
             trace = self._trace_update(state, model_calls=1)
             if not steps:
+                # 空计划没有执行任何工具，也就没有任何可验证的后置条件：
+                # 既不能宣称“目标完成”，也不能声称失败，只能是 unknown。
                 completion = evaluate_completion(
                     {
                         **state,
@@ -506,6 +510,7 @@ class AgentRuntime:
                         "step_index": 0,
                     },
                     stop_reason="no_operations",
+                    forced_outcome="unknown" if not state.get("observations") else None,
                 )
                 return {
                     "plan": [],
@@ -686,14 +691,19 @@ class AgentRuntime:
             }
 
         with db.operation_thread(state.get("thread_id")):
-            observation = self._execute_step(step)
+            executor = self._tools()
+            observation = record_verification(executor.execute(step))
+            # 摘要/分类工具内部也会调用模型，必须计入本次运行预算。
+            inner_model_calls = executor.consume_model_calls()
         update = {
             "current_step": current,
             "observations": [*state.get("observations", []), observation],
             "tool_observations": [*state.get("tool_observations", []), _summarize_observation(observation)],
             "step_index": index + 1,
             "status": "running",
-            "run_trace": self._trace_update(state, tool_calls=1),
+            "run_trace": self._trace_update(
+                state, tool_calls=1, model_calls=inner_model_calls
+            ),
         }
         if tool in {"scan_directory", "extract_text", "classify_file"}:
             update["untrusted_file_data"] = [
@@ -731,9 +741,12 @@ class AgentRuntime:
             "args": pending["args"],
         }
         thread_id = state.get("thread_id")
+        inner_model_calls = 0
         if approved:
             with db.operation_thread(thread_id):
-                observation = self._execute_step(step)
+                executor = self._tools()
+                observation = record_verification(executor.execute(step))
+                inner_model_calls = executor.consume_model_calls()
         else:
             db.log_operation(
                 pending["action"], pending["target"], "rejected",
@@ -749,7 +762,9 @@ class AgentRuntime:
             "step_index": state.get("step_index", 0) + 1,
             "status": "running",
             "run_trace": self._trace_update(
-                state, tool_calls=1 if approved else 0
+                state,
+                tool_calls=1 if approved else 0,
+                model_calls=inner_model_calls,
             ),
         }
         # 批量审批：记住决定，使同一计划里后续 move/rename 步骤不再逐条弹窗（P1-2）。
@@ -989,6 +1004,17 @@ class AgentRuntime:
         run_id = uuid.uuid4().hex
         # Token 用量是“本次运行”的统计，不能把上一轮的用量累加进新 run。
         tracing.clear(thread_id)
+        # 澄清是同一目标的延续：用户这轮往往只补充“哪个目录”，不会重复操作动词。
+        # 只有上一轮确实停在 needs_clarification 时才沿用原授权；已完成/失败/取消的
+        # 请求不延伸授权，新消息必须自己构成授权依据。
+        prior_intent = ""
+        if previous.get("status") == "needs_clarification":
+            prior_intent = str(previous.get("trusted_user_intent") or "").strip()
+        trusted_intent = (
+            f"{prior_intent}\n{message}".strip()
+            if prior_intent and prior_intent != message.strip()
+            else message
+        )
         conversation = list(previous.get("conversation") or [])
         conversation.append({"role": "user", "content": message, "run_id": run_id})
         conversation = conversation[-20:]
@@ -1015,7 +1041,7 @@ class AgentRuntime:
             "reflection": {},
             "batch_approved": False,
             "batch_rejected": False,
-            "trusted_user_intent": message,
+            "trusted_user_intent": trusted_intent,
             "untrusted_file_data": [],
             "tool_observations": [],
             "mutations": {"move": 0, "rename": 0, "delete": 0},

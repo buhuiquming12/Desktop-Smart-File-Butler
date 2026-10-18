@@ -9,7 +9,7 @@
 ## 求职与设计文档
 
 - [系统架构与设计说明](docs/ARCHITECTURE.md)：系统组件、Agent 流程、安全边界、状态恢复、并发与桌面发布架构。
-- [Agent 固定场景清单](docs/AGENT_SCENARIOS.md)：21 个可重复验证场景（初始文件 → 用户输入 → 预期行为 → 最终断言 → 对应测试）。
+- [Agent 固定场景清单](docs/AGENT_SCENARIOS.md)：25 个可重复验证场景（初始文件 → 用户输入 → 预期行为 → 最终断言 → 对应测试）。
 - [简历项目描述](docs/RESUME.md)：推荐简历版本、后端岗位版、AI Agent 岗位版与 30 秒 / 1 分钟口述稿。
 - [面试问答](docs/INTERVIEW_GUIDE.md)：围绕架构、Manifest、PolicyEngine、Prompt Injection、并发、恢复、Runtime、Electron 和 CI 的项目追问。
 
@@ -84,8 +84,9 @@ Agent 状态明确区分：
 | `cancelled` | 用户取消 | 已完成操作保留，可撤销 |
 | `budget_exhausted` | 重规划或运行预算耗尽 | 说明未完成内容与停止原因 |
 | `needs_clarification` | 需要用户补充信息 | 零文件变更 |
+| `unknown` | 空计划/无可验证后置条件 | 不宣称完成 |
 
-统计口径分开：`ok/failed/skipped` 是工具调用次数；`files_ok/files_failed/files_skipped/matched` 是文件级结果。校验动作只读元数据，不会产生新的文件变更。
+统计口径分开：`ok/failed/skipped` 是工具调用次数；`files_ok/files_failed/files_skipped/matched` 是文件级结果。校验动作只读元数据，不会产生新的文件变更；后置条件在工具刚执行完时记录，因此 `A→B` 再 `B→C` 这类连续操作不会因为中间路径已不存在而被误判为部分完成。
 
 ## 批量执行与扫描语义
 
@@ -181,7 +182,7 @@ Planner 随后生成规则，而不是枚举数百条文件路径：
 | `agent_model_timeout_seconds` | 60 | 单次模型请求超时 |
 | `batch_approval_threshold` | 20 | 请求级累计审批阈值 |
 
-供应商提供 Token usage 时记录到 `usage`；不提供时标记 `source: unknown`，不会伪造成 0。取消与超时只在节点/步骤边界生效；已完成的步骤保留，失败的工具调用不会自动重试。
+供应商提供 Token usage 时记录到 `usage`；不提供时标记 `source: unknown`，不会伪造成 0。`model_calls` 也包含摘要/分类工具内部的模型调用。取消与超时只在节点/步骤边界生效；已完成的步骤保留，失败的工具调用不会自动重试。
 
 ## 目录结构
 
@@ -433,6 +434,9 @@ npm run build:web
 - 工具契约：未知工具、缺失参数、多余字段都在文件系统访问前显式失败。
 - 扫描摘要保留 `scan_id`/`scanned_count`/`truncated`/`reason`/完整统计；截断原因同时到达规划器与用户。
 - 完成判定：10 项成功 8 项时返回 `partial` 而非全部成功；校验只读、不产生新变更；重规划上限说明未完成内容。
+- 空计划返回 `unknown` 而不是成功；`A→B→C` 连续操作不会因中间路径消失被判为部分完成。
+- 澄清续问只回目录时仍沿用上一轮授权；已完成请求不会为下一条消息背书。
+- 摘要/分类工具内部的模型调用计入运行预算。
 - 多轮：澄清、引用上一轮扫描、修改目标、跨会话隔离、旧扫描失效重新核验；历史审批不授权新请求。
 - 运行追踪与预算：节点耗时/模型调用/停止原因、Token unknown 标记、模型调用上限、等待审批不耗预算。
 - 文件内容 Prompt Injection 不能触发未授权 mutation。
@@ -455,7 +459,7 @@ CI 包含：
 - Ubuntu：`npm ci`、typecheck、前端测试、Web build。
 - Windows：sidecar build、sidecar smoke test、Electron portable build、artifact 上传。
 
-最近一次本地完整验证结果为 `289 passed, 2 skipped`（后端）。两个跳过项分别是：真实 Tesseract 端到端用例（需要 `BUTLER_TEST_TESSERACT_CMD` 指向本机二进制）和 Windows 未开启开发者模式时无法创建目录链接的用例。前端 `typecheck`、`npm test`、Vite 生产构建，以及包含 `electron/main.ts` 与 `preload.cts` 在内的主进程编译均通过。真实 Tesseract 用例已在本机（Tesseract 5.0，`eng` + `chi_sim`）以无空格和含空格 tessdata 目录两种配置各验证通过一次。真实模型的多轮对话评测需要配置模型，本次未运行。
+最近一次本地完整验证结果为 `294 passed, 2 skipped`（后端）。两个跳过项分别是：真实 Tesseract 端到端用例（需要 `BUTLER_TEST_TESSERACT_CMD` 指向本机二进制）和 Windows 未开启开发者模式时无法创建目录链接的用例。前端 `typecheck`、`npm test`、Vite 生产构建，以及包含 `electron/main.ts` 与 `preload.cts` 在内的主进程编译均通过。真实 Tesseract 用例已在本机（Tesseract 5.0，`eng` + `chi_sim`）以无空格和含空格 tessdata 目录两种配置各验证通过一次。真实模型的多轮对话评测需要配置模型，本次未运行。
 
 ## 安全说明
 

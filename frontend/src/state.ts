@@ -39,7 +39,10 @@ export function taskStatus(value: unknown): TaskStatus {
 /** 终态事件对应的任务看板状态：只有 success 才显示“完成”。 */
 export function taskStatusForOutcome(outcome: TaskOutcome): TaskStatus {
   if (outcome === 'success') return 'success';
-  if (outcome === 'partial' || outcome === 'budget_exhausted') return 'partial';
+  if (outcome === 'partial' || outcome === 'budget_exhausted' || outcome === 'unknown' || outcome === 'needs_clarification') {
+    // “未完成”比“失败”更准确：目标没被验证，但也没有证据说明它失败。
+    return 'partial';
+  }
   return 'failed';
 }
 

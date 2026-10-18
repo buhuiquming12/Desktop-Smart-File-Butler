@@ -9,7 +9,7 @@
 ```powershell
 cd backend
 python -m pytest -q tests/test_scenarios.py tests/test_tool_contracts.py tests/test_context_handoff.py `
-  tests/test_completion.py tests/test_multiturn.py tests/test_runtime_budget.py
+  tests/test_completion.py tests/test_multiturn.py tests/test_runtime_budget.py tests/test_review_regressions.py
 ```
 
 ## 速查表
@@ -37,6 +37,10 @@ python -m pytest -q tests/test_scenarios.py tests/test_tool_contracts.py tests/t
 | 19 | 恢复 | 重启后待审批仍在 | `test_checkpoint_persistence.py::test_pending_approval_survives_new_runtime` |
 | 20 | 预算耗尽 | 模型调用上限触发、说明原因 | `test_runtime_budget.py::test_model_call_limit_stops_with_budget_outcome` |
 | 21 | 偏好记忆 | 可查看/更新/删除，保留键不可删 | `test_multiturn.py::test_preference_can_be_viewed_updated_deleted` |
+| 22 | 空计划 | outcome=unknown，不宣称完成 | `test_review_regressions.py::test_empty_plan_is_not_reported_as_success` |
+| 23 | 连续移动 A→B→C | 中间路径消失也不误判 | `test_review_regressions.py::test_chained_moves_are_not_partial` |
+| 24 | 澄清只回路径 | 沿用上一轮授权 | `test_review_regressions.py::test_clarification_answer_keeps_original_authorization` |
+| 25 | 摘要工具内部调用 | 计入 model_calls 与预算 | `test_review_regressions.py::test_summary_tool_model_calls_are_counted` |
 
 ## 场景细节
 
@@ -197,10 +201,39 @@ python -m pytest -q tests/test_scenarios.py tests/test_tool_contracts.py tests/t
   `__` 前缀保留键既不可写也不可删。
 - 最终断言：更新覆盖旧值、删除后读不到、删除保留键抛 `ValueError`。
 
-## 手动演示（真实模型，可重复）
+### 22. 空计划
 
-> 前置：在设置界面配置模型与一个**测试专用授权目录**（例如 `D:\butler-demo`），
-> 不要用真实个人目录。演示目录里的文件由下面的脚本生成。
+- 初始文件：任意目录。
+- 用户输入：`把 download 里的 PDF 移到 PDF 文件夹`，但模型返回空计划。
+- 预期行为：没有执行任何工具，就没有可验证的后置条件；结论只能是 `unknown`。
+- 最终断言：`status=completed`、`outcome!=success`、`stop_reason=no_operations`、
+  `completion.verified=false`。
+
+### 23. 连续移动
+
+- 初始文件：`a.txt`。
+- 用户输入：`把 a.txt 移动两次做归档`
+- 预期行为：`A→B` 再 `B→C`，两条观察各自在执行当下被验证为成功。
+- 最终断言：两步都 `ok`，`final/a.txt` 存在，`outcome=success`（中间路径 B 已消失
+  不应导致部分完成）。
+
+### 24. 澄清只回路径
+
+- 初始文件：`downloads/` 3 个 PDF。
+- 第一轮：`帮我整理一下文件` → 澄清；第二轮：只回复目录路径（不含操作动词）。
+- 预期行为：仅在上一轮为 `needs_clarification` 时合并原意图；移动仍被授权。
+- 最终断言：无 `未授权 move` 失败，3 个 PDF 进入目标目录。
+- 反向断言（`test_completed_run_does_not_lend_authorization_to_next_message`）：
+  上一轮已完成时，下一条只给路径的消息不继承旧授权。
+
+### 25. 摘要工具的模型调用
+
+- 初始文件：约 24k 字符的 `doc.txt`。
+- 用户输入：`给 doc.txt 生成摘要`
+- 预期行为：`write_summary` 内部 2 次分段 + 1 次归并调用模型，全部计入运行预算。
+- 最终断言：`run_trace.model_calls >= 5`（planning 1 + reflecting 1 + 摘要 3）。
+
+## 手动演示（真实模型，可重复）
 
 1. 生成演示文件（PowerShell）：
 
@@ -252,3 +285,4 @@ python -m pytest -q tests/test_scenarios.py tests/test_tool_contracts.py tests/t
 - 不使用真实个人文件做破坏性测试；所有文件都在 pytest 临时目录中生成。
 - 真实模型评测独立进行：需要 `.env` 或设置界面配置模型；未配置时只运行上述确定性测试。
 - 不把“模型说完成”当作完成；完成度只由 `agent/outcome.py` 的确定性校验给出。
+- 不把“没有步骤”当作成功：空计划一律是 `unknown`。

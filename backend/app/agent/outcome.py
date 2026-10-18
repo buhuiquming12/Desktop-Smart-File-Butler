@@ -53,6 +53,38 @@ def _result_paths_exist(result: Any) -> tuple[bool, str]:
 
 
 def _verify_observation(obs: Dict[str, Any]) -> Dict[str, Any]:
+    """返回该观察的校验结论。
+
+    优先使用工具刚执行完时记录的结论（``verification``）：连续操作 ``A→B`` 再
+    ``B→C`` 会让中间结果在任务结束时已不存在，若那时才检查，合法操作会被判成
+    失败。只有旧观察（没有记录）才回退到“此刻”的只读检查。
+    """
+    recorded = obs.get("verification")
+    if isinstance(recorded, dict) and recorded.get("status"):
+        return {
+            "step_id": obs.get("step_id"),
+            "tool": str(obs.get("tool") or ""),
+            "status": str(recorded.get("status")),
+            "detail": str(recorded.get("detail") or ""),
+            "recorded": True,
+        }
+    return _verify_live(obs)
+
+
+def record_verification(obs: Dict[str, Any]) -> Dict[str, Any]:
+    """工具刚执行完时立即记录后置条件，随观察一起持久化。
+
+    校验仍然只读；它只回答“在操作完成的那一刻，结果是否成立”。调用方负责在
+    执行后立刻调用一次，避免把中间状态当成最终状态。
+    """
+    if str(obs.get("status") or "") != "ok":
+        return obs
+    if isinstance(obs.get("verification"), dict):
+        return obs
+    return {**obs, "verification": _verify_live(obs)}
+
+
+def _verify_live(obs: Dict[str, Any]) -> Dict[str, Any]:
     tool = str(obs.get("tool") or "")
     status = str(obs.get("status") or "")
     check: Dict[str, Any] = {
@@ -334,6 +366,9 @@ def completion_message(
             f"任务失败：{files}；{calls}{reason_text}{pending}。"
             "如已有文件被修改，可在操作日志中查询或撤销。"
         )
+    if not stats.get("tool_calls"):
+        # 空计划 / 纯问答：没有任何可验证的后置条件，不能声称完成。
+        return "未执行任何文件操作，无法验证目标是否完成。"
     return f"任务结束，但完成状态无法确认：{files}；{calls}{reason_text}{pending}。"
 
 
