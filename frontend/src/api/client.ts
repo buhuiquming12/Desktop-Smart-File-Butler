@@ -150,6 +150,10 @@ export class ApiClient {
     });
   }
 
+  deletePreference(key: string): Promise<unknown> {
+    return this.request(`/api/preferences/${encodeURIComponent(key)}`, { method: 'DELETE' });
+  }
+
   getOperations(): Promise<OperationLog[]> {
     return this.request('/api/operations');
   }
@@ -239,8 +243,13 @@ export function reconciliationEvents(threadId: string, state: ThreadState): WSEv
   if (state.pending_approval) events.push({ type: 'approval_required', thread_id: threadId, payload: state.pending_approval });
   if (['completed', 'failed', 'cancelled'].includes(state.status)) {
     events.push({ type: 'done', thread_id: threadId, payload: {
-      status: state.status, message: state.final_response ?? '', error: state.error ?? '',
+      status: state.status,
+      // 重连恢复同样要保留“流程终止 ≠ 目标完成”的区分。
+      outcome: state.outcome ?? '',
+      stop_reason: state.stop_reason ?? '',
+      message: state.final_response ?? '', error: state.error ?? '',
       observations: state.observations ?? [], summary: state.summary,
+      run_id: state.run_id ?? '', usage: state.usage,
     } });
   }
   return events;

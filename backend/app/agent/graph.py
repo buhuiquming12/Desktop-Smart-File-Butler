@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from typing import Any, Dict, Iterable, Literal, Optional
 
@@ -21,6 +22,7 @@ from ..logging_conf import get_logger
 from ..security import resolve_in_sandbox
 from ..tools import manifests
 from ..policy import PolicyEngine
+from . import tracing
 from .checkpoints import (
     _UUID_EPOCH,
     build_checkpointer as _build_checkpointer,
@@ -28,18 +30,22 @@ from .checkpoints import (
     cleanup_checkpoints,
 )
 from .llm import build_llm, build_structured_llm
+from .outcome import evaluate_completion
 from .prompts import PLANNER_SYSTEM_PROMPT, REFLECTION_SYSTEM_PROMPT
 from .state import AgentState, PlanOutput, ReflectionOutput
 from .tool_executor import SUMMARY_CHUNK_CHARS, SUMMARY_MAX_CHUNKS, ToolExecutor
+from ..tools.contracts import validate_tool_args
 
 logger = get_logger(__name__)
 _MAX_REPLANS = 3
 _MAX_PLAN_STEPS = 30           # 单个计划最多步数（提示词同步约束）
 _SUPER_STEPS_PER_STEP = 2      # 移除 observe 后每步占用 act + reflecting 两个超级步
 _MAX_SCAN_RESULTS = 500
-_BATCH_TOOLS = ("move_file", "rename_file")  # 批量破坏性操作，超阈值需审批（P1-2）
+# 会改变文件位置/名字的副作用；它们共用请求级累计审批。
+_CUMULATIVE_TOOLS = (
+    "move_file", "batch_move", "rename_file", "batch_rename", "batch_classify",
+)
 _DEFAULT_BATCH_THRESHOLD = 20
-_BATCH_PREVIEW_LIMIT = 10      # 审批弹窗最多预览的条目数
 
 
 def _batch_threshold() -> int:
@@ -50,23 +56,6 @@ def _batch_threshold() -> int:
     except (TypeError, ValueError):
         return _DEFAULT_BATCH_THRESHOLD
     return value if value > 0 else _DEFAULT_BATCH_THRESHOLD
-
-
-def _batch_diff_summary(steps: list) -> str:
-    """构造批量操作的 diff 摘要：前 N 条 + 总数。"""
-    lines = []
-    for s in steps[:_BATCH_PREVIEW_LIMIT]:
-        args = s.get("args") or {}
-        if s.get("tool") == "move_file":
-            dst = args.get("dest_dir", "")
-            name = args.get("new_name")
-            lines.append(f"移动 {args.get('src', '')} → {dst}" + (f"（改名 {name}）" if name else ""))
-        else:  # rename_file
-            lines.append(f"重命名 {args.get('src', '')} → {args.get('new_name', '')}")
-    more = len(steps) - _BATCH_PREVIEW_LIMIT
-    if more > 0:
-        lines.append(f"…… 以及另外 {more} 项")
-    return "\n".join(lines)
 
 
 def _recursion_limit() -> int:
@@ -90,9 +79,15 @@ _SUMMARY_MAX_CHUNKS = SUMMARY_MAX_CHUNKS
 
 
 def _summarize_observation(obs: Dict[str, Any]) -> Dict[str, Any]:
-    """把单条观察压缩后再喂给规划/反思，避免把 500 条扫描明细或整篇文本反复回灌（P1-5）。
+    """把单条观察压缩后再喂给规划/反思，避免把 500 条扫描明细或整篇文本反复回灌。
 
-    完整清单仍保留在 state 里供工具使用，这里只产出摘要视图。
+    压缩必须按工具结果类型进行，不能把“前 20 条样本的统计”冒充完整统计：
+    - scan_directory：保留 scan_id、total、scanned_count、truncated、reason、
+      manifest 的完整扩展名统计，以及有限样本。
+    - batch_*：保留 matched/success/failed/skipped/truncated/reason 与有限明细，
+      供后续重规划和用户汇报使用。
+    - 长文本：保留截断标记和原始长度。
+    完整清单仍保留在 state / manifest 中供工具使用，这里只产出摘要视图。
     """
     slim: Dict[str, Any] = {
         "step_id": obs.get("step_id"),
@@ -102,24 +97,69 @@ def _summarize_observation(obs: Dict[str, Any]) -> Dict[str, Any]:
     }
     if obs.get("error"):
         slim["error"] = obs["error"]
+    # 参数通常很短，能帮助规划器复用 scan_id / 目标目录；过长时只保留工具名。
+    args = obs.get("args")
+    if isinstance(args, dict) and len(_json(args)) <= 800:
+        slim["args"] = args
 
     result = obs.get("result")
-    if isinstance(result, dict) and isinstance(result.get("items", result.get("preview")), list):
-        items = result.get("items", result.get("preview", []))
-        distribution: Dict[str, int] = {}
-        for item in items:
-            ext = (item.get("ext") or "无扩展名") if isinstance(item, dict) else "未知"
-            distribution[ext] = distribution.get(ext, 0) + 1
+    tool = str(obs.get("tool") or "")
+    if tool == "scan_directory" and isinstance(result, dict):
+        preview = result.get("preview")
+        if not isinstance(preview, list):
+            legacy_items = result.get("items")
+            preview = legacy_items if isinstance(legacy_items, list) else []
+        total = int(result.get("total", len(preview)) or 0)
+        scanned_count = int(result.get("scanned_count", total) or 0)
+        statistics = result.get("summary")
+        statistics_source = "manifest"
+        if not isinstance(statistics, dict):
+            # 兼容旧结果/测试桩：只有样本文本时，明确标记为样本统计。
+            statistics = {}
+            for item in preview:
+                ext = (item.get("ext") or "无扩展名") if isinstance(item, dict) else "未知"
+                statistics[ext] = statistics.get(ext, 0) + 1
+            statistics_source = "sample" if total > len(preview) else "manifest"
         slim["result"] = {
-            "total": result.get("total", len(items)),
-            "truncated": result.get("truncated", False),
-            "extension_distribution": distribution,
-            "sample": items[:_PLANNER_SAMPLE],
+            "scan_id": result.get("scan_id"),
+            "total": total,
+            "scanned_count": scanned_count,
+            "truncated": bool(result.get("truncated", False)),
+            "reason": str(result.get("reason") or "none"),
+            "extension_distribution": statistics,
+            "statistics_source": statistics_source,
+            "sample_size": len(preview[:_PLANNER_SAMPLE]),
+            "sample": preview[:_PLANNER_SAMPLE],
         }
-    elif isinstance(result, str) and len(result) > _PLANNER_TEXT_CAP:
+        return slim
+
+    if tool in {"batch_move", "batch_rename", "batch_classify"} and isinstance(result, dict):
+        slim["result"] = {
+            key: result.get(key)
+            for key in (
+                "matched",
+                "success",
+                "failed",
+                "skipped",
+                "truncated",
+                "reason",
+                "preview",
+                "failures",
+                "skips",
+            )
+            if key in result
+        }
+        for key in ("preview", "failures", "skips"):
+            values = slim["result"].get(key)
+            if isinstance(values, list):
+                slim["result"][key] = values[:_PLANNER_SAMPLE]
+        return slim
+
+    if isinstance(result, str) and len(result) > _PLANNER_TEXT_CAP:
         slim["result"] = result[:_PLANNER_TEXT_CAP] + f"……（已截断，原文共 {len(result)} 字符）"
-    else:
-        slim["result"] = result
+        return slim
+
+    slim["result"] = result
     return slim
 
 
@@ -180,11 +220,12 @@ class AgentRuntime:
 
     def _build_graph(self):
         workflow = StateGraph(AgentState)
-        workflow.add_node("perceive", self._perceive)
-        workflow.add_node("planning", self._plan)
-        workflow.add_node("act", self._act)
+        workflow.add_node("perceive", self._node("perceive", self._perceive))
+        workflow.add_node("planning", self._node("planning", self._plan))
+        workflow.add_node("act", self._node("act", self._act))
+        # 审批节点内部使用 interrupt 暂停；等待时间不计入执行预算。
         workflow.add_node("approval", self._approval)
-        workflow.add_node("reflecting", self._reflect)
+        workflow.add_node("reflecting", self._node("reflecting", self._reflect))
 
         workflow.add_edge(START, "perceive")
         workflow.add_edge("perceive", "planning")
@@ -206,6 +247,15 @@ class AgentRuntime:
         )
         return workflow.compile(checkpointer=self.checkpointer)
 
+    def _node(self, name: str, handler):
+        """把节点包成带计时与预算检查的可调用对象（LangGraph 只接受单参数函数）。"""
+
+        def runner(state: AgentState) -> Dict[str, Any]:
+            return self._timed_node(name, handler, state)
+
+        runner.__name__ = f"node_{name}"
+        return runner
+
     # ---------------- 图节点 ----------------
 
     def _perceive(self, state: AgentState) -> Dict[str, Any]:
@@ -220,6 +270,7 @@ class AgentRuntime:
         history = [
             op.model_dump(mode="json") for op in db.recent_operations(limit=20)
         ]
+        last_scan = state.get("last_scan") or self._last_scan(state.get("observations", []))
         return {
             "perception": {
                 "allowed_roots": roots,
@@ -235,6 +286,9 @@ class AgentRuntime:
             "final_response": "",
             "status": "perceiving",
             "error": "",
+            "outcome": "",
+            "stop_reason": "",
+            "completion": {},
             "batch_approved": False,
             "batch_rejected": False,
             "trusted_user_intent": state.get("user_request", ""),
@@ -242,7 +296,173 @@ class AgentRuntime:
             "tool_observations": [],
             "mutations": state.get("mutations") or {"move": 0, "rename": 0, "delete": 0},
             "approved_mutation_limit": int(state.get("approved_mutation_limit") or 0),
+            "last_scan": last_scan,
         }
+
+    @staticmethod
+    def _validate_scan_reference(args: Dict[str, Any]) -> str:
+        """执行批量步骤前核验 scan_id 与扫描目录仍然有效。
+
+        引用来自上一轮会话或旧扫描时，manifest 可能已随数据库清理消失，目录也可能
+        已被移动/删除。这里只做只读检查，并在失败时给出可执行的补救提示。
+        """
+        scan_id = str(args.get("scan_id") or "").strip()
+        if not scan_id:
+            return "缺少 scan_id，无法确定要处理的文件集合"
+        try:
+            manifest = manifests.load(scan_id)
+        except Exception as exc:  # noqa: BLE001
+            return f"扫描引用已失效：{exc}；请重新扫描目录"
+        directory = str(manifest.get("directory") or "")
+        if directory:
+            try:
+                from pathlib import Path
+
+                if not Path(directory).is_dir():
+                    return f"扫描目录已不存在：{directory}；请重新扫描"
+            except OSError as exc:
+                return f"无法核验扫描目录：{exc}"
+        return ""
+
+    # ---------------- 运行预算与追踪（P1-5） ----------------
+
+    @staticmethod
+    def _budget_limits() -> Dict[str, int]:
+        defaults = {
+            # 30 步计划 + 重规划时，反思本身就会产生几十次模型调用；上限必须留出余量，
+            # 否则一次正常的大计划会被误判为预算耗尽。
+            "agent_max_model_calls": 120,
+            "agent_max_tool_calls": 100,
+            "agent_execution_budget_seconds": 600,
+        }
+        limits: Dict[str, int] = {}
+        for key, default in defaults.items():
+            raw = db.get_preference(key)
+            try:
+                value = int(raw) if raw is not None else default
+            except (TypeError, ValueError):
+                value = default
+            limits[key] = value if value > 0 else default
+        return limits
+
+    def _trace_update(
+        self,
+        state: AgentState,
+        *,
+        model_calls: int = 0,
+        tool_calls: int = 0,
+    ) -> Dict[str, Any]:
+        trace = dict(state.get("run_trace") or {})
+        trace["run_id"] = trace.get("run_id") or state.get("run_id", "")
+        trace["model_calls"] = int(trace.get("model_calls", 0)) + model_calls
+        trace["tool_calls"] = int(trace.get("tool_calls", 0)) + tool_calls
+        trace.setdefault("node_timings", [])
+        trace.setdefault("execution_ms", 0)
+        # 供应商未提供 usage 时保持 unknown，而不是伪造为 0。
+        trace.setdefault(
+            "token_usage", {"input": None, "output": None, "source": "unknown"}
+        )
+        # 供应商真的给了 usage 才覆盖 unknown；否则保留未知，不伪造 0。
+        usage = tracing.usage_for(str(state.get("thread_id") or ""))
+        if usage.get("source") == "provider":
+            trace["token_usage"] = {
+                "input": usage.get("input"),
+                "output": usage.get("output"),
+                "calls": usage.get("calls", 0),
+                "source": "provider",
+            }
+        return trace
+
+    def _budget_exceeded(self, state: AgentState) -> str:
+        trace = state.get("run_trace") or {}
+        limits = self._budget_limits()
+        if int(trace.get("model_calls", 0)) >= limits["agent_max_model_calls"]:
+            return (
+                f"模型调用达到上限 {limits['agent_max_model_calls']} 次"
+            )
+        if int(trace.get("tool_calls", 0)) >= limits["agent_max_tool_calls"]:
+            return f"工具调用达到上限 {limits['agent_max_tool_calls']} 次"
+        budget_ms = limits["agent_execution_budget_seconds"] * 1000
+        if int(trace.get("execution_ms", 0)) >= budget_ms:
+            return (
+                f"执行时间达到预算 {limits['agent_execution_budget_seconds']} 秒"
+                "（等待人工审批的时间不计入）"
+            )
+        return ""
+
+    def _budget_stop(self, state: AgentState, reason: str) -> Dict[str, Any]:
+        completion = evaluate_completion(
+            state, stop_reason="budget_exhausted", forced_outcome="budget_exhausted"
+        )
+        trace = self._trace_update(state)
+        trace["stop_reason"] = "budget_exhausted"
+        return {
+            "status": "completed",
+            "outcome": "budget_exhausted",
+            "stop_reason": "budget_exhausted",
+            "completion": completion,
+            "run_trace": trace,
+            "pending_approval": None,
+            "current_step": {},
+            "final_response": f"{completion['message']}停止原因：{reason}。",
+        }
+
+    def _timed_node(self, name: str, handler, state: AgentState) -> Dict[str, Any]:
+        """记录节点耗时，并在节点边界执行预算检查。
+
+        预算用“节点执行时间之和”而不是墙钟时间：等待审批/用户补充期间不运行节点，
+        因此不会误耗执行预算。
+        """
+        if name in {"planning", "act", "reflecting"}:
+            reason = self._budget_exceeded(state)
+            if reason:
+                logger.info("运行预算耗尽 thread=%s reason=%s", state.get("thread_id"), reason)
+                return self._budget_stop(state, reason)
+        started = time.monotonic()
+        result = handler(state)
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        # 以节点自己返回的 trace 为准（可能已累加模型/工具调用），再补本节点耗时。
+        # 早先这里用 setdefault，节点返回的 trace 会让耗时记录永远只剩第一个节点。
+        trace = dict(result.get("run_trace") or self._trace_update(state)) if isinstance(result, dict) else self._trace_update(state)
+        timings = list(trace.get("node_timings") or [])
+        timings.append({"node": name, "ms": elapsed_ms})
+        trace["node_timings"] = timings[-50:]
+        trace["execution_ms"] = int(trace.get("execution_ms", 0)) + elapsed_ms
+        if isinstance(result, dict):
+            result["run_trace"] = trace
+            result.setdefault("run_id", state.get("run_id", ""))
+            # 终态必须能解释停止原因；未显式给出时按状态推导，避免出现“完成但无原因”。
+            final_status = result.get("status")
+            if final_status in {"completed", "failed", "cancelled"}:
+                result.setdefault(
+                    "stop_reason",
+                    "tool_failed" if final_status == "failed" else "model_done",
+                )
+        return result
+
+    @staticmethod
+    def _last_scan(observations: list) -> Dict[str, Any]:
+        """从既有观察中提取最近一次可用扫描，供“刚才那些 PDF”这类追问引用。"""
+        for obs in reversed(observations or []):
+            if not isinstance(obs, dict) or obs.get("tool") != "scan_directory":
+                continue
+            result = obs.get("result")
+            if not isinstance(result, dict) or not result.get("scan_id"):
+                continue
+            args = obs.get("args") if isinstance(obs.get("args"), dict) else {}
+            summary = result.get("summary")
+            if not isinstance(summary, dict):
+                summary = {}
+            return {
+                "scan_id": result.get("scan_id"),
+                "directory": args.get("directory", ""),
+                "total": int(result.get("total", 0) or 0),
+                "scanned_count": int(result.get("scanned_count", result.get("total", 0)) or 0),
+                "truncated": bool(result.get("truncated", False)),
+                "reason": str(result.get("reason") or "none"),
+                "summary": summary,
+            }
+        return {}
 
     def _plan(self, state: AgentState) -> Dict[str, Any]:
         replan_count = state.get("replan_count", 0)
@@ -255,6 +475,9 @@ class AgentRuntime:
             "tool_observations": _summarize_observations(state.get("observations", [])),
             # 兼容既有 planner/context 测试与第三方提示模板；值仍是同一份受限工具观察。
             "已获得观察": _summarize_observations(state.get("observations", [])),
+            # 多轮上下文：仅用于理解指代，不是新的授权来源。
+            "conversation": (state.get("conversation") or [])[-10:],
+            "last_scan": state.get("last_scan", {}),
             "要求": (
                 "这是重规划。不要重复已经成功或被拒绝的步骤；请根据扫描/提取结果，"
                 "生成尚未完成的具体步骤。"
@@ -274,12 +497,25 @@ class AgentRuntime:
                     # 与 REST 共用同一条数据边界校验，禁止 Agent 修改沙箱保留键。
                     db.validate_public_preference_key(str(item.args["key"]))
             steps = [step.model_dump() for step in result.steps[:_MAX_PLAN_STEPS]]
+            trace = self._trace_update(state, model_calls=1)
             if not steps:
+                completion = evaluate_completion(
+                    {
+                        **state,
+                        "plan": [],
+                        "step_index": 0,
+                    },
+                    stop_reason="no_operations",
+                )
                 return {
                     "plan": [],
                     "step_index": 0,
                     "status": "completed",
-                    "final_response": result.user_message or "没有需要执行的文件操作。",
+                    "outcome": completion["outcome"],
+                    "stop_reason": completion["stop_reason"],
+                    "completion": completion,
+                    "run_trace": trace,
+                    "final_response": result.user_message or completion["message"],
                     "current_step": {},
                 }
             return {
@@ -289,14 +525,24 @@ class AgentRuntime:
                 "status": "planning",
                 "replan_count": replan_count + (1 if state.get("observations") else 0),
                 "final_response": result.user_message,
+                "run_trace": trace,
                 # 累计审批状态属于整个 user request，重规划不得重置。
             }
         except Exception as exc:  # noqa: BLE001
             logger.exception("规划失败")
+            completion = evaluate_completion(
+                {**state, "plan": [], "step_index": 0},
+                stop_reason="planning_error",
+                forced_outcome="failed",
+            )
             return {
                 "status": "failed",
                 "error": str(exc),
-                "final_response": f"规划失败：{exc}",
+                "outcome": "failed",
+                "stop_reason": "planning_error",
+                "completion": completion,
+                "run_trace": self._trace_update(state, model_calls=1),
+                "final_response": f"规划失败：{exc}" + (f"。{completion['message']}" if completion.get("message") else ""),
                 "plan": [],
             }
 
@@ -315,61 +561,91 @@ class AgentRuntime:
         args = dict(step.get("args") or {})
         current = {**step, "args": args}
 
-        proposed = self._proposed_mutation_count(tool, args, plan[index:])
-        decision = self.policy.evaluate(tool, state=state, proposed_count=proposed)
-        if not decision.allowed:
-            observation = self._observation(step, "failed", error=decision.reason)
-            return {"current_step": current, "observations": [*state.get("observations", []), observation],
-                    "step_index": index + 1, "status": "running"}
-        if tool != "delete_file" and decision.requires_approval:
-            approval = {
-                "approval_id": uuid.uuid4().hex,
-                "action": f"batch_{decision.mutation_kind}",
-                "target": f"累计 {sum((state.get('mutations') or {}).values()) + proposed} 项文件变更",
-                "detail": decision.reason,
-                "count": proposed,
-                "approved_limit": sum((state.get("mutations") or {}).values()) + proposed,
-                "batch": True,
-                "tool": tool,
-                "args": args,
-            }
-            return {"current_step": current, "pending_approval": approval, "status": "waiting_approval"}
-
-        # 批量破坏性操作预演审批（P1-2）：计划中 move/rename 步数超阈值时，
-        # 在执行第一个前统一审批一次。拒绝后所有批量步骤都跳过，文件一个都不动。
-        if tool in _BATCH_TOOLS:
-            if state.get("batch_rejected"):
-                observation = self._observation(
-                    step, "rejected", result="用户拒绝了批量操作，未移动该文件"
-                )
-                db.log_operation(
-                    tool, str(args.get("src", "")), "rejected",
-                    detail="用户拒绝批量操作", thread_id=state.get("thread_id"),
-                )
+        # 澄清不产生副作用：暂停执行，等待用户补充信息（P1-4）。
+        if tool == "request_clarification":
+            normalized, argument_error = validate_tool_args(tool, args)
+            if argument_error:
+                observation = self._observation(step, "failed", error=argument_error)
                 return {
                     "current_step": current,
                     "observations": [*state.get("observations", []), observation],
                     "step_index": index + 1,
                     "status": "running",
                 }
-            if not state.get("batch_approved"):
-                batch_steps = [s for s in plan if str(s.get("tool", "")) in _BATCH_TOOLS]
-                if len(batch_steps) > _batch_threshold():
-                    approval = {
-                        "approval_id": uuid.uuid4().hex,
-                        "action": "batch_move",
-                        "target": f"{len(batch_steps)} 项文件移动/重命名",
-                        "detail": _batch_diff_summary(batch_steps),
-                        "count": len(batch_steps),
-                        "batch": True,
-                        "tool": tool,
-                        "args": args,
-                    }
-                    return {
-                        "current_step": current,
-                        "pending_approval": approval,
-                        "status": "waiting_approval",
-                    }
+            question = str((normalized or {}).get("question", ""))
+            completion = evaluate_completion(
+                {**state, "plan": [], "step_index": 0},
+                stop_reason="clarification_requested",
+                forced_outcome="needs_clarification",
+            )
+            return {
+                "current_step": current,
+                "plan": [],
+                "step_index": 0,
+                "status": "needs_clarification",
+                "pending_approval": None,
+                "outcome": "needs_clarification",
+                "stop_reason": "clarification_requested",
+                "completion": completion,
+                "final_response": question or "需要补充信息后才能继续。",
+            }
+
+        proposed = self._proposed_mutation_count(tool, args, plan[index:])
+        # 授权先于一切：意图不成立时，连扫描清单都不必查询（也避免用错误信息泄露
+        # “某个 scan_id 是否存在”）。参数校验同样在这里完成。
+        decision = self.policy.evaluate(
+            tool, state=state, proposed_count=proposed, args=args
+        )
+        if not decision.allowed:
+            observation = self._observation(step, "failed", error=decision.reason)
+            return {"current_step": current, "observations": [*state.get("observations", []), observation],
+                    "step_index": index + 1, "status": "running"}
+
+        # 引用旧扫描时必须在使用前核验：manifest 不存在、目录已消失都明确失败，
+        # 不能拿过期清单继续移动文件。
+        if tool in {"batch_move", "batch_rename", "batch_classify"}:
+            reference_error = self._validate_scan_reference(args)
+            if reference_error:
+                observation = self._observation(step, "failed", error=reference_error)
+                return {
+                    "current_step": current,
+                    "observations": [*state.get("observations", []), observation],
+                    "step_index": index + 1,
+                    "status": "running",
+                }
+
+        if tool != "delete_file" and decision.requires_approval:
+            cumulative = self._cumulative_mutations(state)
+            approval = {
+                "approval_id": uuid.uuid4().hex,
+                # 审批标题必须反映实际工具：batch_classify 也是移动，但它不是 batch_move。
+                "action": tool if tool.startswith("batch_") else f"batch_{decision.mutation_kind}",
+                "target": f"累计 {cumulative + proposed} 项文件变更",
+                "detail": decision.reason,
+                "count": proposed,
+                "approved_limit": cumulative + proposed,
+                "batch": True,
+                "tool": tool,
+                "args": args,
+            }
+            return {"current_step": current, "pending_approval": approval, "status": "waiting_approval"}
+
+        # 用户拒绝过本请求的累计审批后，后续同类的移动/重命名/分类步骤一律跳过。
+        # 审批门槛本身由 PolicyEngine 统一判定（含 batch_classify），这里只负责拒绝后的收敛。
+        if tool in _CUMULATIVE_TOOLS and state.get("batch_rejected"):
+            observation = self._observation(
+                step, "rejected", result="用户拒绝了批量操作，未移动该文件"
+            )
+            db.log_operation(
+                tool, str(args.get("src") or args.get("scan_id") or ""), "rejected",
+                detail="用户拒绝批量操作", thread_id=state.get("thread_id"),
+            )
+            return {
+                "current_step": current,
+                "observations": [*state.get("observations", []), observation],
+                "step_index": index + 1,
+                "status": "running",
+            }
 
         if tool == "delete_file":
             target = str(args.get("path", ""))
@@ -417,11 +693,16 @@ class AgentRuntime:
             "tool_observations": [*state.get("tool_observations", []), _summarize_observation(observation)],
             "step_index": index + 1,
             "status": "running",
+            "run_trace": self._trace_update(state, tool_calls=1),
         }
         if tool in {"scan_directory", "extract_text", "classify_file"}:
             update["untrusted_file_data"] = [
                 *state.get("untrusted_file_data", []), _summarize_observation(observation)
             ]
+        if tool == "scan_directory":
+            latest_scan = self._last_scan([observation])
+            if latest_scan:
+                update["last_scan"] = latest_scan
         self._apply_mutation_count(update, state, tool, observation)
         return update
 
@@ -467,6 +748,9 @@ class AgentRuntime:
             "observations": [*state.get("observations", []), observation],
             "step_index": state.get("step_index", 0) + 1,
             "status": "running",
+            "run_trace": self._trace_update(
+                state, tool_calls=1 if approved else 0
+            ),
         }
         # 批量审批：记住决定，使同一计划里后续 move/rename 步骤不再逐条弹窗（P1-2）。
         if pending.get("batch"):
@@ -482,7 +766,11 @@ class AgentRuntime:
         return result
 
     def _reflect(self, state: AgentState) -> Dict[str, Any]:
-        if state.get("status") == "failed":
+        # 任何终态（含预算在 act 边界触发的 completed）都不再反思，
+        # 否则模型可能把已经确定的 outcome 覆盖掉。
+        if state.get("status") in {
+            "failed", "needs_clarification", "completed", "cancelled"
+        }:
             return {}
 
         plan = state.get("plan", [])
@@ -505,18 +793,41 @@ class AgentRuntime:
                 ]
             )
             decision = result.decision
+            replan_limit_reached = False
             if decision == "replan" and state.get("replan_count", 0) >= _MAX_REPLANS:
                 decision = "done"
-                result.final_response = (
-                    "已达到最大重规划次数。已完成的操作已保留，请检查任务记录后再继续。"
-                )
+                replan_limit_reached = True
             if decision == "continue" and index >= len(plan):
                 decision = "done"
             if decision == "done":
-                response = result.final_response or self._fallback_summary(state)
+                completion = evaluate_completion(
+                    state,
+                    stop_reason="replan_limit" if replan_limit_reached else "model_done",
+                    replan_limit_reached=replan_limit_reached,
+                )
+                outcome = completion["outcome"]
+                # 模型措辞只在确定性校验通过时作为正文；任何部分完成/失败/拒绝/
+                # 预算耗尽都用后端生成的计数与原因，避免“全部成功”的幻觉。
+                if outcome == "success" and result.final_response:
+                    response = result.final_response
+                else:
+                    response = completion["message"]
+                next_status = "failed" if outcome == "failed" else "completed"
+                conversation = list(state.get("conversation") or [])
+                conversation.append({
+                    "role": "assistant",
+                    "content": response[:2000],
+                    "run_id": state.get("run_id", ""),
+                    "outcome": outcome,
+                })
                 return {
                     "reflection": result.model_dump(),
-                    "status": "completed",
+                    "status": next_status,
+                    "outcome": outcome,
+                    "stop_reason": completion["stop_reason"],
+                    "completion": completion,
+                    "conversation": conversation[-20:],
+                    "run_trace": self._trace_update(state, model_calls=1),
                     "final_response": response,
                     "current_step": {},
                 }
@@ -524,21 +835,33 @@ class AgentRuntime:
                 "reflection": {**result.model_dump(), "decision": decision},
                 "status": "running",
                 "current_step": {},
+                "run_trace": self._trace_update(state, model_calls=1),
             }
         except Exception as exc:  # noqa: BLE001
             logger.exception("反思失败")
             # 工具已执行，反思失败不能回滚；安全终止并如实报告。
+            completion = evaluate_completion(
+                state,
+                stop_reason="reflection_error",
+                forced_outcome="failed",
+            )
             return {
                 "status": "failed",
                 "error": str(exc),
-                "final_response": f"文件操作已停止：反思阶段失败（{exc}）。请查看任务记录确认已完成部分。",
+                "outcome": "failed",
+                "stop_reason": "reflection_error",
+                "completion": completion,
+                "run_trace": self._trace_update(state, model_calls=1),
+                "final_response": f"文件操作已停止：反思阶段失败（{exc}）。"
+                + completion.get("message", "")
+                + "请查看任务记录确认已完成部分。",
             }
 
     # ---------------- 路由 ----------------
 
     @staticmethod
     def _after_plan(state: AgentState) -> Literal["act", "done"]:
-        if state.get("status") in {"completed", "failed"} or not state.get("plan"):
+        if state.get("status") in {"completed", "failed", "needs_clarification"} or not state.get("plan"):
             return "done"
         return "act"
 
@@ -548,7 +871,7 @@ class AgentRuntime:
 
     @staticmethod
     def _after_reflect(state: AgentState) -> Literal["act", "plan", "done"]:
-        if state.get("status") in {"completed", "failed"}:
+        if state.get("status") in {"completed", "failed", "cancelled", "needs_clarification"}:
             return "done"
         decision = state.get("reflection", {}).get("decision", "done")
         if decision == "replan":
@@ -577,6 +900,11 @@ class AgentRuntime:
         if tool in {"move_file", "rename_file"}:
             return sum(1 for step in remaining if str(step.get("tool")) in {"move_file", "rename_file"})
         return 1
+
+    @staticmethod
+    def _cumulative_mutations(state: AgentState) -> int:
+        mutations = state.get("mutations") or {}
+        return sum(int(mutations.get(name, 0)) for name in ("move", "rename"))
 
     @staticmethod
     def _apply_mutation_count(update: Dict[str, Any], state: AgentState, tool: str, observation: Dict[str, Any]) -> None:
@@ -648,8 +976,28 @@ class AgentRuntime:
         return {"configurable": {"thread_id": thread_id}, "recursion_limit": _recursion_limit()}
 
     def start_stream(self, message: str, thread_id: str) -> Iterable[Dict[str, Any]]:
+        # 同一 thread 的追问保留对话与最近扫描；每次运行重新开始审批/变更计数。
+        # 因此“刚才那些 PDF”可复用 scan_id，但历史审批绝不会为新请求授权。
+        try:
+            previous = self.state(thread_id)
+        except Exception:  # noqa: BLE001 - 新线程尚无 checkpoint
+            previous = {}
+        if previous.get("pending_approval"):
+            # 等待审批时不允许用新消息隐式“恢复”旧计划：LangGraph 会把新输入当作
+            # interrupt 的返回值，可能被误读为拒绝/批准。必须先显式处理审批。
+            raise RuntimeError("当前会话仍在等待审批，请先批准或拒绝该操作后再发送新消息。")
+        run_id = uuid.uuid4().hex
+        # Token 用量是“本次运行”的统计，不能把上一轮的用量累加进新 run。
+        tracing.clear(thread_id)
+        conversation = list(previous.get("conversation") or [])
+        conversation.append({"role": "user", "content": message, "run_id": run_id})
+        conversation = conversation[-20:]
+        last_scan = previous.get("last_scan") or self._last_scan(
+            previous.get("observations", [])
+        )
         initial: AgentState = {
             "thread_id": thread_id,
+            "run_id": run_id,
             "user_request": message,
             "status": "perceiving",
             "replan_count": 0,
@@ -660,6 +1008,9 @@ class AgentRuntime:
             "pending_approval": None,
             "final_response": "",
             "error": "",
+            "outcome": "",
+            "stop_reason": "",
+            "completion": {},
             "perception": {},
             "reflection": {},
             "batch_approved": False,
@@ -669,6 +1020,14 @@ class AgentRuntime:
             "tool_observations": [],
             "mutations": {"move": 0, "rename": 0, "delete": 0},
             "approved_mutation_limit": 0,
+            "conversation": conversation,
+            "last_scan": last_scan,
+            "run_trace": {
+                "run_id": run_id,
+                "node_timings": [],
+                "model_calls": 0,
+                "token_usage": {"input": None, "output": None, "source": "unknown"},
+            },
         }
         # updates：逐节点状态增量；messages：LLM token 流（点亮 P1-4 的 token 事件）。
         return self.graph.stream(
@@ -690,11 +1049,21 @@ class AgentRuntime:
 
     def cancel(self, thread_id: str) -> None:
         """把取消写入 checkpoint，避免重启后会话又显示为 running/waiting。"""
+        try:
+            state = self.state(thread_id)
+        except Exception:  # noqa: BLE001
+            state = {}
+        completion = evaluate_completion(
+            state, stop_reason="cancelled", forced_outcome="cancelled"
+        )
         self.graph.update_state(
             self.config(thread_id),
             {
                 "status": "cancelled",
                 "pending_approval": None,
-                "final_response": "任务已停止。已完成的文件操作仍可在操作日志中撤销。",
+                "outcome": "cancelled",
+                "stop_reason": "cancelled",
+                "completion": completion,
+                "final_response": completion["message"],
             },
         )

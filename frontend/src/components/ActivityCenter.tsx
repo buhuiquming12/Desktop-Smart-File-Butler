@@ -1,4 +1,4 @@
-﻿import { useState } from 'react';
+import { useState } from 'react';
 import type { ActivityItem } from '../types';
 
 interface ActivityCenterProps {
@@ -78,7 +78,7 @@ export function ActivityCenter({ items, onSwitch, onStop, onViewResult, onCopyRe
                     {item.running && (
                       <button type="button" className="text-button text-button--danger" onClick={() => onStop(item.threadId)}>停止任务</button>
                     )}
-                    {(item.status === 'success' || item.status === 'failed') && (
+                    {(item.status === 'success' || item.status === 'partial' || item.status === 'failed') && (
                       <>
                         <button type="button" className="text-button" onClick={() => onViewResult(item)}>查看结果</button>
                         <button type="button" className="text-button" onClick={() => onCopyResult(item)}>复制结果</button>

@@ -24,11 +24,16 @@ export interface ChatResponse {
 export interface ThreadState {
   thread_id?: string;
   status: string;
+  /** 目标完成度，独立于流程状态：success/partial/failed/rejected/cancelled/budget_exhausted/... */
+  outcome?: string;
+  stop_reason?: string;
   pending_approval?: Record<string, unknown> | null;
   observations?: Array<Record<string, unknown>>;
   final_response?: string;
   error?: string;
   summary?: TaskSummary;
+  run_id?: string;
+  usage?: TokenUsage;
 }
 
 export interface RollbackSummary {
@@ -72,7 +77,7 @@ export interface ChatMessage {
   threadId?: string;
 }
 
-export type TaskStatus = 'pending' | 'running' | 'success' | 'failed' | 'waiting';
+export type TaskStatus = 'pending' | 'running' | 'success' | 'partial' | 'failed' | 'waiting';
 
 export interface TaskItem {
   id: string;
@@ -222,12 +227,44 @@ export interface TaskSummaryOperation {
   dest?: string | null;
 }
 
+/** Token 用量：供应商未提供时 input/output 为 null，source=unknown。 */
+export interface TokenUsage {
+  input: number | null;
+  output: number | null;
+  calls?: number;
+  source: string;
+}
+
+export type TaskOutcome =
+  | 'success'
+  | 'partial'
+  | 'failed'
+  | 'rejected'
+  | 'cancelled'
+  | 'budget_exhausted'
+  | 'needs_clarification'
+  | 'unknown';
+
 export interface TaskSummary {
+  /** 工具调用次数（不是文件数）。 */
   ok: number;
   failed: number;
   skipped: number;
   files: string[];
   operations: TaskSummaryOperation[];
+  /** 以下字段由后端确定性校验产生；旧后端可能缺省。 */
+  outcome?: TaskOutcome | string;
+  outcome_label?: string;
+  stop_reason?: string;
+  verified?: boolean;
+  /** 文件级计数，与工具调用次数分开统计。 */
+  files_ok?: number;
+  files_failed?: number;
+  files_skipped?: number;
+  matched?: number;
+  tool_calls?: number;
+  unexecuted_steps?: number;
+  truncated_reasons?: string[];
 }
 
 /** 首次使用检查结果：null 表示「未能确认」（如配置接口需要令牌而当前环境无法提供）。 */

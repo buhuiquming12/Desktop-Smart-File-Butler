@@ -13,16 +13,21 @@ import {
   approvalOrigin,
   buildActivityItems,
   detachThreadToViews,
+  eventOutcome,
   isBackgroundEvent,
+  isFullSuccess,
   isNearBottom,
   isStalled,
   lastAssistantTurn,
+  outcomeLabel,
   parseApproval,
+  parseSummary,
   reduceThreadEvent,
   resolveEventTarget,
   shouldAutoScroll,
   shouldPromptNewConversation,
   shortThreadId,
+  taskStatusForOutcome,
   updateAssistant,
   type ThreadViewState,
 } from './state.js';
@@ -51,6 +56,41 @@ const completedView = reduceThreadEvent(
 ).view;
 if (completedView.busy) throw new Error('done 未解除 busy');
 if (completedView.messages[0]?.error === true) throw new Error('成功终态不应标记为错误');
+
+// ---- P0-3：流程终止 ≠ 目标完成 ----
+
+// 后端 outcome 优先于 status：completed + partial 仍是“部分完成”。
+const partialView = reduceThreadEvent(
+  { messages: [], tasks: [], busy: true },
+  event('p-1', 'done', {
+    status: 'completed',
+    outcome: 'partial',
+    stop_reason: 'incomplete_goal',
+    message: '任务部分完成：文件成功 8、失败 2',
+    summary: { ok: 1, failed: 0, skipped: 0, files: [], operations: [], outcome: 'partial', files_ok: 8, files_failed: 2 },
+  }),
+).view;
+if (partialView.busy) throw new Error('部分完成也需要解除 busy');
+if (partialView.summary?.outcome !== 'partial') throw new Error('outcome 未透传到摘要');
+if (partialView.summary?.files_ok !== 8 || partialView.summary?.files_failed !== 2) throw new Error('文件级计数未解析');
+if (isFullSuccess(eventOutcome({ status: 'completed', outcome: 'partial' }))) throw new Error('部分完成被当成全部成功');
+if (!isFullSuccess(eventOutcome({ status: 'completed', outcome: 'success' }))) throw new Error('成功被误判');
+if (outcomeLabel('budget_exhausted') !== '预算耗尽') throw new Error('预算耗尽措辞错误');
+if (eventOutcome({ status: 'completed' }) !== 'success') throw new Error('旧后端无 outcome 时应按 completed 处理');
+if (taskStatusForOutcome('partial') !== 'partial') throw new Error('部分完成在看板上被标为成功');
+if (taskStatusForOutcome('budget_exhausted') !== 'partial') throw new Error('预算耗尽在看板上被标为成功');
+if (taskStatusForOutcome('success') !== 'success') throw new Error('成功状态映射错误');
+
+// 终态把仍在运行的任务改成 partial，而不是“完成”。
+const partialTaskView = reduceThreadEvent(
+  { messages: [], tasks: [{ id: 't', title: '移动', detail: '', status: 'running', updatedAt: '', threadId: 'p-2' }], busy: true },
+  event('p-2', 'done', { status: 'completed', outcome: 'partial', message: '部分完成' }),
+).view;
+if (partialTaskView.tasks[0]?.status !== 'partial') throw new Error('部分完成的任务在看板显示为完成');
+
+// 旧后端的精简摘要仍可解析（缺少新字段时给安全默认值）。
+const legacySummary = parseSummary({ ok: 2, failed: 0, skipped: 0, files: [], operations: [] });
+if (!legacySummary || legacySummary.files_ok !== 0 || legacySummary.outcome !== undefined) throw new Error('旧摘要兼容性被破坏');
 
 // ---- B2：断线重连退避与 busy 兜底超时 ----
 

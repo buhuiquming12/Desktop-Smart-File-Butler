@@ -1,4 +1,4 @@
-import type { ActivityItem, ChatMessage, PendingApproval, TaskItem, TaskStatus, TaskSummary, TaskSummaryOperation, WSEvent } from './types';
+import type { ActivityItem, ChatMessage, PendingApproval, TaskItem, TaskOutcome, TaskStatus, TaskSummary, TaskSummaryOperation, WSEvent } from './types';
 
 export interface ThreadViewState {
   messages: ChatMessage[];
@@ -31,9 +31,16 @@ export function payloadText(payload: Record<string, unknown>, ...keys: string[])
 }
 
 export function taskStatus(value: unknown): TaskStatus {
-  return value === 'pending' || value === 'running' || value === 'success' || value === 'failed' || value === 'waiting'
+  return value === 'pending' || value === 'running' || value === 'success' || value === 'partial' || value === 'failed' || value === 'waiting'
     ? value
     : 'running';
+}
+
+/** 终态事件对应的任务看板状态：只有 success 才显示“完成”。 */
+export function taskStatusForOutcome(outcome: TaskOutcome): TaskStatus {
+  if (outcome === 'success') return 'success';
+  if (outcome === 'partial' || outcome === 'budget_exhausted') return 'partial';
+  return 'failed';
 }
 
 export function parseApproval(event: WSEvent): PendingApproval | null {
@@ -60,6 +67,7 @@ export function parseSummary(value: unknown): TaskSummary | null {
   if (!value || typeof value !== 'object') return null;
   const candidate = value as Partial<TaskSummary>;
   if (typeof candidate.ok !== 'number' && typeof candidate.failed !== 'number' && typeof candidate.skipped !== 'number') return null;
+  const count = (input: unknown): number => (typeof input === 'number' && Number.isFinite(input) ? input : 0);
   return {
     ok: typeof candidate.ok === 'number' ? candidate.ok : 0,
     failed: typeof candidate.failed === 'number' ? candidate.failed : 0,
@@ -68,7 +76,50 @@ export function parseSummary(value: unknown): TaskSummary | null {
     operations: Array.isArray(candidate.operations)
       ? candidate.operations.filter((op): op is TaskSummaryOperation => Boolean(op) && typeof op === 'object')
       : [],
+    ...(typeof candidate.outcome === 'string' ? { outcome: candidate.outcome } : {}),
+    ...(typeof candidate.outcome_label === 'string' ? { outcome_label: candidate.outcome_label } : {}),
+    ...(typeof candidate.stop_reason === 'string' ? { stop_reason: candidate.stop_reason } : {}),
+    ...(typeof candidate.verified === 'boolean' ? { verified: candidate.verified } : {}),
+    files_ok: count(candidate.files_ok),
+    files_failed: count(candidate.files_failed),
+    files_skipped: count(candidate.files_skipped),
+    matched: count(candidate.matched),
+    tool_calls: count(candidate.tool_calls),
+    unexecuted_steps: count(candidate.unexecuted_steps),
+    truncated_reasons: Array.isArray(candidate.truncated_reasons)
+      ? candidate.truncated_reasons.filter((reason): reason is string => typeof reason === 'string')
+      : [],
   };
+}
+
+/** 终态事件的“目标完成度”：优先用后端 outcome，缺失时退回 status。 */
+export function eventOutcome(payload: Record<string, unknown>): TaskOutcome {
+  const outcome = payloadText(payload, 'outcome');
+  if (outcome) return outcome as TaskOutcome;
+  const status = payloadText(payload, 'status');
+  if (status === 'failed') return 'failed';
+  if (status === 'cancelled') return 'cancelled';
+  if (status === 'completed') return 'success';
+  return 'unknown';
+}
+
+/** 只有 success 才算完整成功；部分完成/拒绝/预算耗尽都必须按“未完全成功”呈现。 */
+export function isFullSuccess(outcome: TaskOutcome): boolean {
+  return outcome === 'success';
+}
+
+export function outcomeLabel(outcome: TaskOutcome, fallback = '已结束'): string {
+  const labels: Record<string, string> = {
+    success: '已完成',
+    partial: '部分完成',
+    failed: '失败',
+    rejected: '已拒绝',
+    cancelled: '已取消',
+    budget_exhausted: '预算耗尽',
+    needs_clarification: '待补充信息',
+    unknown: '状态未知',
+  };
+  return labels[outcome] ?? fallback;
 }
 
 export function updateAssistant(messages: ChatMessage[], threadId: string, content: string, append: boolean, error = false): ChatMessage[] {
@@ -189,13 +240,16 @@ export function reduceThreadEvent(view: ThreadViewState, event: WSEvent, now = n
       break;
     }
     case 'done': {
-      const failed = event.payload.status === 'failed' || event.payload.status === 'cancelled';
+      // 流程终止 ≠ 目标完成：失败/部分完成/拒绝/预算耗尽都要区别呈现。
+      const outcome = eventOutcome(event.payload);
+      const failed = outcome === 'failed' || outcome === 'cancelled';
+      const finalTaskStatus = taskStatusForOutcome(outcome);
       const text = payloadText(event.payload, 'message', 'error', 'detail', 'content', 'result');
       if (text) next.messages = updateAssistant(next.messages, event.thread_id, text, false, failed);
       next.messages = next.messages.map((message) => message.id === `assistant-${event.thread_id}` ? { ...message, pending: false } : message);
       next.tasks = next.tasks
         .filter((task) => !(task.threadId === event.thread_id && task.status === 'waiting'))
-        .map((task) => task.threadId === event.thread_id && task.status === 'running' ? { ...task, status: failed ? 'failed' : 'success', updatedAt: now } : task);
+        .map((task) => task.threadId === event.thread_id && task.status === 'running' ? { ...task, status: finalTaskStatus, updatedAt: now } : task);
       next.busy = false;
       const summary = parseSummary(event.payload.summary);
       if (summary) {
@@ -297,6 +351,7 @@ const statusTextMap: Record<TaskStatus, string> = {
   pending: '等待',
   running: '执行中',
   success: '完成',
+  partial: '未完成',
   failed: '失败',
   waiting: '待审批',
 };

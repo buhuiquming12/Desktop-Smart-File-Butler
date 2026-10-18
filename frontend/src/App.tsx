@@ -27,8 +27,10 @@ import {
   assistantMessageId,
   buildActivityItems,
   detachThreadToViews,
+  eventOutcome,
   isStalled,
   lastAssistantTurn,
+  outcomeLabel,
   parseApproval,
   payloadText,
   parseSummary,
@@ -36,6 +38,7 @@ import {
   resolveEventTarget,
   shouldPromptNewConversation,
   taskStatus,
+  taskStatusForOutcome,
   type NewConversationAction,
   type ThreadViewState,
 } from './state';
@@ -205,7 +208,10 @@ export function App() {
       case 'done': {
         // B1：后端已把失败统一收敛为 done(status=failed)，此处必须按失败呈现，
         // 否则用户只看到一句普通回复，无从得知任务其实失败了。
-        const failed = event.payload.status === 'failed' || event.payload.status === 'cancelled';
+        // P0-3：status 只表示流程在哪终止，outcome 才表示目标完成度。
+        const outcome = eventOutcome(event.payload);
+        const failed = outcome === 'failed' || outcome === 'cancelled';
+        const finalTaskStatus = taskStatusForOutcome(outcome);
         const finalText = payloadText(event.payload, 'message', 'content', 'result');
         if (finalText) updateAssistant(event.thread_id, finalText, false, failed);
         const assistantId = assistantMessageId(event.thread_id, assistantTurnRef.current[event.thread_id] ?? 1);
@@ -216,10 +222,15 @@ export function App() {
           if (summary) return { ...next, summary, threadId: event.thread_id };
           return next;
         }));
-        setTasks((current) => current.map((task) => task.threadId === event.thread_id && task.status === 'running' ? { ...task, status: failed ? 'failed' : 'success', updatedAt: now } : task));
+        setTasks((current) => current.map((task) => task.threadId === event.thread_id && task.status === 'running' ? { ...task, status: finalTaskStatus, updatedAt: now } : task));
         setBusy(false);
         setApprovalQueue((current) => current.filter((item) => item.thread_id !== event.thread_id));
-        notify(failed ? '任务已结束（失败或已取消）。' : '任务已完成，结果见下方摘要。', failed ? 'error' : 'success');
+        notify(
+          outcome === 'success'
+            ? '任务已完成，结果见下方摘要。'
+            : `任务已结束（${outcomeLabel(outcome)}），请查看下方统计与停止原因。`,
+          outcome === 'success' ? 'success' : outcome === 'partial' || outcome === 'budget_exhausted' ? 'info' : 'error',
+        );
         break;
       }
       case 'error': {
@@ -317,6 +328,7 @@ export function App() {
     saveTools,
     refreshTools,
     savePreference,
+    deletePreference,
     createJob,
     deleteJob,
     rollbackOperation,
@@ -652,6 +664,7 @@ export function App() {
         onRefreshTools={refreshTools}
         onFetchModels={fetchModels}
         onSavePreference={savePreference}
+        onDeletePreference={deletePreference}
         onCreateJob={createJob}
         onDeleteJob={deleteJob}
         onRollbackOperation={rollbackOperation}

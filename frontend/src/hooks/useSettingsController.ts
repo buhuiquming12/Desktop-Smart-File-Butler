@@ -161,6 +161,17 @@ export function useSettingsController(
     }
   }, [api]);
 
+  const deletePreference = useCallback(async (key: string): Promise<void> => {
+    setError(null);
+    try {
+      await api.deletePreference(key);
+      setPreferences((current) => current.filter((item) => item.key !== key));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '删除偏好失败');
+      throw reason;
+    }
+  }, [api]);
+
   const createJob = useCallback(async (job: Omit<ScheduledJob, 'job_id'>): Promise<void> => {
     setError(null);
     try {
@@ -215,6 +226,7 @@ export function useSettingsController(
     saveTools,
     refreshTools,
     savePreference,
+    deletePreference,
     createJob,
     deleteJob,
     rollbackOperation,

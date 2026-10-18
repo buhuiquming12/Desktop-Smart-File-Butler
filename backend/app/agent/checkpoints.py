@@ -30,7 +30,11 @@ _UUID_EPOCH = datetime(1582, 10, 15, tzinfo=timezone.utc)
 
 
 def checkpoint_created_at(checkpoint_id: Any) -> Optional[datetime]:
-    """从 LangGraph 使用的 UUIDv6 checkpoint id 解析生成时刻。"""
+    """从 LangGraph 使用的 UUIDv6 checkpoint id 解析生成时刻。
+
+    时间戳单位是 100ns，这里用整数除法向下取整：用浮点除法四舍五入可能把
+    “刚刚落盘”的 checkpoint 解析成几微秒之后的未来时刻，使 TTL 边界抖动。
+    """
     try:
         value = uuid.UUID(str(checkpoint_id))
     except (ValueError, AttributeError, TypeError):
@@ -43,7 +47,7 @@ def checkpoint_created_at(checkpoint_id: Any) -> Optional[datetime]:
         | ((high48 & 0xFFFF) << 12)
         | ((value.int >> 64) & 0x0FFF)
     )
-    return _UUID_EPOCH + timedelta(microseconds=intervals / 10)
+    return _UUID_EPOCH + timedelta(microseconds=intervals // 10)
 
 
 def cleanup_checkpoints(
@@ -95,15 +99,20 @@ def cleanup_checkpoints(
         sessions.append((str(latest), thread_id))
     sessions.sort(reverse=True)
 
-    cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
     victims = []
-    for index, (latest, thread_id) in enumerate(sessions):
-        if index < max_sessions:
-            continue
-        created = checkpoint_created_at(latest)
-        if created is None or created >= cutoff:
-            continue
-        victims.append(thread_id)
+    if max_age_days <= 0:
+        # 保留期 0 天 = 不按时间保留任何会话（只受 max_sessions 与待审批保护）。
+        # 用显式分支而不是“与当前时刻比较”，避免刚落盘的会话卡在微秒边界上。
+        victims = [thread_id for _, thread_id in sessions[max(max_sessions, 0):]]
+    else:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+        for index, (latest, thread_id) in enumerate(sessions):
+            if index < max_sessions:
+                continue
+            created = checkpoint_created_at(latest)
+            if created is None or created >= cutoff:
+                continue
+            victims.append(thread_id)
 
     removed = 0
     for thread_id in victims:

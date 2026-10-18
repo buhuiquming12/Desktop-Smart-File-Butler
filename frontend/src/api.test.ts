@@ -14,12 +14,18 @@ async function main(): Promise<void> {
   }
 
   const events = reconciliationEvents('thread-1', {
-    status: 'completed', final_response: 'done',
+    status: 'completed', outcome: 'partial', stop_reason: 'tool_failed', run_id: 'run-9',
+    final_response: 'done',
     observations: [{ tool: 'move_file', status: 'ok', description: 'moved' }],
     summary: { ok: 1, failed: 0, skipped: 0, files: [], operations: [] },
   });
   if (!events.some((event) => event.type === 'tool_result')) throw new Error('重连未恢复 observations');
-  if (!events.some((event) => event.type === 'done')) throw new Error('重连未恢复终态');
+  const done = events.find((event) => event.type === 'done');
+  if (!done) throw new Error('重连未恢复终态');
+  if (done.payload.outcome !== 'partial' || done.payload.stop_reason !== 'tool_failed') {
+    throw new Error('重连丢失 outcome / stop_reason，界面会把部分完成显示成功');
+  }
+  if (done.payload.run_id !== 'run-9') throw new Error('重连丢失运行编号');
 
   const rollback = rollbackFeedback({ ok: 7, skipped: 2, failed: 1, details: [] });
   if (rollback.kind !== 'error' || !rollback.message.includes('失败 1')) throw new Error('部分回滚失败被显示为全成功');

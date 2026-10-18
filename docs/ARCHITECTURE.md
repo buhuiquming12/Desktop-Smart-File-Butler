@@ -198,9 +198,37 @@ mutation 数量保存在整个 user request 的状态中，不因为重新规划
 
 删除始终属于高风险操作。
 
-后续安全演进方向是把所有有持久副作用的工具统一纳入一个 Side-effect Policy Contract，包括批量分类、定时任务和偏好写入，减少工具之间策略映射不一致的可能。
+工具副作用不再是散落在各处的字符串映射：`tools/contracts.py` 是唯一登记处，记录每个工具的参数模型、处理器、副作用（read/create/write/move/rename/delete/preference/schedule）与权限语义。策略层从这份登记推导，因此：
 
-## 6. 并发与 TOCTOU
+- `batch_classify` 与实际行为一致地登记为 move，参与移动授权与累计审批；
+- 未知工具、缺少契约、参数校验失败都显式失败（fail closed），不会“默认放行”；
+- 参数在进入文件系统前由 Pydantic 校验，未知字段直接拒绝。
+
+## 6. 完成判定与运行追踪
+
+流程终止与目标完成是两件事，状态里用不同字段分别表达：
+
+- `status`：流程在哪终止（completed / failed / cancelled / needs_clarification / waiting_approval）。
+- `outcome`：目标完成度（success / partial / failed / rejected / cancelled / budget_exhausted / needs_clarification）。
+- `stop_reason`：为什么停（goal_verified / model_done / replan_limit / user_rejected / budget_exhausted / tool_failed / exception）。
+
+模型可以提出 `done`，但“是否成功”由 `agent/outcome.py` 的确定性校验决定：它只读取已确认计划与真实工具结果，检查文件是否存在、批量计数是否自洽、扫描是否截断、是否还有未执行步骤。校验只读元数据，不产生新的文件变更；任何部分完成、拒绝、预算耗尽都会覆盖模型“全部成功”的措辞。
+
+统计口径分开：`ok/failed/skipped` 是工具调用次数，`files_ok/files_failed/files_skipped/matched` 是文件级结果。
+
+运行追踪（`run_trace`）记录运行编号、节点耗时、模型调用次数、工具调用次数与停止原因；供应商提供 usage 时记录 Token，否则标记 `unknown`。预算可配置：
+
+| 偏好键 | 默认 | 含义 |
+|---|---|---|
+| `agent_max_model_calls` | 120 | 单次运行的模型调用上限 |
+| `agent_max_tool_calls` | 100 | 单次运行的工具调用上限 |
+| `agent_execution_budget_seconds` | 600 | 单次运行的执行时间预算（按节点耗时累计，等待审批/用户输入不计入） |
+| `agent_model_timeout_seconds` | 60 | 单次模型请求超时（支持的 provider） |
+| `batch_approval_threshold` | 20 | 请求级累计审批阈值 |
+
+取消与超时的边界一致：只在节点/步骤边界生效，已完成的步骤保留，其后不再产生文件变更；失败的工具调用不会自动重试，避免重复写入。
+
+## 7. 并发与 TOCTOU
 
 简单的“先判断目标不存在，再移动”存在检查与使用之间的竞争窗口。
 
@@ -214,7 +242,7 @@ mutation 数量保存在整个 user request 的状态中，不因为重新规划
 
 受保护的场景包括 move、rename、delete、rollback 和摘要输出命名。
 
-## 7. 状态恢复
+## 8. 状态恢复
 
 WebSocket 自动重连只能保证“重新连上”，不能保证断线期间的 tool_result、approval_required 或 done 没有丢失。
 
@@ -238,7 +266,7 @@ REST fallback 发起新聊天时会保存服务端返回的 thread_id，因此�
 
 当前尚未实现逐事件 event_id replay。
 
-## 8. Runtime 生命周期
+## 9. Runtime 生命周期
 
 模型设置变化后不能简单替换全局 Runtime，因为旧 workflow 可能还在执行。
 
@@ -259,7 +287,7 @@ Runtime A closes resources
 
 一个 workflow 从启动到结束绑定同一个 Runtime，避免执行器和状态读取器来自不同实例。
 
-## 9. SQLite 与持久化
+## 10. SQLite 与持久化
 
 SQLite 负责：
 
@@ -273,7 +301,7 @@ LangGraph checkpoint 使用独立 SQLite saver 并启用 WAL。
 
 普通业务数据库使用独立短连接，并配置 busy timeout 和 synchronous NORMAL，以适应 FastAPI 与 APScheduler 的多线程访问。
 
-## 10. 桌面端发布架构
+## 11. 桌面端发布架构
 
 ~~~mermaid
 flowchart LR
@@ -294,7 +322,7 @@ flowchart LR
 
 生产包不要求目标机器安装 Python 开发环境。
 
-## 11. CI
+## 12. CI
 
 GitHub Actions 当前包含：
 
@@ -320,14 +348,17 @@ Windows / desktop
 
 CI 不只验证代码和单元测试，也验证 Windows 桌面交付链能够真正产出 portable artifact。
 
-## 12. 主要模块职责
+## 13. 主要模块职责
 
 | 模块 | 职责 |
 |---|---|
 | agent/graph.py | LangGraph 节点、状态流转、审批与流程编排 |
 | agent/tool_executor.py | 工具分发、批量执行、分类、摘要 |
 | agent/checkpoints.py | Checkpoint 创建与保留策略 |
+| agent/outcome.py | 确定性完成判定：文件级计数、后置条件校验、outcome/stop_reason |
+| agent/tracing.py | 运行追踪：Token 用量采集（不可获得时标记 unknown） |
 | policy/engine.py | 后端授权与累计 mutation 策略 |
+| tools/contracts.py | 工具契约：参数模型、副作用、权限登记（唯一来源） |
 | tools/manifests.py | 完整扫描清单与确定性过滤 |
 | tools/path_locks.py | 目录级 mutation 锁 |
 | tools/filesystem.py | 文件操作、软删除、回滚 |
@@ -339,7 +370,7 @@ CI 不只验证代码和单元测试，也验证 Windows 桌面交付链能够�
 | hooks/useBackendConfig.ts | backend endpoint 与首次能力检查 |
 | hooks/useSettingsController.ts | 设置页数据与操作状态 |
 
-## 13. 关键设计取舍
+## 14. 关键设计取舍
 
 ### 为什么不是让 LLM 直接调用所有文件工具？
 
@@ -364,12 +395,13 @@ Filesystem: Perform it safely.
 
 LangGraph、文档解析和 OCR 生态集中在 Python；Electron 更适合桌面 UX。sidecar 保留两端优势，并通过 PyInstaller 消除最终用户的 Python 环境依赖。
 
-## 14. 当前边界与下一步
+## 15. 当前边界与下一步
 
 1. WebSocket 尚未实现 event sequence replay。
 2. scan manifest 需要 TTL、容量配额和清理策略。
 3. 原始意图授权仍是保守词法策略，可演进为强类型 Intent Contract。
-4. 所有 side-effect tool 应统一纳入单一 Policy Registry。
+4. 已建立统一的工具契约登记（`tools/contracts.py`）；后续可把处理器注册表本身也迁入该模块。
 5. main.py、graph.py、App.tsx 已开始拆分，但仍可继续抽出 workflow service、Agent transport 和 conversation controller。
 6. API Key 当前不回传 Renderer，但本地 SQLite 仍是明文；正式产品可接系统 Keychain 或 Credential Manager。
 7. 正式发布还需要代码签名、品牌图标与全新 Windows VM 的安装级验证。
+8. 长期偏好目前是键值列表（可查看/更新/删除），还没有按语义检索；跨会话只隔离 thread 状态，不隔离偏好（偏好本就是全局设置）。

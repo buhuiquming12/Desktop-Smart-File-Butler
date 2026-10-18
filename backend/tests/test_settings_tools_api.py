@@ -215,3 +215,33 @@ def test_workspace_endpoints_require_session_token(env: SimpleEnv) -> None:
 
     sandbox_config.save_roots([str(env.root)])  # 保证有授权目录，排除无关原因
     assert env.client.get("/api/settings/tools").status_code == 200
+
+
+# ---------- 偏好记忆：查看 / 更新 / 删除 ----------
+
+def test_preferences_can_be_listed_updated_and_deleted(env: SimpleEnv) -> None:
+    assert env.client.put("/api/preferences/archive_style", json={"value": "by-month"}).status_code == 200
+    body = env.client.get("/api/preferences").json()
+    assert {"key": "archive_style", "value": "by-month"} in body
+
+    assert env.client.put("/api/preferences/archive_style", json={"value": "by-type"}).status_code == 200
+    assert {"key": "archive_style", "value": "by-type"} in env.client.get("/api/preferences").json()
+
+    assert env.client.delete("/api/preferences/archive_style").status_code == 200
+    assert all(item["key"] != "archive_style" for item in env.client.get("/api/preferences").json())
+    # 再删同一个键是 404，不是静默成功。
+    assert env.client.delete("/api/preferences/archive_style").status_code == 404
+
+
+def test_reserved_preference_cannot_be_deleted_via_api(env: SimpleEnv) -> None:
+    db.set_preference("__sandbox_roots__", "x", allow_reserved=True)
+    response = env.client.delete("/api/preferences/__sandbox_roots__")
+    assert response.status_code == 422
+    assert db.get_preference("__sandbox_roots__") == "x"
+
+
+def test_preferences_delete_requires_session_token(env: SimpleEnv) -> None:
+    response = env.client.delete(
+        "/api/preferences/anything", headers={"X-Butler-Token": ""}
+    )
+    assert response.status_code == 401

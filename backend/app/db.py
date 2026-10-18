@@ -258,6 +258,14 @@ def get_preference(key: str) -> Optional[str]:
     return row["value"] if row else None
 
 
+def delete_preference(key: str) -> bool:
+    """删除普通偏好；保留键（``__`` 前缀）不可通过该入口删除。"""
+    normalized = validate_public_preference_key(key)
+    with _conn() as c:
+        cursor = c.execute("DELETE FROM preferences WHERE key=?", (normalized,))
+    return cursor.rowcount > 0
+
+
 def all_preferences() -> List[Preference]:
     """返回用户偏好。以 __ 开头的保留键（如内部沙箱配置）不对外暴露、也不喂给规划器。"""
     with _conn() as c:

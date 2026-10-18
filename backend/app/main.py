@@ -30,6 +30,7 @@ from .api.auth import (
 from .api.connections import ConnectionManager
 from .api.management import build_management_router
 from .agent.graph import AgentRuntime
+from .agent import tracing
 from .config import get_settings
 from .logging_conf import get_logger, setup_logging
 from .models import (
@@ -217,6 +218,8 @@ async def _fail_terminal(
             WSEventType.done,
             thread_id,
             status="failed",
+            outcome="failed",
+            stop_reason="exception",
             message=message,
             error=detail or message,
             summary=ws_events.build_task_summary([]),
@@ -286,11 +289,18 @@ async def _run_stream(
                             cancel_state(thread_id)
                         except Exception:  # noqa: BLE001 - 尚无首个 checkpoint 时仍要完成取消
                             logger.exception("写入取消 checkpoint 失败 thread=%s", thread_id)
+                    cancelled_state = selected.state(thread_id)
                     terminal = _event(
                         WSEventType.done, thread_id,
                         status="cancelled",
+                        outcome="cancelled",
+                        stop_reason="cancelled",
                         message="任务已停止。当前步骤前的操作已保留，可在操作日志中查看或撤销。",
-                        summary=ws_events.build_task_summary(selected.state(thread_id).get("observations", [])),
+                        summary=ws_events.build_task_summary(
+                            cancelled_state.get("observations", []), cancelled_state
+                        ),
+                        run_id=cancelled_state.get("run_id", ""),
+                        usage=tracing.usage_for(thread_id),
                     )
                     if broadcast:
                         await connections.broadcast(terminal)
@@ -317,16 +327,27 @@ async def _run_stream(
                     await connections.send(client_id, approval_event)
             return state
 
-        # 终态统一走 done（status=completed|failed），WSEventType.error 只留给非终态诊断（B1）。
+        # 终态统一走 done（status=completed|failed|cancelled），error 只留给非终态诊断（B1）。
+        # outcome 与 status 分离：流程终止≠目标完成，前端必须分别展示。
         final_status = state.get("status")
         terminal = _event(
             WSEventType.done,
             thread_id,
             status=final_status,
+            outcome=state.get("outcome", ""),
+            stop_reason=state.get("stop_reason", ""),
             message=state.get("final_response", ""),
             error=state.get("error", ""),
             observations=state.get("observations", []),
-            summary=ws_events.build_task_summary(state.get("observations", [])),
+            summary=ws_events.build_task_summary(
+                state.get("observations", []), state
+            ),
+            run_id=state.get("run_id", ""),
+            usage=tracing.usage_for(thread_id),
+            trace={
+                key: (state.get("run_trace") or {}).get(key)
+                for key in ("model_calls", "tool_calls", "execution_ms")
+            },
         )
         if broadcast:
             await connections.broadcast(terminal)
@@ -378,6 +399,16 @@ async def _start_chat(
             # 启动也在终态兜底内：模型未配置时 AgentRuntime 构造就可能失败。
             try:
                 runtime = get_runtime()
+                pending_state = runtime.state(thread_id)
+                if pending_state.get("pending_approval"):
+                    diagnostic = _event(
+                        WSEventType.error,
+                        thread_id,
+                        message="当前会话仍在等待审批，请先批准或拒绝该操作，再发送新消息。",
+                    )
+                    if client_id:
+                        await connections.send(client_id, diagnostic)
+                    return thread_id
                 iterator = runtime.start_stream(request.message.strip(), thread_id)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("启动会话失败 thread=%s", thread_id)
@@ -490,7 +521,11 @@ def thread_state(thread_id: str) -> Dict[str, Any]:
     state = get_runtime().state(thread_id)
     if not state:
         raise HTTPException(status_code=404, detail="会话不存在")
-    return {**state, "summary": ws_events.build_task_summary(state.get("observations", []))}
+    return {
+        **state,
+        "summary": ws_events.build_task_summary(state.get("observations", []), state),
+        "usage": tracing.usage_for(thread_id),
+    }
 
 
 @app.post("/api/threads/{thread_id}/cancel", status_code=status.HTTP_202_ACCEPTED)

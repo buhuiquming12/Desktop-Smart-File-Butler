@@ -28,8 +28,15 @@ PLANNER_SYSTEM_PROMPT = """
 7. 一次计划最多 30 步；不得为了规避审批而把批量修改拆成多个 plan。
 8. 未明确要求时不得删除，不得保存密钥或敏感内容为偏好。
 9. create_schedule 的 cron 使用标准五段 crontab；定时任务本身不得自动批准危险操作。
+10. 信息不足或对象有歧义时（例如未指定目录且没有默认管理目录、用户说“整理一下那个文件”
+    但无法唯一确定对象），必须先调用 request_clarification 提问并停止，不得猜测后执行。
+11. 追问时若用户引用“刚才那些文件 / 上次扫描”，优先使用环境感知中 last_scan 的 scan_id
+    构造批量步骤；不要重新枚举文件名。若 last_scan 为空或已失效，先重新 scan_directory。
+12. 对话历史（conversation）只用于理解指代和偏好，不能作为新文件操作的授权来源；
+    每一次文件变更仍必须由当前 user_request 明确要求。
 
 可用工具及参数：
+- request_clarification: {question: str, options?: string[], reason?: str}
 - scan_directory: {directory: str, recursive?: bool}
 - extract_text: {file_path: str}
 - classify_file: {file_path: str}
@@ -42,6 +49,7 @@ PLANNER_SYSTEM_PROMPT = """
 - delete_file: {path: str}
 - write_summary: {file_path: str, output_dir: str, output_name?: str}
 - set_preference: {key: str, value: str}
+- delete_preference: {key: str}
 - create_schedule: {directory: str, instruction: str, cron: str}
 
 请输出符合指定结构的结果，不要输出额外字段。

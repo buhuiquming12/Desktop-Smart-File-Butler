@@ -14,6 +14,7 @@ from ..logging_conf import get_logger
 from ..models import ScheduledJob
 from ..security import resolve_in_sandbox
 from ..tools import categories, extract, filesystem, manifests, scheduler
+from ..tools.contracts import validate_tool_args
 from ..tools.path_locks import path_locks
 
 logger = get_logger(__name__)
@@ -49,7 +50,14 @@ class ToolExecutor:
 
     def execute(self, step: Dict[str, Any]) -> Dict[str, Any]:
         tool = str(step.get("tool", ""))
-        args = dict(step.get("args") or {})
+        raw_args = step.get("args") or {}
+        # 契约校验必须先于任何文件系统访问：未知工具、缺失参数、类型错误
+        # 都返回明确失败，而不是带着残缺参数继续执行。
+        normalized_args, argument_error = validate_tool_args(tool, raw_args)
+        if argument_error:
+            logger.warning("工具参数校验失败 tool=%s error=%s args=%s", tool, argument_error, raw_args)
+            return self.observation(step, "failed", error=argument_error)
+        args = normalized_args or {}
         try:
             if tool == "scan_directory":
                 scan = filesystem.scan_directory(
@@ -93,6 +101,16 @@ class ToolExecutor:
             elif tool == "set_preference":
                 db.set_preference(str(args["key"]), str(args["value"]))
                 result = {"key": str(args["key"]), "saved": True}
+            elif tool == "delete_preference":
+                deleted = db.delete_preference(str(args["key"]))
+                result = {"key": str(args["key"]), "deleted": deleted}
+            elif tool == "request_clarification":
+                # 正常路径由图节点拦截；直接执行时也只返回问题，不产生副作用。
+                result = {
+                    "question": str(args["question"]),
+                    "options": list(args.get("options") or []),
+                    "reason": str(args.get("reason") or ""),
+                }
             elif tool == "create_schedule":
                 result = self.create_schedule(args)
             else:

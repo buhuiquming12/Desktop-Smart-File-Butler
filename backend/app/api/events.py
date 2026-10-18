@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from typing import Any, Awaitable, Callable, Dict, Iterable, Optional, Tuple
 
+from ..agent import tracing
 from ..models import WSEvent, WSEventType
 
 
@@ -52,9 +53,11 @@ async def emit_update(
 
 
 async def emit_token(send: Callable[[str, WSEvent], Awaitable[None]], client_id: Optional[str], thread_id: str, data: Any) -> None:
+    chunk = data[0] if isinstance(data, tuple) else data
+    # 供应商提供 usage 时累计到本次运行；未提供则最终标记 unknown。
+    tracing.record(thread_id, chunk)
     if not client_id:
         return
-    chunk = data[0] if isinstance(data, tuple) else data
     content = getattr(chunk, "content", None)
     if isinstance(content, str) and content:
         await send(client_id, event(WSEventType.token, thread_id, token=content))
@@ -94,6 +97,17 @@ _STATUS_LABELS = {
     "cancelled": "跳过",
 }
 
+_OUTCOME_LABELS = {
+    "success": "已完成",
+    "partial": "部分完成",
+    "failed": "失败",
+    "rejected": "已拒绝",
+    "cancelled": "已取消",
+    "budget_exhausted": "预算耗尽",
+    "needs_clarification": "待补充信息",
+    "unknown": "无法确认",
+}
+
 
 def _observation_status_label(status: object) -> str:
     return _STATUS_LABELS.get(str(status), str(status) or "未知")
@@ -130,10 +144,15 @@ def _observation_paths(obs: Dict[str, Any]) -> tuple[str, Optional[str]]:
     return src, dest
 
 
-def build_task_summary(observations: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+def build_task_summary(
+    observations: Iterable[Dict[str, Any]],
+    state: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """从观测列表生成结构化任务摘要（体验优化）。
 
     只回传安全、可审计的字段；操作明细不做全文转储，文件路径按唯一性截断展示。
+    ``ok/failed/skipped`` 是工具调用次数；文件级结果单独放在 ``files_*`` 字段，
+    避免把 10 次批量调用说成“10 个文件全部成功”。
     """
     items = list(observations)
     ok = 0
@@ -169,10 +188,40 @@ def build_task_summary(observations: Iterable[Dict[str, Any]]) -> Dict[str, Any]
             "dest": dest or None,
         })
 
-    return {
+    summary: Dict[str, Any] = {
         "ok": ok,
         "failed": failed,
         "skipped": skipped,
         "files": files[:12],
         "operations": operations,
     }
+    if state is None:
+        # 兼容既有调用方：没有会话状态时维持原来的精简结构。
+        return summary
+
+    # 文件级计数与完成度来自后端确定性校验，而不是模型措辞。
+    from ..agent.outcome import collect_stats  # 延迟导入，避免循环依赖
+
+    stats = collect_stats(
+        items,
+        mutations=state.get("mutations") or {},
+        plan=state.get("plan") or [],
+        step_index=int(state.get("step_index") or 0),
+    )
+    file_stats = stats["file_stats"]
+    summary.update({
+        "outcome": str(state.get("outcome") or ""),
+        "outcome_label": _OUTCOME_LABELS.get(
+            str(state.get("outcome") or ""), ""
+        ),
+        "stop_reason": str(state.get("stop_reason") or ""),
+        "verified": state.get("outcome") == "success",
+        "files_ok": int(file_stats.get("success", 0)),
+        "files_failed": int(file_stats.get("failed", 0)),
+        "files_skipped": int(file_stats.get("skipped", 0)),
+        "matched": int(file_stats.get("matched", 0)),
+        "tool_calls": int(stats.get("tool_calls", 0)),
+        "unexecuted_steps": int(stats.get("unexecuted_steps", 0) or 0),
+        "truncated_reasons": list(stats.get("truncated_reasons") or []),
+    })
+    return summary

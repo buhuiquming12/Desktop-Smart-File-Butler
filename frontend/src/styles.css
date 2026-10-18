@@ -148,6 +148,7 @@ h3 { margin: 0; font-size: 15px; }
 .badge { flex: 0 0 auto; padding: 3px 5px; border-radius: 5px; background: #f0f1f4; color: #777e8d; font-size: 11px; font-weight: 800; }
 .badge--running { color: var(--primary); background: var(--primary-soft); }
 .badge--success { color: #267b5c; background: #e9f7f1; }
+.badge--partial { color: #a66b1f; background: #fff5e7; }
 .badge--failed { color: #b43b46; background: #fff0f1; }
 .badge--waiting { color: #a66b1f; background: #fff5e7; }
 .task-clear { margin: 0 15px 13px auto; }
@@ -263,6 +264,10 @@ h3 { margin: 0; font-size: 15px; }
 
 /* ---------------- 任务完成摘要卡（体验优化） ---------------- */
 .summary-card { margin-top: 9px; padding: 12px 13px; border: 1px solid #e3e5ee; border-radius: 11px; background: #fbfcfe; }
+.summary-card--success { border-color: #cfe9de; }
+.summary-card--partial { border-color: #f0dcb4; background: #fffdf7; }
+.summary-card--failed { border-color: #f2ccd1; background: #fffafb; }
+.summary-card__stop-reason { margin: 0 0 9px; color: #8a5a1c; font-size: 11px; line-height: 1.5; }
 .summary-card__header { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 9px; }
 .summary-card__header strong { font-size: 13px; }
 .summary-card__header > span { color: var(--muted); font-family: ui-monospace, monospace; font-size: 11px; }

@@ -96,7 +96,9 @@ def test_thirty_step_plan_with_replan_completes(
 ) -> None:
     """P0-3 验收：30 步初计划 + 1 次 10 步重规划能跑完，不抛 GraphRecursionError。"""
     thread_id = "recursion-test"
-    for _ in configured_runtime.start_stream("整理测试目录", thread_id):
+    # P0-1 之后 set_preference 也需要原始意图授权（不再默认放行），
+    # 因此这里用同时包含“记住偏好”和“整理”的请求，保持本用例只验证递归预算。
+    for _ in configured_runtime.start_stream("记住这些偏好，然后整理测试目录", thread_id):
         pass
     state = configured_runtime.state(thread_id)
     assert state.get("status") == "completed", state.get("error")

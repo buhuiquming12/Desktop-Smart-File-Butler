@@ -19,7 +19,9 @@ ToolName = Literal[
     "delete_file",
     "write_summary",
     "set_preference",
+    "delete_preference",
     "create_schedule",
+    "request_clarification",
 ]
 
 
@@ -72,6 +74,7 @@ class AgentState(TypedDict, total=False):
         "planning",
         "running",
         "waiting_approval",
+        "needs_clarification",
         "completed",
         "failed",
         "cancelled",
@@ -82,3 +85,12 @@ class AgentState(TypedDict, total=False):
     batch_rejected: bool          # 本计划的批量 move/rename 被拒绝，全部跳过
     mutations: Dict[str, int]
     approved_mutation_limit: int
+    # 独立于流程状态的“目标完成度”；status 表示流程在哪终止，outcome 表示目标结果。
+    outcome: str
+    stop_reason: str
+    completion: Dict[str, Any]
+    # P1：运行追踪、多轮上下文与最近一次可用扫描。
+    run_id: str
+    run_trace: Dict[str, Any]
+    conversation: List[Dict[str, Any]]
+    last_scan: Dict[str, Any]

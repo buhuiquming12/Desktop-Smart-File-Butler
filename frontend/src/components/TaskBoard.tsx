@@ -9,6 +9,7 @@ const statusText: Record<TaskStatus, string> = {
   pending: '等待',
   running: '执行中',
   success: '完成',
+  partial: '未完成',
   failed: '失败',
   waiting: '待审批',
 };

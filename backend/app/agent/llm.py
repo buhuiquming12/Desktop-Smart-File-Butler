@@ -21,9 +21,14 @@ _T = TypeVar("_T", bound=BaseModel)
 
 
 def build_llm(temperature: float = 0.1):
-    """构造聊天模型。支持 openai / ollama。配置来自 .env 与前端保存的覆盖项。"""
+    """构造聊天模型。支持 openai / ollama。配置来自 .env 与前端保存的覆盖项。
+
+    请求超时来自偏好 ``agent_model_timeout_seconds``（默认 60 秒），只对支持该参数的
+    provider 生效：超时让单次模型调用尽快失败，而不是让整个任务无限挂起。
+    """
     config = get_effective_config()
     provider = config.provider
+    timeout = _model_timeout()
 
     if provider == "openai":
         from langchain_openai import ChatOpenAI
@@ -34,10 +39,12 @@ def build_llm(temperature: float = 0.1):
             model=config.openai_model,
             api_key=config.openai_api_key,
             temperature=temperature,
+            timeout=timeout,
+            max_retries=1,
         )
         if config.openai_base_url:
             kwargs["base_url"] = config.openai_base_url
-        logger.info("使用 OpenAI 模型: %s", config.openai_model)
+        logger.info("使用 OpenAI 模型: %s（超时 %ss）", config.openai_model, timeout)
         return ChatOpenAI(**kwargs)
 
     if provider == "ollama":
@@ -51,6 +58,18 @@ def build_llm(temperature: float = 0.1):
         )
 
     raise ValueError(f"未知 provider: {provider}")
+
+
+def _model_timeout() -> int:
+    """单次模型请求超时（秒）。读取失败或非法值回退默认，绝不因配置坏值启动失败。"""
+    try:
+        from .. import db
+
+        raw = db.get_preference("agent_model_timeout_seconds")
+        value = int(raw) if raw is not None else 60
+    except Exception:  # noqa: BLE001 - 数据库未初始化时不应影响建模
+        return 60
+    return value if value > 0 else 60
 
 
 # --------------------------- 提示词驱动的 JSON 结构化输出 ---------------------------

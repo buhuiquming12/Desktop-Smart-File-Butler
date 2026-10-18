@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import { shortThreadId } from '../state';
-import type { TaskSummary, TaskSummaryOperation } from '../types';
+import { outcomeLabel, shortThreadId } from '../state';
+import type { TaskOutcome, TaskSummary, TaskSummaryOperation } from '../types';
 import type { ToastKind } from './ToastStack';
 
 interface TaskSummaryCardProps {
@@ -26,11 +26,28 @@ function operationStatusLabel(op: TaskSummaryOperation): string {
   return op.status_label || op.status || '未知';
 }
 
+const OUTCOME_TONE: Record<string, string> = {
+  success: 'summary-card--success',
+  partial: 'summary-card--partial',
+  failed: 'summary-card--failed',
+  rejected: 'summary-card--failed',
+  cancelled: 'summary-card--failed',
+  budget_exhausted: 'summary-card--partial',
+  needs_clarification: 'summary-card--partial',
+};
+
 /** 复制/打开目录只处理后端摘要里已校验过的路径；不使用 dangerouslySetInnerHTML。 */
 export function TaskSummaryCard({ summary, threadId, onCopy, onReveal, onRollback }: TaskSummaryCardProps) {
   const [expanded, setExpanded] = useState(false);
   const [confirmingRollback, setConfirmingRollback] = useState(false);
   const confirmTimerRef = useRef<number | null>(null);
+
+  const outcome = (summary.outcome || 'unknown') as TaskOutcome;
+  const toneClass = OUTCOME_TONE[outcome] ?? '';
+  const label = summary.outcome_label || outcomeLabel(outcome);
+  const filesOk = summary.files_ok ?? 0;
+  const filesFailed = summary.files_failed ?? 0;
+  const filesSkipped = summary.files_skipped ?? 0;
 
   useEffect(() => () => {
     if (confirmTimerRef.current !== null) window.clearTimeout(confirmTimerRef.current);
@@ -50,17 +67,39 @@ export function TaskSummaryCard({ summary, threadId, onCopy, onReveal, onRollbac
   };
 
   return (
-    <div className="summary-card">
+    <div className={`summary-card ${toneClass}`.trim()}>
       <header className="summary-card__header">
-        <strong>任务完成摘要</strong>
+        <strong>任务结果 · {label}</strong>
         <span>会话 {shortThreadId(threadId)}</span>
       </header>
 
-      <div className="summary-stats" aria-label="统计">
-        <span className="summary-stat summary-stat--ok">成功 <b>{summary.ok}</b></span>
-        <span className="summary-stat summary-stat--failed">失败 <b>{summary.failed}</b></span>
-        <span className="summary-stat summary-stat--skipped">跳过 <b>{summary.skipped}</b></span>
-      </div>
+      {summary.stop_reason && summary.stop_reason !== 'goal_verified' && (
+        <p className="summary-card__stop-reason">
+          停止原因：{summary.stop_reason}
+          {summary.unexecuted_steps ? `；仍有 ${summary.unexecuted_steps} 个已规划步骤未执行` : ''}
+        </p>
+      )}
+
+      {summary.truncated_reasons && summary.truncated_reasons.length > 0 && (
+        <p className="summary-card__stop-reason">
+          扫描不完整：{summary.truncated_reasons.join('、')}（未列举完整目录）
+        </p>
+      )}
+
+      {(filesOk + filesFailed + filesSkipped > 0 || summary.matched) ? (
+        <div className="summary-stats" aria-label="文件统计">
+          <span className="summary-stat summary-stat--ok">文件成功 <b>{filesOk}</b></span>
+          <span className="summary-stat summary-stat--failed">文件失败 <b>{filesFailed}</b></span>
+          <span className="summary-stat summary-stat--skipped">文件跳过 <b>{filesSkipped}</b></span>
+          {summary.matched ? <span className="summary-stat">匹配 <b>{summary.matched}</b></span> : null}
+        </div>
+      ) : (
+        <div className="summary-stats" aria-label="工具调用统计">
+          <span className="summary-stat summary-stat--ok">工具成功 <b>{summary.ok}</b></span>
+          <span className="summary-stat summary-stat--failed">工具失败 <b>{summary.failed}</b></span>
+          <span className="summary-stat summary-stat--skipped">工具跳过 <b>{summary.skipped}</b></span>
+        </div>
+      )}
 
       {summary.files.length > 0 && (
         <div className="summary-files">

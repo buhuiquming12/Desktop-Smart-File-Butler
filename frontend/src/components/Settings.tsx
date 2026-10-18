@@ -42,6 +42,7 @@ interface SettingsProps {
   onRefreshTools: () => Promise<void>;
   onFetchModels: (request: LLMModelsRequest) => Promise<LLMModelsResponse>;
   onSavePreference: (preference: Preference) => Promise<void>;
+  onDeletePreference: (key: string) => Promise<void>;
   onCreateJob: (job: Omit<ScheduledJob, 'job_id'>) => Promise<void>;
   onDeleteJob: (jobId: string) => Promise<void>;
   onRollbackOperation: (opId: number) => Promise<void>;
@@ -627,7 +628,11 @@ export function Settings(props: SettingsProps) {
               <div><h3>Agent 偏好</h3><p>这些键值会由后端保存，并在后续任务中使用。</p></div>
               <div className="data-list">
                 {props.preferences.length === 0 ? <p className="muted">暂未保存偏好。</p> : props.preferences.map((item) => (
-                  <div className="data-row" key={item.key}><strong>{item.key}</strong><span>{item.value || '—'}</span></div>
+                  <div className="data-row" key={item.key}>
+                    <strong>{item.key}</strong>
+                    <span>{item.value || '—'}</span>
+                    <button className="text-button text-button--danger" type="button" onClick={() => void props.onDeletePreference(item.key)}>删除</button>
+                  </div>
                 ))}
               </div>
               <form className="stack-form" onSubmit={(event) => void savePreference(event)}>

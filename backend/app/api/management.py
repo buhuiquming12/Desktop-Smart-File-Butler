@@ -252,6 +252,16 @@ def build_management_router(reset_runtime: Callable[[], None]) -> APIRouter:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {"key": normalized_key, "value": body.value}
 
+    @router.delete("/preferences/{key}")
+    def delete_preference(key: str) -> Dict[str, Any]:
+        try:
+            deleted = db.delete_preference(key)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if not deleted:
+            raise HTTPException(status_code=404, detail="偏好不存在")
+        return {"key": key, "status": "deleted"}
+
     @router.get("/jobs")
     def jobs() -> list[Dict[str, Any]]:
         return [item.model_dump() for item in db.list_jobs()]
