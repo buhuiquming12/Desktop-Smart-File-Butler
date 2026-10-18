@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { outcomeLabel, shortThreadId } from '../state';
+import { effectLabel, outcomeLabel, shortThreadId, stopReasonLabel } from '../state';
 import type { TaskOutcome, TaskSummary, TaskSummaryOperation } from '../types';
 import type { ToastKind } from './ToastStack';
 
@@ -75,8 +75,14 @@ export function TaskSummaryCard({ summary, threadId, onCopy, onReveal, onRollbac
 
       {summary.stop_reason && summary.stop_reason !== 'goal_verified' && (
         <p className="summary-card__stop-reason">
-          停止原因：{summary.stop_reason}
+          停止原因：{stopReasonLabel(summary.stop_reason)}
           {summary.unexecuted_steps ? `；仍有 ${summary.unexecuted_steps} 个已规划步骤未执行` : ''}
+        </p>
+      )}
+
+      {summary.unmet_effects && summary.unmet_effects.length > 0 && (
+        <p className="summary-card__stop-reason">
+          未执行你要求的：{summary.unmet_effects.map(effectLabel).join('、')}
         </p>
       )}
 

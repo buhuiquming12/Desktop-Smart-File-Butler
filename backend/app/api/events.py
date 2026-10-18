@@ -209,6 +209,7 @@ def build_task_summary(
         step_index=int(state.get("step_index") or 0),
     )
     file_stats = stats["file_stats"]
+    completion = state.get("completion") or {}
     summary.update({
         "outcome": str(state.get("outcome") or ""),
         "outcome_label": _OUTCOME_LABELS.get(
@@ -216,6 +217,7 @@ def build_task_summary(
         ),
         "stop_reason": str(state.get("stop_reason") or ""),
         "verified": state.get("outcome") == "success",
+        "unmet_effects": list(completion.get("unmet_effects") or []),
         "files_ok": int(file_stats.get("success", 0)),
         "files_failed": int(file_stats.get("failed", 0)),
         "files_skipped": int(file_stats.get("skipped", 0)),

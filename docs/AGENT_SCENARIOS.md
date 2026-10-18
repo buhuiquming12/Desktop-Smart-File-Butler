@@ -9,7 +9,8 @@
 ```powershell
 cd backend
 python -m pytest -q tests/test_scenarios.py tests/test_tool_contracts.py tests/test_context_handoff.py `
-  tests/test_completion.py tests/test_multiturn.py tests/test_runtime_budget.py tests/test_review_regressions.py
+  tests/test_completion.py tests/test_multiturn.py tests/test_runtime_budget.py `
+  tests/test_review_regressions.py tests/test_review_regressions_2.py
 ```
 
 ## 速查表
@@ -41,6 +42,10 @@ python -m pytest -q tests/test_scenarios.py tests/test_tool_contracts.py tests/t
 | 23 | 连续移动 A→B→C | 中间路径消失也不误判 | `test_review_regressions.py::test_chained_moves_are_not_partial` |
 | 24 | 澄清只回路径 | 沿用上一轮授权 | `test_review_regressions.py::test_clarification_answer_keeps_original_authorization` |
 | 25 | 摘要工具内部调用 | 计入 model_calls 与预算 | `test_review_regressions.py::test_summary_tool_model_calls_are_counted` |
+| 26 | 澄清中改口 | 不继承旧授权 | `test_review_regressions_2.py::test_task_switch_during_clarification_drops_old_authorization` |
+| 27 | 只扫描就结束 | outcome=partial + goal_unmet | `test_review_regressions_2.py::test_scan_only_stop_is_not_goal_success` |
+| 28 | 工具内部超预算 | 调用次数不越过剩余额度 | `test_review_regressions_2.py::test_tool_internal_calls_stop_at_budget` |
+| 29 | 结果消失 | 缓存校验不会被当成最终结论 | `test_review_regressions_2.py::test_cached_verification_does_not_mask_vanished_result` |
 
 ## 场景细节
 
@@ -232,6 +237,36 @@ python -m pytest -q tests/test_scenarios.py tests/test_tool_contracts.py tests/t
 - 用户输入：`给 doc.txt 生成摘要`
 - 预期行为：`write_summary` 内部 2 次分段 + 1 次归并调用模型，全部计入运行预算。
 - 最终断言：`run_trace.model_calls >= 5`（planning 1 + reflecting 1 + 摘要 3）。
+
+### 26. 澄清中改口
+
+- 初始文件：`a.txt`。
+- 第一轮：`帮我整理一下文件` → 澄清；第二轮：`算了，只帮我扫描一下目录`。
+- 预期行为：改口标记命中，不再继承“整理”授权；模型仍计划移动时被拒绝。
+- 最终断言：`trusted_user_intent` 不含“整理”；`move_file` 观察 failed；文件未动。
+- 反向用例（`test_pure_path_answer_still_inherits`）：只回路径时仍继承。
+
+### 27. 只扫描就结束
+
+- 初始文件：`downloads/a.pdf`。
+- 用户输入：`把下载目录里的 PDF 移动到 PDF 文件夹`，模型只扫描就 `done`。
+- 预期行为：扫描不构成“移动”，目标要求未满足。
+- 最终断言：`outcome=partial`、`stop_reason=goal_unmet`、`completion.unmet_effects=["move"]`，
+  用户消息说明「移动」尚未执行。
+
+### 28. 工具内部超预算
+
+- 初始文件：约 60k 字符的 `doc.txt`（5 段）。
+- 配置：`agent_max_model_calls=4`。
+- 预期行为：规划已用 1 次，`write_summary` 内部最多再调用 3 次，超出即失败。
+- 最终断言：模型实际调用次数 ≤ 3；结果不是 success；错误/消息含「预算」。
+
+### 29. 结果消失
+
+- 初始文件：移动成功后结果文件被外部删除。
+- 预期行为：执行当下记录为 verified，但收尾复核发现路径消失且无后续操作消费它。
+- 最终断言：`outcome!=success`、对应 check 为 `failed`。
+- 反向用例（`test_superseded_result_is_not_treated_as_vanished`）：`A→B→C` 仍为 success。
 
 ## 手动演示（真实模型，可重复）
 

@@ -19,6 +19,53 @@ from ..tools.contracts import (
 )
 
 
+_NEGATION_MARKERS = (
+    "不要", "不用", "不需要", "不准", "不允许", "禁止", "无需", "先不", "别", "勿",
+    "don't", "do not", "never",
+)
+
+
+def _is_negated(text: str, index: int) -> bool:
+    """判断某个意图词是否被否定（“不要移动”“别整理”）。
+
+    只看词前 3 个字符：足够覆盖中文否定词，又不会把远处的“别”算进来。
+    """
+    window = text[max(0, index - 3):index]
+    return any(marker in window for marker in _NEGATION_MARKERS)
+
+
+def intent_effects(intent: str) -> set[str]:
+    """从用户原话推导“本次请求要求产生的副作用”。
+
+    这是保守的词法判据，供两处共用：
+    - PolicyEngine：某个副作用是否被本次请求授权；
+    - 完成判定：用户要求的效果是否真的发生过（扫描不算完成“移动”）。
+    """
+    text = (intent or "").casefold()
+    effects: set[str] = set()
+    for kind, terms in _INTENT_TERMS.items():
+        for term in terms:
+            start = text.find(term)
+            while start != -1:
+                if not _is_negated(text, start):
+                    effects.add(kind)
+                    break
+                start = text.find(term, start + 1)
+            if kind in effects:
+                break
+    return effects
+
+
+def is_task_switch(message: str) -> bool:
+    """用户是否在澄清之后改口/换任务（而不是补充信息）。"""
+    text = (message or "").casefold()
+    markers = (
+        "算了", "不用了", "不弄了", "取消", "重新开始", "换个", "换一个",
+        "改主意", "先不", "别整理", "新任务", "never mind", "forget it",
+    )
+    return any(marker in text for marker in markers)
+
+
 _INTENT_TERMS: dict[str, tuple[str, ...]] = {
     "move": (
         "移动", "移到", "挪到", "转移", "整理", "归档", "分类",
@@ -93,9 +140,9 @@ class PolicyEngine:
         count = max(0, int(proposed_count))
         intent = str(
             state.get("trusted_user_intent") or state.get("user_request") or ""
-        ).casefold()
-        terms = _INTENT_TERMS.get(kind, ())
-        if not terms or not any(term in intent for term in terms):
+        )
+        # 否定句不算授权：“不要移动”不能成为移动的依据。
+        if kind not in intent_effects(intent):
             return PolicyDecision(
                 False, False, f"原始用户请求未授权 {kind} 操作", kind, count, kind
             )

@@ -14,6 +14,7 @@ import {
   buildActivityItems,
   detachThreadToViews,
   eventOutcome,
+  effectLabel,
   isBackgroundEvent,
   isFullSuccess,
   isNearBottom,
@@ -27,6 +28,7 @@ import {
   shouldAutoScroll,
   shouldPromptNewConversation,
   shortThreadId,
+  stopReasonLabel,
   taskStatusForOutcome,
   updateAssistant,
   type ThreadViewState,
@@ -92,6 +94,14 @@ if (partialTaskView.tasks[0]?.status !== 'partial') throw new Error('部分完�
 // 旧后端的精简摘要仍可解析（缺少新字段时给安全默认值）。
 const legacySummary = parseSummary({ ok: 2, failed: 0, skipped: 0, files: [], operations: [] });
 if (!legacySummary || legacySummary.files_ok !== 0 || legacySummary.outcome !== undefined) throw new Error('旧摘要兼容性被破坏');
+if (legacySummary?.unmet_effects?.length !== 0) throw new Error('缺省 unmet_effects 应为空数组');
+
+// 停止原因与未完成副作用都要变成人话。
+if (stopReasonLabel('goal_unmet') !== '目标未达成') throw new Error('stop_reason 未翻译');
+if (stopReasonLabel('weird_reason') !== 'weird_reason') throw new Error('未知 stop_reason 应原样显示');
+if (effectLabel('move') !== '移动') throw new Error('副作用未翻译');
+const unmet = parseSummary({ ok: 1, failed: 0, skipped: 0, files: [], operations: [], unmet_effects: ['move'] });
+if (unmet?.unmet_effects?.[0] !== 'move') throw new Error('unmet_effects 未解析');
 
 // ---- B2：断线重连退避与 busy 兜底超时 ----
 

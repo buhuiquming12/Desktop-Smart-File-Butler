@@ -265,6 +265,8 @@ export interface TaskSummary {
   tool_calls?: number;
   unexecuted_steps?: number;
   truncated_reasons?: string[];
+  /** 用户要求但未发生的副作用（如只扫描就结束时的 move）。 */
+  unmet_effects?: string[];
 }
 
 /** 首次使用检查结果：null 表示「未能确认」（如配置接口需要令牌而当前环境无法提供）。 */

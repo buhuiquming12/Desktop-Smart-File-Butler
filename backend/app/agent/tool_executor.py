@@ -43,6 +43,10 @@ def safe_summary_name(source: Path, output_name: Optional[str]) -> str:
     return name
 
 
+class ModelBudgetExceeded(RuntimeError):
+    """工具内部模型调用超过本次运行的剩余预算。"""
+
+
 class ToolExecutor:
     """把 LangGraph 节点与具体文件/模型工具实现隔离。"""
 
@@ -52,7 +56,14 @@ class ToolExecutor:
         self._model_usage = threading.local()
 
     def _note_model_call(self) -> None:
-        self._model_usage.calls = int(getattr(self._model_usage, "calls", 0)) + 1
+        used = int(getattr(self._model_usage, "calls", 0))
+        limit = getattr(self._model_usage, "limit", None)
+        # 预算在调用前检查：一次 write_summary 可能循环几十次，不能只在节点边界拦。
+        if limit is not None and used >= int(limit):
+            raise ModelBudgetExceeded(
+                f"模型调用预算耗尽（本步骤最多再调用 {int(limit)} 次），已停止该工具"
+            )
+        self._model_usage.calls = used + 1
 
     def consume_model_calls(self) -> int:
         """取出并清零本线程自上次调用以来的模型调用次数。"""
@@ -60,8 +71,14 @@ class ToolExecutor:
         self._model_usage.calls = 0
         return calls
 
-    def execute(self, step: Dict[str, Any]) -> Dict[str, Any]:
+    def execute(
+        self, step: Dict[str, Any], *, model_call_limit: Optional[int] = None
+    ) -> Dict[str, Any]:
         tool = str(step.get("tool", ""))
+        # 每次执行都重设额度：limit=None 表示不限制（测试与直接调用）。
+        self._model_usage.limit = (
+            max(0, int(model_call_limit)) if model_call_limit is not None else None
+        )
         raw_args = step.get("args") or {}
         # 契约校验必须先于任何文件系统访问：未知工具、缺失参数、类型错误
         # 都返回明确失败，而不是带着残缺参数继续执行。

@@ -6,8 +6,12 @@
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
+
+from ..policy.engine import intent_effects
+from ..tools.contracts import TOOL_CONTRACTS
 
 OUTCOMES = (
     "success",
@@ -23,6 +27,16 @@ OUTCOMES = (
 _BATCH_TOOLS = {"batch_move", "batch_rename", "batch_classify"}
 _SINGLE_FILE_TOOLS = {"move_file", "rename_file", "delete_file", "write_summary", "make_dir"}
 _PATH_RESULT_TOOLS = {"move_file", "rename_file", "delete_file", "write_summary"}
+_MUTATION_TOOLS = _BATCH_TOOLS | _SINGLE_FILE_TOOLS
+
+_EFFECT_LABELS = {
+    "move": "移动",
+    "rename": "重命名",
+    "delete": "删除",
+    "write": "生成摘要",
+    "preference": "保存偏好",
+    "schedule": "创建定时任务",
+}
 
 
 def _int(value: Any, default: int = 0) -> int:
@@ -52,23 +66,96 @@ def _result_paths_exist(result: Any) -> tuple[bool, str]:
     return True, ""
 
 
-def _verify_observation(obs: Dict[str, Any]) -> Dict[str, Any]:
+def _norm_path(value: Any) -> str:
+    try:
+        return os.path.normcase(os.path.abspath(str(value)))
+    except (OSError, ValueError):
+        return str(value)
+
+
+def _result_paths(obs: Dict[str, Any]) -> list[str]:
+    result = obs.get("result")
+    if isinstance(result, str):
+        return [result]
+    if isinstance(result, dict):
+        preview = result.get("preview")
+        if isinstance(preview, list):
+            return [str(item) for item in preview if isinstance(item, str) and item]
+    return []
+
+
+def _consumed_sources(observations: list, index: int) -> set[str]:
+    """收集“后续成功变更”消费掉的源路径。
+
+    ``A→B`` 再 ``B→C`` 时，B 处的旧结果会在收尾时消失，但这属于正常链路：
+    后续操作把该路径作为源消费掉了，不能算“结果凭空消失”。
+    """
+    sources: set[str] = set()
+    for later in observations[index + 1:]:
+        if str(later.get("status") or "") != "ok":
+            continue
+        if str(later.get("tool") or "") not in _MUTATION_TOOLS:
+            continue
+        args = later.get("args") if isinstance(later.get("args"), dict) else {}
+        for key in ("src", "path", "file_path", "directory"):
+            value = args.get(key)
+            if isinstance(value, str) and value:
+                sources.add(_norm_path(value))
+    return sources
+
+
+def _verify_observation(obs: Dict[str, Any], *, superseded: Optional[set[str]] = None) -> Dict[str, Any]:
     """返回该观察的校验结论。
 
-    优先使用工具刚执行完时记录的结论（``verification``）：连续操作 ``A→B`` 再
-    ``B→C`` 会让中间结果在任务结束时已不存在，若那时才检查，合法操作会被判成
-    失败。只有旧观察（没有记录）才回退到“此刻”的只读检查。
+    执行当下的记录（``verification``）解决“中间状态被后续操作改变”的误判；但收尾时
+    仍要复核最终状态，否则文件在任务结束前消失也会被报成成功。只有被后续成功变更
+    消费掉的路径才允许跳过复核。
     """
     recorded = obs.get("verification")
-    if isinstance(recorded, dict) and recorded.get("status"):
-        return {
-            "step_id": obs.get("step_id"),
-            "tool": str(obs.get("tool") or ""),
-            "status": str(recorded.get("status")),
-            "detail": str(recorded.get("detail") or ""),
-            "recorded": True,
-        }
-    return _verify_live(obs)
+    if not (isinstance(recorded, dict) and recorded.get("status")):
+        return _verify_live(obs)
+
+    check = {
+        "step_id": obs.get("step_id"),
+        "tool": str(obs.get("tool") or ""),
+        "status": str(recorded.get("status")),
+        "detail": str(recorded.get("detail") or ""),
+        "recorded": True,
+    }
+    if check["status"] != "verified":
+        # 失败与不完整不会因为时间推移变好，直接采信执行当下的结论。
+        return check
+
+    skipped = superseded or set()
+    missing = [
+        path
+        for path in _result_paths(obs)
+        if _norm_path(path) not in skipped and not Path(path).exists()
+    ]
+    if missing:
+        check.update(
+            status="failed",
+            detail=f"结果路径在任务结束前已消失: {missing[0]}",
+        )
+    return check
+
+
+def _unmet_effects(intent: str, observations: list) -> list[str]:
+    """用户要求、但本次运行从未成功产生的副作用。
+
+    例如用户说“把 PDF 移动到 PDF 文件夹”，模型只扫描就结束：扫描不构成“移动”。
+    """
+    required = {kind for kind in intent_effects(intent) if kind not in {"read", "create"}}
+    if not required:
+        return []
+    performed: set[str] = set()
+    for obs in observations:
+        if str(obs.get("status") or "") != "ok":
+            continue
+        contract = TOOL_CONTRACTS.get(str(obs.get("tool") or ""))
+        if contract is not None:
+            performed.add(contract.side_effect)
+    return sorted(required - performed)
 
 
 def record_verification(obs: Dict[str, Any]) -> Dict[str, Any]:
@@ -317,6 +404,7 @@ def completion_message(
     unexecuted: list[Dict[str, Any]],
     *,
     stop_reason: str,
+    unmet_effects: Optional[list[str]] = None,
 ) -> str:
     file_stats = stats.get("file_stats") or {}
     files = (
@@ -335,18 +423,24 @@ def completion_message(
         if unexecuted
         else ""
     )
+    unmet = [name for name in (unmet_effects or []) if name]
+    unmet_text = (
+        "；用户要求的「" + "、".join(_EFFECT_LABELS.get(name, name) for name in unmet) + "」尚未执行"
+        if unmet
+        else ""
+    )
 
     if outcome == "success":
         return f"任务完成：{files}；{calls}。所有可验证的文件后置条件均已通过。"
     if outcome == "partial":
         return (
-            f"任务部分完成：{files}；{calls}{reason_text}{pending}。"
+            f"任务部分完成：{files}；{calls}{reason_text}{pending}{unmet_text}。"
             "已完成的操作仍可在操作日志中查询或撤销。"
         )
     if outcome == "rejected":
         return (
             f"任务已停止：用户拒绝了需要审批的操作，未执行后续变更。"
-            f"{files}；{calls}{reason_text}{pending}。"
+            f"{files}；{calls}{reason_text}{pending}{unmet_text}。"
         )
     if outcome == "cancelled":
         return (
@@ -356,14 +450,14 @@ def completion_message(
     if outcome == "budget_exhausted":
         return (
             f"任务因重规划/执行预算达到上限而停止：{files}；{calls}"
-            f"{reason_text}{pending}。"
+            f"{reason_text}{pending}{unmet_text}。"
             "已完成的操作已保留，可检查后继续或撤销。"
         )
     if outcome == "needs_clarification":
         return "需要补充信息后才能继续，尚未执行任何文件变更。"
     if outcome == "failed":
         return (
-            f"任务失败：{files}；{calls}{reason_text}{pending}。"
+            f"任务失败：{files}；{calls}{reason_text}{pending}{unmet_text}。"
             "如已有文件被修改，可在操作日志中查询或撤销。"
         )
     if not stats.get("tool_calls"):
@@ -389,9 +483,16 @@ def evaluate_completion(
         plan=plan,
         step_index=step_index,
     )
-    checks = [_verify_observation(obs) for obs in observations]
+    checks: list[Dict[str, Any]] = []
+    for index, obs in enumerate(observations):
+        superseded = _consumed_sources(observations, index)
+        checks.append(_verify_observation(obs, superseded=superseded))
     unexecuted = _unexecuted(plan, step_index)
     check_statuses = [str(check.get("status")) for check in checks]
+    unmet_effects = _unmet_effects(
+        str(state.get("trusted_user_intent") or state.get("user_request") or ""),
+        observations,
+    )
 
     file_stats = stats["file_stats"]
     file_success = _int(file_stats.get("success"))
@@ -402,6 +503,7 @@ def evaluate_completion(
         any(status in {"failed", "incomplete", "unverified"} for status in check_statuses)
         or bool(stats.get("truncated_reasons"))
         or bool(unexecuted)
+        or bool(unmet_effects)
         or file_failed > 0
         or file_stats.get("skipped", 0) > 0
         or tool_failed > 0
@@ -425,12 +527,14 @@ def evaluate_completion(
         stop_reason = "tool_failed"
     elif incomplete:
         outcome = "partial"
-        if stop_reason in {"model_done", "goal_verified"}:
+        if stop_reason in {"model_done", "goal_verified", "no_operations"}:
             stop_reason = (
                 "user_rejected"
                 if rejected
                 else "tool_failed"
                 if tool_failed or file_failed
+                else "goal_unmet"
+                if unmet_effects
                 else "incomplete_goal"
             )
     else:
@@ -438,7 +542,12 @@ def evaluate_completion(
         stop_reason = "goal_verified"
 
     message = completion_message(
-        outcome, stats, checks, unexecuted, stop_reason=stop_reason
+        outcome,
+        stats,
+        checks,
+        unexecuted,
+        stop_reason=stop_reason,
+        unmet_effects=unmet_effects,
     )
     return {
         "outcome": outcome,
@@ -447,6 +556,7 @@ def evaluate_completion(
         "message": message,
         "checks": checks,
         "unexecuted_steps": unexecuted,
+        "unmet_effects": unmet_effects,
         "stats": stats,
         "replan_limit": {
             "reached": bool(replan_limit_reached),

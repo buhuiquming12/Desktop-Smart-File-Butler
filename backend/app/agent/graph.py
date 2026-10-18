@@ -22,6 +22,7 @@ from ..logging_conf import get_logger
 from ..security import resolve_in_sandbox
 from ..tools import manifests
 from ..policy import PolicyEngine
+from ..policy.engine import intent_effects, is_task_switch
 from . import tracing
 from .checkpoints import (
     _UUID_EPOCH,
@@ -56,6 +57,20 @@ def _batch_threshold() -> int:
     except (TypeError, ValueError):
         return _DEFAULT_BATCH_THRESHOLD
     return value if value > 0 else _DEFAULT_BATCH_THRESHOLD
+
+
+def _is_clarification_answer(message: str) -> bool:
+    """判断这轮消息是否只是对上一条澄清问题的补充。
+
+    判据是确定性的：出现改口/换任务标记，或自带新的操作动词，都视为“新请求”，
+    不能继承上一轮授权文本。
+    """
+    text = message.strip()
+    if not text:
+        return False
+    if is_task_switch(text):
+        return False
+    return not intent_effects(text)
 
 
 def _recursion_limit() -> int:
@@ -392,6 +407,13 @@ class AgentRuntime:
             )
         return ""
 
+    def _remaining_model_calls(self, state: AgentState) -> int:
+        """本次运行还剩多少次模型调用额度，交给工具内部自查。"""
+        limits = self._budget_limits()
+        trace = state.get("run_trace") or {}
+        used = int(trace.get("model_calls", 0))
+        return max(0, limits["agent_max_model_calls"] - used)
+
     def _budget_stop(self, state: AgentState, reason: str) -> Dict[str, Any]:
         completion = evaluate_completion(
             state, stop_reason="budget_exhausted", forced_outcome="budget_exhausted"
@@ -692,7 +714,9 @@ class AgentRuntime:
 
         with db.operation_thread(state.get("thread_id")):
             executor = self._tools()
-            observation = record_verification(executor.execute(step))
+            observation = record_verification(
+                executor.execute(step, model_call_limit=self._remaining_model_calls(state))
+            )
             # 摘要/分类工具内部也会调用模型，必须计入本次运行预算。
             inner_model_calls = executor.consume_model_calls()
         update = {
@@ -745,7 +769,11 @@ class AgentRuntime:
         if approved:
             with db.operation_thread(thread_id):
                 executor = self._tools()
-                observation = record_verification(executor.execute(step))
+                observation = record_verification(
+                    executor.execute(
+                        step, model_call_limit=self._remaining_model_calls(state)
+                    )
+                )
                 inner_model_calls = executor.consume_model_calls()
         else:
             db.log_operation(
@@ -1005,11 +1033,13 @@ class AgentRuntime:
         # Token 用量是“本次运行”的统计，不能把上一轮的用量累加进新 run。
         tracing.clear(thread_id)
         # 澄清是同一目标的延续：用户这轮往往只补充“哪个目录”，不会重复操作动词。
-        # 只有上一轮确实停在 needs_clarification 时才沿用原授权；已完成/失败/取消的
-        # 请求不延伸授权，新消息必须自己构成授权依据。
+        # 只有上一轮确实停在 needs_clarification、且这轮既不是改口也不是新任务时
+        # 才沿用原授权；已完成/失败/取消的请求不延伸授权。
         prior_intent = ""
         if previous.get("status") == "needs_clarification":
             prior_intent = str(previous.get("trusted_user_intent") or "").strip()
+        if prior_intent and not _is_clarification_answer(message):
+            prior_intent = ""
         trusted_intent = (
             f"{prior_intent}\n{message}".strip()
             if prior_intent and prior_intent != message.strip()

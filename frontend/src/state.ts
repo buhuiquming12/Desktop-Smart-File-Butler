@@ -92,7 +92,45 @@ export function parseSummary(value: unknown): TaskSummary | null {
     truncated_reasons: Array.isArray(candidate.truncated_reasons)
       ? candidate.truncated_reasons.filter((reason): reason is string => typeof reason === 'string')
       : [],
+    unmet_effects: Array.isArray(candidate.unmet_effects)
+      ? candidate.unmet_effects.filter((effect): effect is string => typeof effect === 'string')
+      : [],
   };
+}
+
+/** 后端 stop_reason → 用户可读文本；未知值原样显示，便于排查。 */
+export function stopReasonLabel(reason: string): string {
+  const labels: Record<string, string> = {
+    goal_verified: '目标已验证',
+    model_done: '模型结束',
+    goal_unmet: '目标未达成',
+    incomplete_goal: '目标未完成',
+    user_rejected: '用户拒绝',
+    tool_failed: '工具失败',
+    replan_limit: '达到重规划上限',
+    budget_exhausted: '预算耗尽',
+    no_operations: '没有可执行步骤',
+    clarification_requested: '等待补充信息',
+    planning_error: '规划失败',
+    reflection_error: '反思失败',
+    exception: '执行异常',
+    cancelled: '已取消',
+  };
+  return labels[reason] ?? reason;
+}
+
+/** 副作用 → 中文名，用于“用户要求的 X 尚未执行”。 */
+export function effectLabel(effect: string): string {
+  const labels: Record<string, string> = {
+    move: '移动',
+    rename: '重命名',
+    delete: '删除',
+    write: '生成摘要',
+    preference: '保存偏好',
+    schedule: '创建定时任务',
+    create: '新建目录',
+  };
+  return labels[effect] ?? effect;
 }
 
 /** 终态事件的“目标完成度”：优先用后端 outcome，缺失时退回 status。 */
