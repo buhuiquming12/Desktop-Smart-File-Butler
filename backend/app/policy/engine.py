@@ -26,26 +26,221 @@ _NEGATION_MARKERS = (
 )
 
 # 路径是参数，不是指令：``D:\scan``、``/home/me/list`` 里的单词不能当成操作动词。
-# 顺序有意义：先吃掉带盘符/UNC 的绝对路径，再处理 POSIX 绝对路径与相对路径，
-# 否则相对路径规则会把绝对路径的尾巴再匹配一次（结果一样，但更难排查）。
-_PATH_PATTERNS = (
-    re.compile(r"[A-Za-z]:[\\/][^\s\"'“”‘’，。；;、）)]*"),
-    re.compile(r"\\\\[^\s\"'“”‘’，。；;、）)]+"),
-    re.compile(r"(?<![\w])/(?:[\w.~-]+/)*[\w.~-]*"),
-    re.compile(r"[\w.~-]+(?:[\\/][\w.~ -]+)+"),
+# 反过来，剥路径也不能把真正的指令一起吃掉：``整理/归档`` 是并列动词而不是路径，
+# ``downloads/report 整理一下`` 里的“整理”必须留下。因此分三层处理：
+# 1. 整条消息就是一个路径（可带空格、可带引号）→ 整段剥掉；
+# 2. 绝对路径（盘符 / UNC / POSIX）→ 剥掉；跨空格延续时遇到“像指令”的片段就停；
+# 3. 相对路径（``downloads\scan``）→ 只剥不像动作枚举的片段。
+# 所有替换都用等长空格，避免改变后续否定词窗口的位置。
+_PATH_SEPARATORS = "/\\"
+
+# 路径片段在此结束：空白、引号、句读与右括号（``(x86)`` 之类的目录名仍算路径）。
+_SEGMENT_STOP = frozenset(" \t\r\n\"'“”‘’，。；;、）]}<>|")
+
+_QUOTE_CLOSERS = {'"': '"', "'": "'", "“": "”", "‘": "’", "`": "`"}
+
+# 绝对路径只能从这些位置开始，避免把自然语言里的斜杠当成路径。
+_ABS_PATH_START = re.compile(
+    r"[A-Za-z]:[\\/]"                 # D:\ 或 C:/
+    r"|\\\\[^\s\\/]+[\\/][^\s\\/]+"   # \\server\share
+    r"|(?<![\w.~-])/[\w.~]"           # /home/me
+    r"|(?<![\w.~-])~[\\/]"            # ~/Downloads
 )
+
+# 相对路径：至少一个分隔符，两侧是路径字符（不含空格，否则会吞掉后面的动词）。
+_RELATIVE_PATH = re.compile(r"(?<![\w.~-])[\w.~-]+(?:[\\/][\w.~-]+)+")
+
+_BARE_PATH_PREFIX = re.compile(r"(?:[A-Za-z]:[\\/]|\\\\|/|~[\\/]|\.{1,2}[\\/])")
+_BARE_PATH_CHARS = re.compile(r"[\w.~@#$%&+=!^()\[\]{}\-\\/: ]+")
+
+# “整条消息是路径”这一判断的排除词：出现这些词说明消息其实是一条指令。
+_PATH_ONLY_COMMAND_WORDS = (
+    "然后", "接着", "并且", "之后", "帮我", "请", "把", "将", "再", "先",
+)
+
+# 路径后面的中文片段只有形如“删除”“整理一下”才算指令；“扫描件”“整理箱”这类
+# 目录名里虽然含操作词，但后面跟着名词，仍属于路径。
+_COMMAND_TAILS = ("", "了", "吧", "掉", "一下", "一遍", "这些", "那些", "全部", "所有")
+
+
+def _blank_spans(text: str, spans: list[tuple[int, int]]) -> str:
+    """把给定区间替换成等长空格。"""
+    if not spans:
+        return text
+    chars = list(text)
+    for start, end in spans:
+        chars[start:end] = " " * (end - start)
+    return "".join(chars)
+
+
+def _is_intent_word(segment: str) -> bool:
+    word = segment.strip().casefold()
+    return any(word == term for terms in _INTENT_TERMS.values() for term in terms)
+
+
+def _only_intent_segments(text: str) -> bool:
+    """``整理/归档``、``move/organize`` 是动作枚举，不是路径。"""
+    segments = [part.strip() for part in re.split(r"[\\/]", text)]
+    segments = [part for part in segments if part]
+    return len(segments) >= 2 and all(_is_intent_word(part) for part in segments)
+
+
+def _contains_intent_term(text: str) -> bool:
+    lowered = text.casefold()
+    return any(
+        _term_positions(lowered, term)
+        for terms in _INTENT_TERMS.values()
+        for term in terms
+    )
+
+
+def _looks_like_command_chunk(chunk: str) -> bool:
+    """中文片段是否是一个动作（“删除”“整理一下”），而不是路径名（“扫描件”）。"""
+    lowered = chunk.casefold()
+    for terms in _INTENT_TERMS.values():
+        for term in terms:
+            if lowered.startswith(term) and lowered[len(term):] in _COMMAND_TAILS:
+                return True
+    return False
+
+
+def _looks_like_path(text: str) -> bool:
+    value = text.strip()
+    if not value:
+        return False
+    if _BARE_PATH_PREFIX.match(value):
+        return True
+    if not any(separator in value for separator in _PATH_SEPARATORS):
+        return False
+    return not _only_intent_segments(value)
+
+
+def _strip_wrapping_quotes(value: str) -> str:
+    if len(value) >= 2 and _QUOTE_CLOSERS.get(value[0]) == value[-1]:
+        return value[1:-1].strip()
+    return value
+
+
+def _is_bare_path(text: str) -> bool:
+    """整条消息是否只是一个路径（例如用户只回答 ``D:\\My Documents\\scan``）。
+
+    带空格的路径无法逐段判断“这个空格属于路径还是句子”，因此先看整体：
+    消息以路径开头、只由路径字符组成、且没有指令信号时，整段都算参数。
+    """
+    value = _strip_wrapping_quotes(text.strip())
+    value = value.rstrip(" .,;:!?，。；：！？、")
+    if len(value) < 3:
+        return False
+    if any(char in value for char in "\"'“”‘’`"):
+        return False
+    if _BARE_PATH_CHARS.fullmatch(value) is None:
+        return False
+    if _BARE_PATH_PREFIX.match(value) is None:
+        # 相对路径：第一个单词必须本身带分隔符，且不能是动作枚举。
+        first = value.split(" ", 1)[0]
+        if _RELATIVE_PATH.fullmatch(first) is None or _only_intent_segments(first):
+            return False
+    if any(word in value for word in _PATH_ONLY_COMMAND_WORDS):
+        return False
+    # 空格之后的片段是中文动作（“D:\scan 删除”）时，消息是指令而不是路径名。
+    return not any(
+        _looks_like_command_chunk(chunk)
+        for chunk in value.split(" ")[1:]
+        if any(ord(char) > 0x2E7F for char in chunk)
+    )
+
+
+def _mask_quoted_paths(text: str) -> str:
+    spans: list[tuple[int, int]] = []
+    index = 0
+    while index < len(text):
+        closer = _QUOTE_CLOSERS.get(text[index])
+        if closer is None:
+            index += 1
+            continue
+        end = text.find(closer, index + 1)
+        if end == -1:
+            index += 1
+            continue
+        if _looks_like_path(text[index + 1:end]):
+            spans.append((index, end + 1))
+        index = end + 1
+    return _blank_spans(text, spans)
+
+
+def _continues_path(chunk: str) -> bool:
+    """空格之后的片段是否仍属于路径。
+
+    含分隔符的片段（``Documents\\scan``）明显还是路径；命中操作词的片段
+    （``整理一下``、``move``）则是指令，必须留在自然语言里。
+    """
+    if any(separator in chunk for separator in _PATH_SEPARATORS):
+        return True
+    return not _contains_intent_term(chunk)
+
+
+def _consume_path(text: str, start: int) -> int:
+    length = len(text)
+    index = start
+    while index < length:
+        char = text[index]
+        if char in _PATH_SEPARATORS or char not in _SEGMENT_STOP:
+            index += 1
+            continue
+        if char not in " \t":
+            break
+        cursor = index
+        while cursor < length and text[cursor] in " \t":
+            cursor += 1
+        end = cursor
+        while end < length and text[end] not in _SEGMENT_STOP:
+            end += 1
+        chunk = text[cursor:end]
+        if not chunk or not _continues_path(chunk):
+            break
+        index = end
+    return index
+
+
+def _mask_absolute_paths(text: str) -> str:
+    spans: list[tuple[int, int]] = []
+    position = 0
+    while position < len(text):
+        match = _ABS_PATH_START.search(text, position)
+        if match is None:
+            break
+        end = _consume_path(text, match.start())
+        if end > match.start():
+            spans.append((match.start(), end))
+        position = max(end, match.end())
+    return _blank_spans(text, spans)
+
+
+def _mask_relative_paths(text: str) -> str:
+    def _replace(match: re.Match[str]) -> str:
+        value = match.group(0)
+        if _only_intent_segments(value):
+            return value
+        return " " * len(value)
+
+    return _RELATIVE_PATH.sub(_replace, text)
 
 
 def strip_paths(text: str) -> str:
     """把路径片段替换成空格，只留下自然语言部分。
 
     典型场景：用户只回答 ``D:\\scan``，其中 ``scan`` 命中只读词表，会被误判成
-    “这轮自带新操作”，从而清空上一轮授权。剥掉路径后该消息没有动词，就是纯补充。
+    “这轮自带新操作”，从而清空上一轮授权。路径也可能是 ``D:\\My Documents\\scan``
+    这种带空格的，或者被引号包住；反过来，``整理/归档`` 这类并列动词、路径后面的
+    “整理一下”都不能被当成路径剥掉。
     """
-    masked = text
-    for pattern in _PATH_PATTERNS:
-        masked = pattern.sub(" ", masked)
-    return masked
+    if not text:
+        return text
+    if _is_bare_path(text):
+        return " " * len(text)
+    masked = _mask_quoted_paths(text)
+    masked = _mask_absolute_paths(masked)
+    return _mask_relative_paths(masked)
 
 
 def _is_negated(text: str, index: int) -> bool:

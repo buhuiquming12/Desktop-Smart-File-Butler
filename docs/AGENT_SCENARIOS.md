@@ -290,6 +290,16 @@ python -m pytest -q tests/test_scenarios.py tests/test_tool_contracts.py tests/t
 - 词表回归：`intent_effects(r"D:\scan") == set()`；`移动 D:\scan 到 D:\list` 只识别出移动，
   不会因为路径里的 `list` 多出一个只读意图。
 
+### 32. 带空格的路径 / 动作枚举
+
+- 词表回归：`intent_effects(r"D:\My Documents\scan") == set()`、
+  `intent_effects('"D:\\My scan"') == set()`——带空格或引号的纯路径回答仍是补充信息，
+  不会清空上一轮授权。
+- 反向回归：`把 D:\My Documents\scan 移动到 out` 仍识别出 `move`，
+  `D:\scan 删除` 仍识别出 `delete`；路径规则不能因为跨空格而吞掉动词。
+- 反向回归：`整理/归档 这些文件`、`把 downloads/report 整理一下`
+  仍识别出 `move`——并列动词不是路径，相对路径也不会吃掉后面的“整理”。
+
 ## 手动演示（真实模型，可重复）
 
 1. 生成演示文件（PowerShell）：
