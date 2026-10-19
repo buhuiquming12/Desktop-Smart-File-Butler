@@ -9,7 +9,7 @@
 ## 求职与设计文档
 
 - [系统架构与设计说明](docs/ARCHITECTURE.md)：系统组件、Agent 流程、安全边界、状态恢复、并发与桌面发布架构。
-- [Agent 固定场景清单](docs/AGENT_SCENARIOS.md)：29 个可重复验证场景（初始文件 → 用户输入 → 预期行为 → 最终断言 → 对应测试）。
+- [Agent 固定场景清单](docs/AGENT_SCENARIOS.md)：30 个可重复验证场景（初始文件 → 用户输入 → 预期行为 → 最终断言 → 对应测试）。
 - [简历项目描述](docs/RESUME.md)：推荐简历版本、后端岗位版、AI Agent 岗位版与 30 秒 / 1 分钟口述稿。
 - [面试问答](docs/INTERVIEW_GUIDE.md)：围绕架构、Manifest、PolicyEngine、Prompt Injection、并发、恢复、Runtime、Electron 和 CI 的项目追问。
 
@@ -438,7 +438,8 @@ npm run build:web
 - 完成判定：10 项成功 8 项时返回 `partial` 而非全部成功；校验只读、不产生新变更；重规划上限说明未完成内容。
 - 空计划返回 `unknown` 而不是成功；`A→B→C` 连续操作不会因中间路径消失被判为部分完成；
   结果在任务结束前消失仍会被复核发现。
-- 澄清续问只回目录时仍沿用上一轮授权；澄清中改口或换任务不继承旧授权；已完成请求不会为下一条消息背书。
+- 澄清续问只回目录时仍沿用上一轮授权；澄清中改口、换任务或只要求“扫描/查看”时不继承旧授权；已完成请求不会为下一条消息背书。
+- 意图词表包含只读动作（扫描/查看/浏览/清单），因此“只扫描一下”不会被当成没有新操作；ASCII 词按词边界匹配（`remove` 不算 `move`）。
 - 摘要/分类工具内部的模型调用计入运行预算，且在调用前检查剩余额度。
 - 用户要求“移动”而只做了扫描时返回 `goal_unmet` 与 `unmet_effects`，不算完成。
 - 多轮：澄清、引用上一轮扫描、修改目标、跨会话隔离、旧扫描失效重新核验；历史审批不授权新请求。
@@ -463,7 +464,7 @@ CI 包含：
 - Ubuntu：`npm ci`、typecheck、前端测试、Web build。
 - Windows：sidecar build、sidecar smoke test、Electron portable build、artifact 上传。
 
-最近一次本地完整验证结果为 `300 passed, 2 skipped`（后端）。两个跳过项分别是：真实 Tesseract 端到端用例（需要 `BUTLER_TEST_TESSERACT_CMD` 指向本机二进制）和 Windows 未开启开发者模式时无法创建目录链接的用例。前端 `typecheck`、`npm test`、Vite 生产构建，以及包含 `electron/main.ts` 与 `preload.cts` 在内的主进程编译均通过。真实 Tesseract 用例已在本机（Tesseract 5.0，`eng` + `chi_sim`）以无空格和含空格 tessdata 目录两种配置各验证通过一次。真实模型的多轮对话评测需要配置模型，本次未运行。
+最近一次本地完整验证结果为 `324 passed, 2 skipped`（后端）。两个跳过项分别是：真实 Tesseract 端到端用例（需要 `BUTLER_TEST_TESSERACT_CMD` 指向本机二进制）和 Windows 未开启开发者模式时无法创建目录链接的用例。前端 `typecheck`、`npm test`、Vite 生产构建，以及包含 `electron/main.ts` 与 `preload.cts` 在内的主进程编译均通过。真实 Tesseract 用例已在本机（Tesseract 5.0，`eng` + `chi_sim`）以无空格和含空格 tessdata 目录两种配置各验证通过一次。真实模型的多轮对话评测需要配置模型，本次未运行。
 
 ## 安全说明
 

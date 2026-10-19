@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -34,24 +35,38 @@ def _is_negated(text: str, index: int) -> bool:
     return any(marker in window for marker in _NEGATION_MARKERS)
 
 
+def _term_positions(text: str, term: str) -> list[int]:
+    """返回 term 在 text 中所有出现位置。
+
+    ASCII 词要求词边界：否则 ``remove`` 里的 "move"、``already`` 里的 "read"
+    会被当成操作意图——前者会给未授权的“移动”放行，后者会把纯补充信息误判成新任务。
+    CJK 没有词边界，继续用子串匹配。
+    """
+    if term.isascii() and term.replace(" ", "").isalpha():
+        pattern = rf"(?<![a-z]){re.escape(term)}(?![a-z])"
+        return [match.start() for match in re.finditer(pattern, text)]
+    positions: list[int] = []
+    start = text.find(term)
+    while start != -1:
+        positions.append(start)
+        start = text.find(term, start + 1)
+    return positions
+
+
 def intent_effects(intent: str) -> set[str]:
     """从用户原话推导“本次请求要求产生的副作用”。
 
-    这是保守的词法判据，供两处共用：
+    这是保守的词法判据，供三处共用：
     - PolicyEngine：某个副作用是否被本次请求授权；
-    - 完成判定：用户要求的效果是否真的发生过（扫描不算完成“移动”）。
+    - 完成判定：用户要求的效果是否真的发生过（扫描不算完成“移动”）；
+    - 澄清续问：这轮消息是否自带新操作（只读动作也算，见 _INTENT_TERMS["read"]）。
     """
     text = (intent or "").casefold()
     effects: set[str] = set()
     for kind, terms in _INTENT_TERMS.items():
         for term in terms:
-            start = text.find(term)
-            while start != -1:
-                if not _is_negated(text, start):
-                    effects.add(kind)
-                    break
-                start = text.find(term, start + 1)
-            if kind in effects:
+            if any(not _is_negated(text, index) for index in _term_positions(text, term)):
+                effects.add(kind)
                 break
     return effects
 
@@ -67,6 +82,13 @@ def is_task_switch(message: str) -> bool:
 
 
 _INTENT_TERMS: dict[str, tuple[str, ...]] = {
+    # 只读动作也必须登记：否则“只扫描一下”会被当成“没有任何操作”，
+    # 在澄清续问里被误判为单纯补充信息，从而继承上一轮的移动授权。
+    "read": (
+        "扫描", "扫一下", "扫一遍", "查看", "看一眼", "看一下",
+        "浏览", "列出", "列一下", "列个", "清单", "统计一下",
+        "scan", "list", "browse", "view", "look at", "read",
+    ),
     "move": (
         "移动", "移到", "挪到", "转移", "整理", "归档", "分类",
         "放到", "放进", "放入",

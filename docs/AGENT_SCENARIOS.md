@@ -10,7 +10,7 @@
 cd backend
 python -m pytest -q tests/test_scenarios.py tests/test_tool_contracts.py tests/test_context_handoff.py `
   tests/test_completion.py tests/test_multiturn.py tests/test_runtime_budget.py `
-  tests/test_review_regressions.py tests/test_review_regressions_2.py
+  tests/test_review_regressions.py tests/test_review_regressions_2.py tests/test_review_regressions_3.py
 ```
 
 ## 速查表
@@ -46,6 +46,7 @@ python -m pytest -q tests/test_scenarios.py tests/test_tool_contracts.py tests/t
 | 27 | 只扫描就结束 | outcome=partial + goal_unmet | `test_review_regressions_2.py::test_scan_only_stop_is_not_goal_success` |
 | 28 | 工具内部超预算 | 调用次数不越过剩余额度 | `test_review_regressions_2.py::test_tool_internal_calls_stop_at_budget` |
 | 29 | 结果消失 | 缓存校验不会被当成最终结论 | `test_review_regressions_2.py::test_cached_verification_does_not_mask_vanished_result` |
+| 30 | 只扫描的澄清回答 | 不继承移动授权 | `test_review_regressions_3.py::test_scan_only_answer_does_not_inherit_move_authorization` |
 
 ## 场景细节
 
@@ -267,6 +268,15 @@ python -m pytest -q tests/test_scenarios.py tests/test_tool_contracts.py tests/t
 - 预期行为：执行当下记录为 verified，但收尾复核发现路径消失且无后续操作消费它。
 - 最终断言：`outcome!=success`、对应 check 为 `failed`。
 - 反向用例（`test_superseded_result_is_not_treated_as_vanished`）：`A→B→C` 仍为 success。
+
+### 30. 只扫描的澄清回答
+
+- 初始文件：`a.txt`。
+- 第一轮：`帮我整理一下文件` → 澄清；第二轮：`只扫描一下这个目录`（没有“算了”等改口词）。
+- 预期行为：`扫描` 属于只读动作，本身构成新请求，不能沿用上一轮的移动授权。
+- 最终断言：`trusted_user_intent` 不含“整理”；`move_file` 观察 failed；文件未动。
+- 反向用例（`test_plain_path_answer_still_inherits`）：只回路径仍继承授权。
+- 词表回归：`remove` 不被识别为 `move`、`already` 不被识别为 `read`（ASCII 词边界）。
 
 ## 手动演示（真实模型，可重复）
 
