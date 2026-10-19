@@ -25,6 +25,28 @@ _NEGATION_MARKERS = (
     "don't", "do not", "never",
 )
 
+# 路径是参数，不是指令：``D:\scan``、``/home/me/list`` 里的单词不能当成操作动词。
+# 顺序有意义：先吃掉带盘符/UNC 的绝对路径，再处理 POSIX 绝对路径与相对路径，
+# 否则相对路径规则会把绝对路径的尾巴再匹配一次（结果一样，但更难排查）。
+_PATH_PATTERNS = (
+    re.compile(r"[A-Za-z]:[\\/][^\s\"'“”‘’，。；;、）)]*"),
+    re.compile(r"\\\\[^\s\"'“”‘’，。；;、）)]+"),
+    re.compile(r"(?<![\w])/(?:[\w.~-]+/)*[\w.~-]*"),
+    re.compile(r"[\w.~-]+(?:[\\/][\w.~ -]+)+"),
+)
+
+
+def strip_paths(text: str) -> str:
+    """把路径片段替换成空格，只留下自然语言部分。
+
+    典型场景：用户只回答 ``D:\\scan``，其中 ``scan`` 命中只读词表，会被误判成
+    “这轮自带新操作”，从而清空上一轮授权。剥掉路径后该消息没有动词，就是纯补充。
+    """
+    masked = text
+    for pattern in _PATH_PATTERNS:
+        masked = pattern.sub(" ", masked)
+    return masked
+
 
 def _is_negated(text: str, index: int) -> bool:
     """判断某个意图词是否被否定（“不要移动”“别整理”）。
@@ -60,8 +82,10 @@ def intent_effects(intent: str) -> set[str]:
     - PolicyEngine：某个副作用是否被本次请求授权；
     - 完成判定：用户要求的效果是否真的发生过（扫描不算完成“移动”）；
     - 澄清续问：这轮消息是否自带新操作（只读动作也算，见 _INTENT_TERMS["read"]）。
+
+    匹配前先剥掉路径：路径是参数，不是指令。
     """
-    text = (intent or "").casefold()
+    text = strip_paths((intent or "").casefold())
     effects: set[str] = set()
     for kind, terms in _INTENT_TERMS.items():
         for term in terms:

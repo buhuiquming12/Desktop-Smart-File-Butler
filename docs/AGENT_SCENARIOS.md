@@ -10,7 +10,8 @@
 cd backend
 python -m pytest -q tests/test_scenarios.py tests/test_tool_contracts.py tests/test_context_handoff.py `
   tests/test_completion.py tests/test_multiturn.py tests/test_runtime_budget.py `
-  tests/test_review_regressions.py tests/test_review_regressions_2.py tests/test_review_regressions_3.py
+  tests/test_review_regressions.py tests/test_review_regressions_2.py tests/test_review_regressions_3.py `
+  tests/test_review_regressions_4.py
 ```
 
 ## 速查表
@@ -47,6 +48,7 @@ python -m pytest -q tests/test_scenarios.py tests/test_tool_contracts.py tests/t
 | 28 | 工具内部超预算 | 调用次数不越过剩余额度 | `test_review_regressions_2.py::test_tool_internal_calls_stop_at_budget` |
 | 29 | 结果消失 | 缓存校验不会被当成最终结论 | `test_review_regressions_2.py::test_cached_verification_does_not_mask_vanished_result` |
 | 30 | 只扫描的澄清回答 | 不继承移动授权 | `test_review_regressions_3.py::test_scan_only_answer_does_not_inherit_move_authorization` |
+| 31 | 目录名叫 scan/list | 路径不被当成指令，授权保留 | `test_review_regressions_4.py::test_directory_named_scan_keeps_authorization` |
 
 ## 场景细节
 
@@ -277,6 +279,16 @@ python -m pytest -q tests/test_scenarios.py tests/test_tool_contracts.py tests/t
 - 最终断言：`trusted_user_intent` 不含“整理”；`move_file` 观察 failed；文件未动。
 - 反向用例（`test_plain_path_answer_still_inherits`）：只回路径仍继承授权。
 - 词表回归：`remove` 不被识别为 `move`、`already` 不被识别为 `read`（ASCII 词边界）。
+
+### 31. 目录名叫 scan / list
+
+- 初始文件：`scan/` 与 `list/` 目录，各含 `a.txt`。
+- 第一轮：`帮我整理一下文件` → 澄清；第二轮：只回复 `...\scan`（或 `...\list`）。
+- 预期行为：路径是参数，不是指令；路径里的 `scan`/`list` 不能当作只读动作，
+  因此仍继承上一轮的整理授权。
+- 最终断言：`trusted_user_intent` 含“整理”；扫描 + 移动都成功，`a.txt` 进入目标目录。
+- 词表回归：`intent_effects(r"D:\scan") == set()`；`移动 D:\scan 到 D:\list` 只识别出移动，
+  不会因为路径里的 `list` 多出一个只读意图。
 
 ## 手动演示（真实模型，可重复）
 
