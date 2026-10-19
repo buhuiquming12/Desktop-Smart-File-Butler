@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
-from ..policy.engine import intent_effects
+from ..policy.engine import explicit_intent_effects, intent_effects
 from ..tools.contracts import TOOL_CONTRACTS
 
 OUTCOMES = (
@@ -33,6 +33,7 @@ _EFFECT_LABELS = {
     "move": "移动",
     "rename": "重命名",
     "delete": "删除",
+    "create": "新建目录",
     "write": "生成摘要",
     "preference": "保存偏好",
     "schedule": "创建定时任务",
@@ -46,8 +47,14 @@ def _int(value: Any, default: int = 0) -> int:
         return default
 
 
-def _result_paths_exist(result: Any) -> tuple[bool, str]:
-    """只读校验结果路径；任何异常都视为“无法确认”，不向外抛。"""
+def _result_paths_exist(
+    result: Any, skipped: Optional[set[str]] = None
+) -> tuple[bool, str]:
+    """只读校验结果路径；任何异常都视为“无法确认”，不向外抛。
+
+    ``skipped`` 是被后续成功变更消费掉的路径（``A→B`` 再 ``B→C`` 的 B 处）：
+    它们本就应该消失，不能因此判失败。
+    """
     candidates: list[str] = []
     if isinstance(result, str):
         candidates = [result]
@@ -55,8 +62,9 @@ def _result_paths_exist(result: Any) -> tuple[bool, str]:
         preview = result.get("preview")
         if isinstance(preview, list):
             candidates = [str(item) for item in preview if isinstance(item, str)]
+    superseded = skipped or set()
     for value in candidates:
-        if not value:
+        if not value or _norm_path(value) in superseded:
             continue
         try:
             if not Path(value).exists():
@@ -89,6 +97,9 @@ def _consumed_sources(observations: list, index: int) -> set[str]:
 
     ``A→B`` 再 ``B→C`` 时，B 处的旧结果会在收尾时消失，但这属于正常链路：
     后续操作把该路径作为源消费掉了，不能算“结果凭空消失”。
+
+    批量工具的参数里没有逐项源路径（只有 scan_id），因此还要读结果里的
+    ``sources``：``batch_move`` 之后再 ``batch_classify`` 也是同一条正常链路。
     """
     sources: set[str] = set()
     for later in observations[index + 1:]:
@@ -101,6 +112,11 @@ def _consumed_sources(observations: list, index: int) -> set[str]:
             value = args.get(key)
             if isinstance(value, str) and value:
                 sources.add(_norm_path(value))
+        result = later.get("result")
+        if isinstance(result, dict):
+            for value in result.get("sources") or []:
+                if isinstance(value, str) and value:
+                    sources.add(_norm_path(value))
     return sources
 
 
@@ -113,7 +129,7 @@ def _verify_observation(obs: Dict[str, Any], *, superseded: Optional[set[str]] =
     """
     recorded = obs.get("verification")
     if not (isinstance(recorded, dict) and recorded.get("status")):
-        return _verify_live(obs)
+        return _verify_live(obs, superseded=superseded)
 
     check = {
         "step_id": obs.get("step_id"),
@@ -144,8 +160,14 @@ def _unmet_effects(intent: str, observations: list) -> list[str]:
     """用户要求、但本次运行从未成功产生的副作用。
 
     例如用户说“把 PDF 移动到 PDF 文件夹”，模型只扫描就结束：扫描不构成“移动”。
+
+    ``create`` 平时是移动/整理的从属授权（移动前可能要建目标目录，``move_file``
+    自己也会建），因此默认不当作目标；只有请求本身就是在“新建目录”时它才是目标。
     """
     required = {kind for kind in intent_effects(intent) if kind not in {"read", "create"}}
+    if not required:
+        # 纯“新建目录/文件夹”请求：建目录就是目标，没建成不能算成功。
+        required |= explicit_intent_effects(intent)
     if not required:
         return []
     performed: set[str] = set()
@@ -171,7 +193,9 @@ def record_verification(obs: Dict[str, Any]) -> Dict[str, Any]:
     return {**obs, "verification": _verify_live(obs)}
 
 
-def _verify_live(obs: Dict[str, Any]) -> Dict[str, Any]:
+def _verify_live(
+    obs: Dict[str, Any], *, superseded: Optional[set[str]] = None
+) -> Dict[str, Any]:
     tool = str(obs.get("tool") or "")
     status = str(obs.get("status") or "")
     check: Dict[str, Any] = {
@@ -239,7 +263,7 @@ def _verify_live(obs: Dict[str, Any]) -> Dict[str, Any]:
                 detail=f"扫描不完整：{result.get('reason') or 'unknown'}",
             )
             return check
-        paths_ok, path_error = _result_paths_exist(result)
+        paths_ok, path_error = _result_paths_exist(result, superseded)
         if not paths_ok:
             check.update(status="failed", detail=path_error)
             return check
@@ -247,6 +271,9 @@ def _verify_live(obs: Dict[str, Any]) -> Dict[str, Any]:
         return check
 
     if tool in _PATH_RESULT_TOOLS and isinstance(result, str):
+        if superseded and _norm_path(result) in superseded:
+            check.update(status="verified", detail="结果已被后续操作消费")
+            return check
         try:
             exists = Path(result).exists()
         except OSError as exc:

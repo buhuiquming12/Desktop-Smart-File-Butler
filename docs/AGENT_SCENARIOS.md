@@ -299,6 +299,25 @@ python -m pytest -q tests/test_scenarios.py tests/test_tool_contracts.py tests/t
   `D:\scan 删除` 仍识别出 `delete`；路径规则不能因为跨空格而吞掉动词。
 - 反向回归：`整理/归档 这些文件`、`把 downloads/report 整理一下`
   仍识别出 `move`——并列动词不是路径，相对路径也不会吃掉后面的“整理”。
+- 反向回归（第五轮）：紧贴路径的中文动作 `D:\scan删除`、`D:\scan整理一下`、
+  `把D:\scan里的PDF移动到out` 仍识别出 `delete`/`move`；`D:\扫描件2024`、
+  `D:\资料\扫描` 仍按目录名处理。
+- 反向回归（第五轮）：`D:\scan delete`、`D:\scan move` 按指令处理；
+  `D:\My scan`、`D:\scan list` 仍按路径处理（scan/list 是常见目录名）。
+
+### 33. 空计划、新建目录与批量链
+
+- 空计划：规划器返回零步骤却给出“全部整理完成，共 123 个文件”时，
+  正文必须是后端的“未执行任何文件操作，无法验证目标”，不能回显模型措辞。
+- 新建目录：`新建一个备份文件夹` 若最终没有 `make_dir` 成功，`unmet_effects` 含
+  `create`、outcome 为 `partial`；“移动到新建的 out 文件夹”里 `create` 只是从属授权，
+  移动成功即为 `success`。
+- 批量链：`batch_move → batch_classify` 两步都成功时，前一步的结果路径被后一步消费，
+  收尾复核不能因此判成 `partial`；批量结果记录 `sources` 供该判断使用。
+- 拒绝收敛：25 项移动触发一次审批，拒绝后同请求剩余步骤全部记 rejected，
+  不再出现第二次审批弹窗，文件一个都不动。
+- 重连恢复：`needs_clarification` 也作为终态恢复为 `done` 事件，界面不会停在“处理中”，
+  且能显示待回答的问题。
 
 ## 手动演示（真实模型，可重复）
 

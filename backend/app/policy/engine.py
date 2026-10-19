@@ -60,7 +60,24 @@ _PATH_ONLY_COMMAND_WORDS = (
 
 # 路径后面的中文片段只有形如“删除”“整理一下”才算指令；“扫描件”“整理箱”这类
 # 目录名里虽然含操作词，但后面跟着名词，仍属于路径。
-_COMMAND_TAILS = ("", "了", "吧", "掉", "一下", "一遍", "这些", "那些", "全部", "所有")
+_COMMAND_TAILS = (
+    "", "了", "吧", "掉", "一下", "一遍", "这些", "那些", "全部", "所有",
+    # 趋向补语：“移动到 out”“删除到回收站”里的“移 动”后面跟的是“到”。
+    "到", "进", "入", "至", "成", "起来", "出去", "回来", "回去", "完", "走", "光",
+)
+
+# 紧贴路径的中文动作（``D:\scan删除``）：中文没有词边界，只能靠动词判断。
+# 分隔符之后的最后一段不参与（``D:\资料\扫描`` 仍是目录名）。
+_CJK_START = 0x2E80
+_CJK_CONNECTIVES = ("的", "里", "中", "下", "上", "内", "外", "后", "前", "时", "处", "边")
+_CJK_STRONG_COMMANDS = (
+    "删除", "删掉", "清理", "移动", "移到", "挪到", "转移",
+    "重命名", "改名", "整理", "归档", "分类", "新建", "创建",
+)
+
+# 路径之后单独出现的英文动作词是命令；scan/list 之类只读词与目录名无法区分
+# （``D:\My scan`` 是路径），因此仍按路径处理，避免把目录名误判成新请求。
+_ASCII_COMMAND_KINDS = ("move", "rename", "delete")
 
 
 def _blank_spans(text: str, spans: list[tuple[int, int]]) -> str:
@@ -85,23 +102,55 @@ def _only_intent_segments(text: str) -> bool:
     return len(segments) >= 2 and all(_is_intent_word(part) for part in segments)
 
 
-def _contains_intent_term(text: str) -> bool:
-    lowered = text.casefold()
-    return any(
-        _term_positions(lowered, term)
-        for terms in _INTENT_TERMS.values()
-        for term in terms
-    )
-
-
 def _looks_like_command_chunk(chunk: str) -> bool:
     """中文片段是否是一个动作（“删除”“整理一下”），而不是路径名（“扫描件”）。"""
-    lowered = chunk.casefold()
+    lowered = chunk.strip().strip("，。；;、！!？?.,").casefold()
+    if not lowered:
+        return False
     for terms in _INTENT_TERMS.values():
         for term in terms:
             if lowered.startswith(term) and lowered[len(term):] in _COMMAND_TAILS:
                 return True
     return False
+
+
+def _contains_command_phrase(text: str) -> bool:
+    """片段中间是否也藏着动作（“里的文件整理一下”）。
+
+    只看 ``_COMMAND_TAILS`` 允许的尾巴，所以“整理箱”“扫描件”仍算目录名。
+    """
+    lowered = text.casefold()
+    for terms in _INTENT_TERMS.values():
+        for term in terms:
+            if term.isascii():
+                continue
+            start = lowered.find(term)
+            while start != -1:
+                if lowered[start + len(term):] in _COMMAND_TAILS:
+                    return True
+                start = lowered.find(term, start + 1)
+    return False
+
+
+def _is_command_chunk(chunk: str) -> bool:
+    """片段是否是一条动作指令：中文“删除/整理一下”，或英文 move/rename/delete。
+
+    英文只读词（scan/list/view）与目录名无法区分（``D:\\My scan`` 是路径），
+    因此仍按路径处理；move/delete 出现在文件名里的概率极低，按指令处理更保守。
+    """
+    text = chunk.strip().strip("，。；;、！!？?.,")
+    if not text:
+        return False
+    lowered = text.casefold()
+    if lowered.isascii():
+        if " " in lowered or any(sep in lowered for sep in _PATH_SEPARATORS):
+            return False
+        return any(
+            lowered == term
+            for kind in _ASCII_COMMAND_KINDS
+            for term in _INTENT_TERMS[kind]
+        )
+    return _looks_like_command_chunk(lowered) or _contains_command_phrase(lowered)
 
 
 def _looks_like_path(text: str) -> bool:
@@ -119,6 +168,44 @@ def _strip_wrapping_quotes(value: str) -> str:
     if len(value) >= 2 and _QUOTE_CLOSERS.get(value[0]) == value[-1]:
         return value[1:-1].strip()
     return value
+
+
+def _strong_command(run: str) -> bool:
+    """中文片段是否以动作开头（“删除旧文件”也算，“扫描件”“整理箱”不算）。"""
+    if _looks_like_command_chunk(run) or _contains_command_phrase(run):
+        return True
+    return run.startswith(_CJK_STRONG_COMMANDS)
+
+
+def _cjk_starts_command(text: str, index: int) -> bool:
+    """从 ``index`` 开始的中文片段是否已经离开路径（``D:\\scan删除``）。
+
+    中文没有词边界，目录名同样可能含“扫描”“整理”，因此只在有明确信号时断开：
+    - 片段后面紧跟拉丁字母/数字（``里的PDF…``、``删除2024``）；
+    - 片段本身是动作短语，且不是分隔符之后的最后一段（``D:\\资料\\扫描`` 是目录名）。
+    """
+    end = index
+    while end < len(text) and ord(text[end]) > _CJK_START:
+        end += 1
+    run = text[index:end]
+    if not run:
+        return False
+    following = text[end:end + 1]
+    previous = text[index - 1:index]
+    # 紧贴路径（前面不是分隔符）的中文片段更像动词；分隔符之后的一段更像目录名。
+    glued = bool(previous) and previous not in _PATH_SEPARATORS
+    if following and following in " \t\u3000":
+        # 空格之后是参数（``D:\scan移到 out``）；纯路径名（``D:\我的 文档``）不切断。
+        return glued and _strong_command(run)
+    if following and following in _PATH_SEPARATORS:
+        return False
+    if not following:
+        if not glued:
+            # 分隔符之后的最后一段仍按目录名处理（``D:\资料\扫描``）。
+            return False
+        return _strong_command(run)
+    # 紧贴拉丁字母/数字：动作词，或“的/里/中…”这类依附前面的连接词，才说明离开路径。
+    return _strong_command(run) or run.startswith(_CJK_CONNECTIVES)
 
 
 def _is_bare_path(text: str) -> bool:
@@ -142,12 +229,14 @@ def _is_bare_path(text: str) -> bool:
             return False
     if any(word in value for word in _PATH_ONLY_COMMAND_WORDS):
         return False
-    # 空格之后的片段是中文动作（“D:\scan 删除”）时，消息是指令而不是路径名。
-    return not any(
-        _looks_like_command_chunk(chunk)
-        for chunk in value.split(" ")[1:]
-        if any(ord(char) > 0x2E7F for char in chunk)
-    )
+    # 紧贴路径的中文动作（``D:\scan删除``）说明消息其实是一条指令。
+    if any(
+        ord(char) > _CJK_START and _cjk_starts_command(value, index)
+        for index, char in enumerate(value)
+    ):
+        return False
+    # 空格之后的片段是动作（``D:\scan 删除``、``D:\scan delete``）时同理。
+    return not any(_is_command_chunk(chunk) for chunk in value.split(" ")[1:])
 
 
 def _mask_quoted_paths(text: str) -> str:
@@ -171,12 +260,12 @@ def _mask_quoted_paths(text: str) -> str:
 def _continues_path(chunk: str) -> bool:
     """空格之后的片段是否仍属于路径。
 
-    含分隔符的片段（``Documents\\scan``）明显还是路径；命中操作词的片段
-    （``整理一下``、``move``）则是指令，必须留在自然语言里。
+    含分隔符的片段（``Documents\\scan``）明显还是路径；动作片段（``整理一下``、
+    ``delete``）则是指令，必须留在自然语言里；``整理箱`` 这类带名词的目录名保留。
     """
     if any(separator in chunk for separator in _PATH_SEPARATORS):
-        return True
-    return not _contains_intent_term(chunk)
+        return not _only_intent_segments(chunk)
+    return not _is_command_chunk(chunk)
 
 
 def _consume_path(text: str, start: int) -> int:
@@ -185,6 +274,9 @@ def _consume_path(text: str, start: int) -> int:
     while index < length:
         char = text[index]
         if char in _PATH_SEPARATORS or char not in _SEGMENT_STOP:
+            # 紧贴路径的中文动作（``D:\scan删除``）是句子的开始，不是路径的一部分。
+            if ord(char) > _CJK_START and _cjk_starts_command(text, index):
+                break
             index += 1
             continue
         if char not in " \t":
@@ -290,6 +382,26 @@ def intent_effects(intent: str) -> set[str]:
     return effects
 
 
+def explicit_intent_effects(intent: str) -> set[str]:
+    """只从“显式动词”推导的副作用，用于完成判定区分目标与从属授权。
+
+    ``整理``/``移动`` 会派生 ``create``（移动前可能需要建目标目录），但只有
+    明确说“新建目录/文件夹”才把建目录本身当作目标：说了就必须真的建成，
+    否则不能判定成功。“创建摘要文件”这类写入请求不算建目录目标。
+    """
+    text = strip_paths((intent or "").casefold())
+    effects: set[str] = set()
+    for kind, patterns in _EXPLICIT_PATTERNS.items():
+        for pattern in patterns:
+            if any(
+                not _is_negated(text, match.start())
+                for match in re.finditer(pattern, text)
+            ):
+                effects.add(kind)
+                break
+    return effects
+
+
 def is_task_switch(message: str) -> bool:
     """用户是否在澄清之后改口/换任务（而不是补充信息）。"""
     text = (message or "").casefold()
@@ -327,6 +439,16 @@ _INTENT_TERMS: dict[str, tuple[str, ...]] = {
         "remember", "prefer", "default", "forget",
     ),
     "schedule": ("定时", "定期", "每天", "每周", "每月", "cron", "schedule"),
+}
+
+# 显式目标：只有“新建目录/文件夹”才是目标本身；“创建摘要文件”属于 write，不算建目录。
+_EXPLICIT_PATTERNS: dict[str, tuple[str, ...]] = {
+    "create": (
+        r"(?:新建|创建|建个|建立一个?)[^，。；;\n]{0,12}?(?:目录|文件夹|folder|directory)",
+        r"(?:目录|文件夹)[^，。；;\n]{0,6}?(?:新建|创建)",
+        r"\bmkdir\b",
+        r"\b(?:create|make)\s+(?:a\s+)?(?:new\s+)?(?:folder|directory)\b",
+    ),
 }
 
 

@@ -26,6 +26,8 @@ SUPPORTED_CONTENT_EXTS = {
 }
 SUMMARY_CHUNK_CHARS = 12_000
 SUMMARY_MAX_CHUNKS = 40
+# 批量结果里保留的“被消费源路径”条数：用于完成判定识别链式操作，无需无上限持久化。
+_MAX_BATCH_SOURCES = 200
 
 
 def _json(value: Any) -> str:
@@ -158,6 +160,7 @@ class ToolExecutor:
         *,
         truncated: bool = False,
         reason: str = "none",
+        sources: Optional[list[str]] = None,
     ) -> Dict[str, Any]:
         return {
             "matched": matched,
@@ -167,6 +170,9 @@ class ToolExecutor:
             "truncated": truncated,
             "reason": reason,
             "preview": successes[:10],
+            # 被消费的清单项（源路径）。完成判定用它识别“后续操作吃掉了上一步的结果”，
+            # 否则 A→B 再 B→C 的批量链会被误判成“结果在任务结束前消失”。
+            "sources": [str(item) for item in (sources or [])][:_MAX_BATCH_SOURCES],
             "failures": failed[:10],
             "skips": skipped[:10],
         }
@@ -175,12 +181,14 @@ class ToolExecutor:
         manifest = manifests.load(str(args["scan_id"]))
         items = manifests.match(str(args["scan_id"]), dict(args.get("filter") or {}))
         successes: list[str] = []
+        sources: list[str] = []
         failed: list[dict] = []
         skipped: list[dict] = []
         for item in items:
             source = str(item.get("path") or "")
             try:
                 successes.append(filesystem.move_file(source, str(args["dest_dir"])))
+                sources.append(source)
             except FileNotFoundError:
                 skipped.append({"path": source, "reason": "source_missing"})
             except Exception as exc:  # noqa: BLE001
@@ -190,6 +198,7 @@ class ToolExecutor:
             len(items), successes, failed, skipped,
             truncated=bool(meta.get("truncated")),
             reason=str(meta.get("reason") or "none"),
+            sources=sources,
         )
 
     def batch_rename(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -199,6 +208,7 @@ class ToolExecutor:
         if not prefix and not suffix:
             raise ValueError("batch_rename 至少需要 prefix 或 suffix")
         successes: list[str] = []
+        sources: list[str] = []
         failed: list[dict] = []
         skipped: list[dict] = []
         for item in items:
@@ -206,6 +216,7 @@ class ToolExecutor:
             new_name = f"{prefix}{source.stem}{suffix}{source.suffix}"
             try:
                 successes.append(filesystem.rename_file(str(source), new_name))
+                sources.append(str(source))
             except FileNotFoundError:
                 skipped.append({"path": str(source), "reason": "source_missing"})
             except Exception as exc:  # noqa: BLE001
@@ -215,6 +226,7 @@ class ToolExecutor:
             len(items), successes, failed, skipped,
             truncated=bool(meta.get("truncated")),
             reason=str(meta.get("reason") or "none"),
+            sources=sources,
         )
 
     def batch_classify(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -222,6 +234,7 @@ class ToolExecutor:
         items = manifests.match(str(args["scan_id"]), dict(args.get("filter") or {}))
         root = Path(str(args["dest_root"]))
         successes: list[str] = []
+        sources: list[str] = []
         failed: list[dict] = []
         skipped: list[dict] = []
         for item in items:
@@ -229,6 +242,7 @@ class ToolExecutor:
             category = categories.rule_category(str(item.get("ext") or ""))
             try:
                 successes.append(filesystem.move_file(source, str(root / category)))
+                sources.append(source)
             except FileNotFoundError:
                 skipped.append({"path": source, "reason": "source_missing"})
             except Exception as exc:  # noqa: BLE001
@@ -238,6 +252,7 @@ class ToolExecutor:
             len(items), successes, failed, skipped,
             truncated=bool(meta.get("truncated")),
             reason=str(meta.get("reason") or "none"),
+            sources=sources,
         )
 
     def llm_classify(self, name: str, rule: str, text: str) -> Optional[str]:

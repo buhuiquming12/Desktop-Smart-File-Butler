@@ -534,15 +534,22 @@ class AgentRuntime:
                     stop_reason="no_operations",
                     forced_outcome="unknown" if not state.get("observations") else None,
                 )
+                # 模型措辞只有在校验通过（success）时才能作为正文；否则“全部完成！”
+                # 会盖住“未执行任何文件操作，无法验证目标”的确定性结论。
+                response = (
+                    result.user_message
+                    if completion["outcome"] == "success"
+                    else completion["message"]
+                )
                 return {
                     "plan": [],
                     "step_index": 0,
-                    "status": "completed",
+                    "status": "failed" if completion["outcome"] == "failed" else "completed",
                     "outcome": completion["outcome"],
                     "stop_reason": completion["stop_reason"],
                     "completion": completion,
                     "run_trace": trace,
-                    "final_response": result.user_message or completion["message"],
+                    "final_response": response,
                     "current_step": {},
                 }
             return {
@@ -628,6 +635,24 @@ class AgentRuntime:
             return {"current_step": current, "observations": [*state.get("observations", []), observation],
                     "step_index": index + 1, "status": "running"}
 
+        # 用户拒绝过本请求的累计审批后，后续同类的移动/重命名/分类步骤一律跳过。
+        # 这个判断必须早于“请求审批”：拒绝后累计变更数没有获批，policy 仍会返回
+        # requires_approval，先弹窗就会对同一请求反复要审批。
+        if tool in _CUMULATIVE_TOOLS and state.get("batch_rejected"):
+            observation = self._observation(
+                step, "rejected", result="用户拒绝了批量操作，未移动该文件"
+            )
+            db.log_operation(
+                tool, str(args.get("src") or args.get("scan_id") or ""), "rejected",
+                detail="用户拒绝批量操作", thread_id=state.get("thread_id"),
+            )
+            return {
+                "current_step": current,
+                "observations": [*state.get("observations", []), observation],
+                "step_index": index + 1,
+                "status": "running",
+            }
+
         # 引用旧扫描时必须在使用前核验：manifest 不存在、目录已消失都明确失败，
         # 不能拿过期清单继续移动文件。
         if tool in {"batch_move", "batch_rename", "batch_classify"}:
@@ -656,23 +681,6 @@ class AgentRuntime:
                 "args": args,
             }
             return {"current_step": current, "pending_approval": approval, "status": "waiting_approval"}
-
-        # 用户拒绝过本请求的累计审批后，后续同类的移动/重命名/分类步骤一律跳过。
-        # 审批门槛本身由 PolicyEngine 统一判定（含 batch_classify），这里只负责拒绝后的收敛。
-        if tool in _CUMULATIVE_TOOLS and state.get("batch_rejected"):
-            observation = self._observation(
-                step, "rejected", result="用户拒绝了批量操作，未移动该文件"
-            )
-            db.log_operation(
-                tool, str(args.get("src") or args.get("scan_id") or ""), "rejected",
-                detail="用户拒绝批量操作", thread_id=state.get("thread_id"),
-            )
-            return {
-                "current_step": current,
-                "observations": [*state.get("observations", []), observation],
-                "step_index": index + 1,
-                "status": "running",
-            }
 
         if tool == "delete_file":
             target = str(args.get("path", ""))
@@ -967,9 +975,10 @@ class AgentRuntime:
         return self._tools().execute(step)
 
     @staticmethod
-    def _batch_result(matched: int, successes: list[str], failed: list[dict], skipped: list[dict], *, truncated: bool = False, reason: str = "none") -> Dict[str, Any]:
+    def _batch_result(matched: int, successes: list[str], failed: list[dict], skipped: list[dict], *, truncated: bool = False, reason: str = "none", sources: Optional[list[str]] = None) -> Dict[str, Any]:
         return ToolExecutor.batch_result(
-            matched, successes, failed, skipped, truncated=truncated, reason=reason
+            matched, successes, failed, skipped,
+            truncated=truncated, reason=reason, sources=sources,
         )
 
     def _batch_move(self, args: Dict[str, Any]) -> Dict[str, Any]:

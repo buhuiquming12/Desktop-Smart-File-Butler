@@ -27,6 +27,18 @@ async function main(): Promise<void> {
   }
   if (done.payload.run_id !== 'run-9') throw new Error('重连丢失运行编号');
 
+  // 待澄清也是终态：漏掉它，重连后界面会永远停在“处理中”，问题也看不到。
+  const clarify = reconciliationEvents('thread-2', {
+    status: 'needs_clarification', outcome: 'needs_clarification',
+    stop_reason: 'clarification_requested', final_response: '要整理哪个目录？',
+    observations: [],
+    summary: { ok: 0, failed: 0, skipped: 0, files: [], operations: [] },
+  });
+  const clarifyDone = clarify.find((event) => event.type === 'done');
+  if (!clarifyDone) throw new Error('重连未恢复待澄清状态');
+  if (clarifyDone.payload.message !== '要整理哪个目录？') throw new Error('重连丢失澄清问题');
+  if (clarifyDone.payload.outcome !== 'needs_clarification') throw new Error('重连丢失澄清 outcome');
+
   const rollback = rollbackFeedback({ ok: 7, skipped: 2, failed: 1, details: [] });
   if (rollback.kind !== 'error' || !rollback.message.includes('失败 1')) throw new Error('部分回滚失败被显示为全成功');
 

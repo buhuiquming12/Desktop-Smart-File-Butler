@@ -241,7 +241,9 @@ export function reconciliationEvents(threadId: string, state: ThreadState): WSEv
     },
   }));
   if (state.pending_approval) events.push({ type: 'approval_required', thread_id: threadId, payload: state.pending_approval });
-  if (['completed', 'failed', 'cancelled'].includes(state.status)) {
+  // needs_clarification 也是“本次运行已结束、等用户补充信息”的终态：
+  // 漏掉它，断线重连时界面会一直停在“处理中”，用户看不到要回答的问题。
+  if (['completed', 'failed', 'cancelled', 'needs_clarification'].includes(state.status)) {
     events.push({ type: 'done', thread_id: threadId, payload: {
       status: state.status,
       // 重连恢复同样要保留“流程终止 ≠ 目标完成”的区分。
