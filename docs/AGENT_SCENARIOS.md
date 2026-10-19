@@ -303,7 +303,8 @@ python -m pytest -q tests/test_scenarios.py tests/test_tool_contracts.py tests/t
   `把D:\scan里的PDF移动到out` 仍识别出 `delete`/`move`；`D:\扫描件2024`、
   `D:\资料\扫描` 仍按目录名处理。
 - 反向回归（第五轮）：`D:\scan delete`、`D:\scan move` 按指令处理；
-  `D:\My scan`、`D:\scan list` 仍按路径处理（scan/list 是常见目录名）。
+  `D:\My scan`、`D:\scan list` 仍按路径处理（scan/list 是常见目录名，
+  只读新任务通常写作 `list D:\scan`，动词在路径之前）。
 
 ### 33. 空计划、新建目录与批量链
 
@@ -318,6 +319,30 @@ python -m pytest -q tests/test_scenarios.py tests/test_tool_contracts.py tests/t
   不再出现第二次审批弹窗，文件一个都不动。
 - 重连恢复：`needs_clarification` 也作为终态恢复为 `done` 事件，界面不会停在“处理中”，
   且能显示待回答的问题。
+
+### 34. 英文只读新任务
+
+- 第一轮：`帮我整理一下文件` → 澄清；第二轮：`show me the files` /
+  `check the folder` / `find all pdfs` / `看看这个目录`。
+- 预期行为：这些都是只读新任务，不能当作“没有动词”的补充信息继承上一轮移动授权。
+- 最终断言：`trusted_user_intent` 不含“整理”；`move_file` 观察 failed；文件未动。
+- 词表回归：`intent_effects("show me the files") == {"read"}`；
+  纯路径回答（`D:\scan`、`D:\My scan`、`D:\Program Files\scan`）仍继承授权。
+
+### 35. 混合请求的新建目录目标
+
+- 请求：`新建一个备份文件夹，然后把 PDF 移动进去`。
+- 预期行为：`create` 是独立目标，不只是移动的从属授权。
+- 最终断言：只有 `move_file` 成功时 `unmet_effects == ["create"]`、outcome 为 `partial`；
+  `make_dir` 与 `move_file` 都成功时为 `success`。
+- 定语用法（`把 PDF 移动到新建的 out 文件夹`）不要求独立建目录。
+
+### 36. 大批量链式操作
+
+- 初始文件：220 个 PDF（超过旧的 200 条 `sources` 上限）。
+- 流程：`scan → batch_move → scan → batch_classify`。
+- 预期行为：前一步的源路径被后一步全部消费，链不能被判成“结果消失”。
+- 最终断言：批量结果 `sources` 有 220 条；四个检查全部 verified；outcome 为 `success`。
 
 ## 手动演示（真实模型，可重复）
 

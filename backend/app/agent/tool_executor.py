@@ -26,8 +26,6 @@ SUPPORTED_CONTENT_EXTS = {
 }
 SUMMARY_CHUNK_CHARS = 12_000
 SUMMARY_MAX_CHUNKS = 40
-# 批量结果里保留的“被消费源路径”条数：用于完成判定识别链式操作，无需无上限持久化。
-_MAX_BATCH_SOURCES = 200
 
 
 def _json(value: Any) -> str:
@@ -172,7 +170,9 @@ class ToolExecutor:
             "preview": successes[:10],
             # 被消费的清单项（源路径）。完成判定用它识别“后续操作吃掉了上一步的结果”，
             # 否则 A→B 再 B→C 的批量链会被误判成“结果在任务结束前消失”。
-            "sources": [str(item) for item in (sources or [])][:_MAX_BATCH_SOURCES],
+            # 不能截断：链式判断要按全部匹配项比对，截断会让大批量链后半段被误判。
+            # 长度上界由扫描清单本身决定（filesystem._MAX_SCAN_ITEMS），不是无界集合。
+            "sources": list(dict.fromkeys(str(item) for item in (sources or []))),
             "failures": failed[:10],
             "skips": skipped[:10],
         }

@@ -162,12 +162,12 @@ def _unmet_effects(intent: str, observations: list) -> list[str]:
     例如用户说“把 PDF 移动到 PDF 文件夹”，模型只扫描就结束：扫描不构成“移动”。
 
     ``create`` 平时是移动/整理的从属授权（移动前可能要建目标目录，``move_file``
-    自己也会建），因此默认不当作目标；只有请求本身就是在“新建目录”时它才是目标。
+    自己也会建），因此默认不当作目标；但用户在请求里明确要求“新建目录/文件夹”时
+    它就是独立目标——混合请求（先建目录再移动）同样必须真的建成。
+    “移动到新建的 out 文件夹”这类定语用法由 ``explicit_intent_effects`` 排除。
     """
     required = {kind for kind in intent_effects(intent) if kind not in {"read", "create"}}
-    if not required:
-        # 纯“新建目录/文件夹”请求：建目录就是目标，没建成不能算成功。
-        required |= explicit_intent_effects(intent)
+    required |= explicit_intent_effects(intent)
     if not required:
         return []
     performed: set[str] = set()

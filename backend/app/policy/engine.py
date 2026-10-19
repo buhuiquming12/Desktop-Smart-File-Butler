@@ -76,7 +76,8 @@ _CJK_STRONG_COMMANDS = (
 )
 
 # 路径之后单独出现的英文动作词是命令；scan/list 之类只读词与目录名无法区分
-# （``D:\My scan`` 是路径），因此仍按路径处理，避免把目录名误判成新请求。
+# （``D:\My scan``、``D:\scan list`` 都是合法目录名），因此仍按路径处理。
+# 只读新任务通常把动词放在最前（``list D:\scan``），那条路径不受影响。
 _ASCII_COMMAND_KINDS = ("move", "rename", "delete")
 
 
@@ -135,8 +136,7 @@ def _contains_command_phrase(text: str) -> bool:
 def _is_command_chunk(chunk: str) -> bool:
     """片段是否是一条动作指令：中文“删除/整理一下”，或英文 move/rename/delete。
 
-    英文只读词（scan/list/view）与目录名无法区分（``D:\\My scan`` 是路径），
-    因此仍按路径处理；move/delete 出现在文件名里的概率极低，按指令处理更保守。
+    英文只读词（scan/list/view）与目录名无法区分（``D:\\My scan``），仍按路径处理。
     """
     text = chunk.strip().strip("，。；;、！!？?.,")
     if not text:
@@ -236,7 +236,10 @@ def _is_bare_path(text: str) -> bool:
     ):
         return False
     # 空格之后的片段是动作（``D:\scan 删除``、``D:\scan delete``）时同理。
-    return not any(_is_command_chunk(chunk) for chunk in value.split(" ")[1:])
+    return not any(
+        _is_command_chunk(match.group(0))
+        for match in list(re.finditer(r"\S+", value))[1:]
+    )
 
 
 def _mask_quoted_paths(text: str) -> str:
@@ -415,10 +418,15 @@ def is_task_switch(message: str) -> bool:
 _INTENT_TERMS: dict[str, tuple[str, ...]] = {
     # 只读动作也必须登记：否则“只扫描一下”会被当成“没有任何操作”，
     # 在澄清续问里被误判为单纯补充信息，从而继承上一轮的移动授权。
+    # 英文只读动词要覆盖日常说法（show/check/find/search…），否则这些新任务
+    # 会被当成“没有动词”的补充信息，沿用上一轮的移动授权。
     "read": (
-        "扫描", "扫一下", "扫一遍", "查看", "看一眼", "看一下",
-        "浏览", "列出", "列一下", "列个", "清单", "统计一下",
-        "scan", "list", "browse", "view", "look at", "read",
+        "扫描", "扫一下", "扫一遍", "查看", "看一眼", "看一下", "看看", "看下",
+        "浏览", "列出", "列一下", "列个", "列出来", "清单", "统计一下", "统计",
+        "数一下", "清点", "有什么", "都有什么", "找一下",
+        "scan", "list", "browse", "view", "look at", "look", "read", "show",
+        "display", "check", "find", "search", "inspect", "peek", "count",
+        "print", "enumerate", "what's in", "what is in", "tell me",
     ),
     "move": (
         "移动", "移到", "挪到", "转移", "整理", "归档", "分类",
@@ -442,10 +450,11 @@ _INTENT_TERMS: dict[str, tuple[str, ...]] = {
 }
 
 # 显式目标：只有“新建目录/文件夹”才是目标本身；“创建摘要文件”属于 write，不算建目录。
+# ``(?!\s*的)`` 排除定语用法（“移动到新建的 out 文件夹”），那里建目录只是从属动作。
 _EXPLICIT_PATTERNS: dict[str, tuple[str, ...]] = {
     "create": (
-        r"(?:新建|创建|建个|建立一个?)[^，。；;\n]{0,12}?(?:目录|文件夹|folder|directory)",
-        r"(?:目录|文件夹)[^，。；;\n]{0,6}?(?:新建|创建)",
+        r"(?:新建|创建|建个|建立一个?)(?!\s*的)[^，。；;\n]{0,12}?(?:目录|文件夹|folder|directory)",
+        r"(?:目录|文件夹)[^，。；;\n]{0,6}?(?:新建|创建)(?!\s*的)",
         r"\bmkdir\b",
         r"\b(?:create|make)\s+(?:a\s+)?(?:new\s+)?(?:folder|directory)\b",
     ),
