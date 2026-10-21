@@ -10,7 +10,7 @@ import pytest
 from app import db
 from app.agent.tool_executor import ToolExecutor
 from app.config import get_settings
-from app.tools import naming, preview
+from app.tools import filesystem, naming, preview
 
 
 @pytest.fixture()
@@ -68,6 +68,28 @@ def test_sequence_prefix_and_padding(sandbox: Path) -> None:
     })
     names = [item["target_name"] for item in page["items"]]
     assert names == ["0005a.txt", "0007b.txt", "0009c.txt"]
+
+
+def test_scan_order_is_natural_and_stable(sandbox: Path) -> None:
+    """扫描顺序必须由自然序决定，而不是文件系统返回目录项的顺序。
+
+    NTFS 通常按字母返回、ext4 按哈希返回；若直接沿用，序号重命名与预览列表在
+    Windows 与 Linux 上会得到不同结果（CI 上曾经因此失败）。
+    """
+    source = sandbox / "order"
+    (source / "sub").mkdir(parents=True)
+    for name in ("b.txt", "a.txt", "file10.txt", "file2.txt"):
+        (source / name).write_text("x", encoding="utf-8")
+    (source / "sub" / "z3.txt").write_text("x", encoding="utf-8")
+
+    flat = [item.name for item in filesystem.scan_directory(str(source)).items]
+    assert flat == ["a.txt", "b.txt", "file2.txt", "file10.txt", "sub"]
+
+    nested = [
+        Path(item.path).relative_to(source).as_posix()
+        for item in filesystem.scan_directory(str(source), recursive=True).items
+    ]
+    assert nested == ["a.txt", "b.txt", "file2.txt", "file10.txt", "sub", "sub/z3.txt"]
 
 
 def test_date_template_uses_modified_time(sandbox: Path) -> None:

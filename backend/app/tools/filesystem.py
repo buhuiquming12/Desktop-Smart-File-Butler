@@ -39,6 +39,7 @@ def preflight_restore(op: OperationLog) -> dict:
     return {"status": "ok", "detail": "预检通过", "current": str(current)}
 
 import os
+import re
 import shutil
 import stat as stat_module
 from dataclasses import dataclass
@@ -83,6 +84,36 @@ class ScanResult:
 
     def __getitem__(self, index):
         return self.items[index]
+
+
+_NATURAL_TOKEN = re.compile(r"(\d+)")
+
+
+def natural_key(name: str) -> tuple:
+    """文件名自然排序键：``file2`` 排在 ``file10`` 之前，且结果与平台无关。
+
+    目录项顺序由文件系统决定（NTFS 多按字母序，ext4 多按哈希序），若序列重命名
+    与预览列表直接沿用该顺序，同一条规则在 Windows 与 Linux 上会得到不同编号。
+    末尾保留原始片段，让 ``A.txt`` / ``a.txt`` 这类仅大小写不同的名字也有确定次序。
+    """
+    key: list[tuple[int, int, str, str]] = []
+    for token in _NATURAL_TOKEN.split(name):
+        if not token:
+            continue
+        if token.isdigit():
+            key.append((0, int(token), "", ""))
+        else:
+            key.append((1, 0, token.casefold(), token))
+    return tuple(key)
+
+
+def _tree_sort_key(path: str, root: str) -> tuple:
+    """按相对路径逐段自然排序，保证递归扫描的先后顺序同样稳定。"""
+    try:
+        rel = os.path.relpath(path, root)
+    except ValueError:
+        rel = path  # 跨盘符无法求相对路径时退化为整体比较
+    return tuple(natural_key(part) for part in rel.split(os.sep) if part not in ("", "."))
 
 
 def _is_link_like(entry: "os.DirEntry[str]") -> bool:
@@ -188,6 +219,8 @@ def scan_directory(directory: str, recursive: bool = False) -> ScanResult:
         logger.warning("目录扫描提前结束（%s）: %s", bounded_by, root)
     elif depth_limited:
         logger.warning("目录扫描已按深度上限 %d 截断深层分支: %s", _MAX_SCAN_DEPTH, root)
+    # 统一按自然序重排：下游的序号重命名、预览列表、分批都依赖稳定的先后顺序。
+    items.sort(key=lambda meta: _tree_sort_key(meta.path, str(root)))
     reason = "max_items" if bounded_by else "max_depth" if depth_limited else "permission_error" if permission_error else "none"
     return ScanResult(items, len(items), reason != "none", reason)
 
