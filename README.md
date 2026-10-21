@@ -480,7 +480,8 @@ SANDBOX_ROOTS='["C:/Users/me/Downloads", "D:/Archive"]'
 ```powershell
 # 1. 安装依赖
 cd backend
-pip install -r requirements.txt
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
 cd ..\frontend
 npm ci
 
@@ -492,6 +493,20 @@ npm run build:sidecar
 
 # 4. 构建 Windows portable 包
 npm run dist
+```
+
+> `npm run build:sidecar` 调用的是裸 `python`，若该解释器没装 PyInstaller，脚本会自动改用
+> `backend/.venv` 里的解释器重跑；也可以用 `PYTHON=D:\path\to\python.exe npm run build:sidecar`
+> 显式指定。两步都通过后 `frontend/release/` 下才会出现可分发 exe。
+
+如果第 4 步报 `EPERM ... win-unpacked.tmp -> win-unpacked` 或
+`safe-delete ... BULK_CONFIRM_REQUIRED`，说明当前环境（如受文件守卫/杀毒监控的目录）
+锁住了解包出的 `*.asar`，electron-builder 无法清理或改名。把输出目录换到工作区之外再打包，
+再把 exe 拷回来即可：
+
+```powershell
+npx electron-builder --win portable --config.directories.output=D:/butler-build
+copy "D:\butler-build\桌面智能文件管家 0.1.0.exe" "release\"
 ```
 
 主要产物：

@@ -27,6 +27,9 @@ node_modules/
 frontend/dist/
 frontend/dist-electron/
 frontend/release/
+# 备用输出目录：工作区内的文件守卫会锁住解包出的 *.asar，导致 electron-builder
+# 无法 rename/清理时，会退到 release-xxx 之类的同级目录重新打包（见 README）。
+frontend/release-*/
 frontend/.vite/
 frontend/.test-dist/
 frontend/.electron-test-dist/
