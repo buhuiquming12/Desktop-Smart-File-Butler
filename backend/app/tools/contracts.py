@@ -86,11 +86,33 @@ class BatchRenameArgs(_StrictModel):
     filter: BatchFilter = Field(default_factory=BatchFilter)
     prefix: str = ""
     suffix: str = ""
+    find: str = Field(default="", max_length=200)
+    replace: str = Field(default="", max_length=200)
+    case_sensitive: bool = False
+    template: str = Field(default="", max_length=300)
+    sequence_start: Optional[int] = Field(default=None, ge=0, le=999_999)
+    sequence_step: int = Field(default=1, ge=1, le=1000)
+    sequence_padding: int = Field(default=3, ge=1, le=10)
+    sequence_position: Literal["prefix", "suffix"] = "suffix"
+    date_source: Optional[Literal["modified", "created", "now", "content"]] = None
+    date_format: str = Field(default="YYYYMMDD", max_length=40)
 
     @model_validator(mode="after")
     def _needs_affix(self) -> "BatchRenameArgs":
-        if not self.prefix and not self.suffix:
-            raise ValueError("batch_rename 至少需要 prefix 或 suffix")
+        # 前缀/后缀、查找替换、序号、日期、模板至少要有一项，否则是空操作。
+        if not any([
+            self.prefix, self.suffix, self.find, self.template,
+            self.sequence_start is not None, self.date_source,
+        ]):
+            raise ValueError(
+                "batch_rename 至少需要 prefix/suffix/find/template/sequence_start/date_source 之一"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _sequence_position(self) -> "BatchRenameArgs":
+        if self.sequence_position not in {"prefix", "suffix"}:
+            raise ValueError("sequence_position 仅支持 prefix 或 suffix")
         return self
 
 
@@ -98,6 +120,8 @@ class BatchClassifyArgs(_StrictModel):
     scan_id: str = Field(min_length=1)
     dest_root: str = Field(min_length=1)
     filter: BatchFilter = Field(default_factory=BatchFilter)
+    # extension：按扩展名规则；content：按正文 + 模型（带缓存与预算回退）。
+    mode: Literal["extension", "content"] = "extension"
 
 
 class RenameArgs(_StrictModel):
@@ -136,6 +160,45 @@ class ClarifyArgs(_StrictModel):
     question: str = Field(min_length=1, max_length=1_000)
     options: list[str] = Field(default_factory=list, max_length=10)
     reason: str = Field(default="", max_length=500)
+
+
+class PreviewBatchArgs(_StrictModel):
+    """为批量操作生成逐文件预览；只读，不修改文件系统。"""
+
+    op: Literal["move", "rename", "classify", "delete"]
+    scan_id: str = Field(default="", max_length=64)
+    directory: str = Field(default="", max_length=1000)
+    filter: BatchFilter = Field(default_factory=BatchFilter)
+    dest_dir: str = Field(default="", max_length=1000)
+    dest_root: str = Field(default="", max_length=1000)
+    mode: Literal["extension", "content"] = "extension"
+    prefix: str = Field(default="", max_length=200)
+    suffix: str = Field(default="", max_length=200)
+    find: str = Field(default="", max_length=200)
+    replace: str = Field(default="", max_length=200)
+    template: str = Field(default="", max_length=300)
+    sequence_start: Optional[int] = Field(default=None, ge=0, le=999_999)
+    sequence_step: int = Field(default=1, ge=1, le=1000)
+    sequence_padding: int = Field(default=3, ge=1, le=10)
+    sequence_position: Literal["prefix", "suffix"] = "suffix"
+    date_source: Optional[Literal["modified", "created", "now", "content"]] = None
+    date_format: str = Field(default="YYYYMMDD", max_length=40)
+
+    @model_validator(mode="after")
+    def _needs_target(self) -> "PreviewBatchArgs":
+        if not self.scan_id and not self.directory:
+            raise ValueError("preview_batch 需要 scan_id 或 directory")
+        if self.op == "move" and not self.dest_dir:
+            raise ValueError("移动预览需要 dest_dir")
+        if self.op == "classify" and not self.dest_root:
+            raise ValueError("分类预览需要 dest_root")
+        return self
+
+
+class SearchContentArgs(_StrictModel):
+    query: str = Field(min_length=1, max_length=500)
+    limit: int = Field(default=20, ge=1, le=100)
+    offset: int = Field(default=0, ge=0)
 
 
 @dataclass(frozen=True)
@@ -199,6 +262,12 @@ TOOL_CONTRACTS: dict[str, ToolContract] = {
     ),
     "request_clarification": ToolContract(
         "request_clarification", ClarifyArgs, "read", "暂停并向用户澄清目标或对象"
+    ),
+    "preview_batch": ToolContract(
+        "preview_batch", PreviewBatchArgs, "read", "生成逐文件操作预览（只读，不修改文件）"
+    ),
+    "search_content": ToolContract(
+        "search_content", SearchContentArgs, "read", "在已建立的内容索引中检索正文"
     ),
 }
 

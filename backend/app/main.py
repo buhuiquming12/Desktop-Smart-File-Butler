@@ -28,6 +28,7 @@ from .api.auth import (
     write_session_file as _write_session_file,
 )
 from .api.connections import ConnectionManager
+from .api.features import build_feature_router
 from .api.management import build_management_router
 from .agent.graph import AgentRuntime
 from .agent import tracing
@@ -40,7 +41,7 @@ from .models import (
     WSEventType,
 )
 from .runtime import threads as thread_registry
-from .tools import scheduler
+from .tools import scheduler, watcher
 
 settings = get_settings()
 setup_logging(settings.log_dir)
@@ -127,10 +128,13 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     _main_loop = asyncio.get_running_loop()
     _write_session_file()
     scheduler.init_scheduler(_scheduled_runner)
+    # P5：目录监听只在应用运行期间生效；退出后不会再整理任何文件（界面需如实提示）。
+    watcher.start_watcher()
     logger.info("桌面智能文件管家后端已启动")
     try:
         yield
     finally:
+        watcher.stop_watcher()
         scheduler.shutdown()
         for task in list(_background_tasks):
             task.cancel()
@@ -183,6 +187,17 @@ async def _auth_guard(request: Request, call_next: Any) -> Any:
 
 
 app.include_router(build_management_router(reset_runtime))
+
+
+def _preview_llm() -> Any:
+    """预览的内容分类使用当前运行时模型；模型未配置时返回 None（自动回退到扩展名）。"""
+    try:
+        return get_runtime().tool_executor.llm
+    except Exception:  # noqa: BLE001 - 预览不能因为模型未配置而不可用
+        return None
+
+
+app.include_router(build_feature_router(_preview_llm))
 
 
 def _next_update(iterator: Iterable[Dict[str, Any]]) -> Tuple[bool, Optional[Dict[str, Any]]]:

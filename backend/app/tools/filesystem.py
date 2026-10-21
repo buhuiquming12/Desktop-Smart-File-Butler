@@ -8,6 +8,25 @@
 from __future__ import annotations
 
 
+def _note_index_move(old: str, new: str) -> None:
+    """内容索引的增量更新；索引不存在或更新失败都不能影响文件操作本身。"""
+    try:
+        from . import indexer
+
+        indexer.note_path_moved(old, new)
+    except Exception:  # noqa: BLE001
+        logger.debug("更新内容索引失败 %s -> %s", old, new, exc_info=True)
+
+
+def _note_index_removed(path: str) -> None:
+    try:
+        from . import indexer
+
+        indexer.note_path_removed(path)
+    except Exception:  # noqa: BLE001
+        logger.debug("清理内容索引失败 %s", path, exc_info=True)
+
+
 def preflight_restore(op: OperationLog) -> dict:
     """回滚预检：不修改文件，只确认源和目标均位于沙箱且源仍存在。"""
     if op.action not in _REVERSIBLE_ACTIONS or op.status != "ok" or not op.dest:
@@ -209,8 +228,15 @@ def _safe_child_name(name: str) -> str:
     return name
 
 
-def move_file(src: str, dest_dir: str, new_name: str | None = None) -> str:
-    """移动文件到目标目录，可同时重命名。目标存在则自动改名避免覆盖。"""
+def move_file(
+    src: str, dest_dir: str, new_name: str | None = None, *, ensure_unique: bool = True
+) -> str:
+    """移动文件到目标目录，可同时重命名。
+
+    ``ensure_unique=True``（默认）时目标占用会自动改名避免覆盖；``False`` 时目标占用
+    直接抛 ``FileExistsError``——预览执行走这条路径，保证实际落点与用户确认的完全一致，
+    不会出现“确认的是 a.txt、实际写成 a (1).txt”的静默偏离。
+    """
     src_path = resolve_in_sandbox(src, must_exist=True)
     if src_path.is_dir():
         raise IsADirectoryError(f"move_file 仅支持文件: {src_path}")
@@ -221,28 +247,39 @@ def move_file(src: str, dest_dir: str, new_name: str | None = None) -> str:
             raise NotADirectoryError(f"目标不是目录: {dest_root}")
         name = _safe_child_name(new_name) if new_name else src_path.name
         dest = resolve_in_sandbox(str(dest_root / name))
-        dest = _unique_dest(dest)
+        if ensure_unique:
+            dest = _unique_dest(dest)
+        elif dest.exists():
+            raise FileExistsError(f"目标已存在: {dest}")
         try:
             shutil.move(str(src_path), str(dest))
             log_operation("move", str(src_path), "ok", dest=str(dest))
+            _note_index_move(str(src_path), str(dest))
             return str(dest)
         except OSError as exc:
             log_operation("move", str(src_path), "failed", dest=str(dest), detail=str(exc))
             raise
 
 
-def rename_file(src: str, new_name: str) -> str:
-    """在原目录内重命名文件。"""
+def rename_file(src: str, new_name: str, *, ensure_unique: bool = True) -> str:
+    """在原目录内重命名文件。
+
+    ``ensure_unique=False`` 时目标占用直接失败（理由同 ``move_file``）。
+    """
     src_path = resolve_in_sandbox(src, must_exist=True)
     if src_path.is_dir():
         raise IsADirectoryError(f"rename_file 仅支持文件: {src_path}")
     name = _safe_child_name(new_name)
     with path_locks.acquire(src_path.parent):
         dest = resolve_in_sandbox(str(src_path.with_name(name)))
-        dest = _unique_dest(dest)
+        if ensure_unique:
+            dest = _unique_dest(dest)
+        elif dest.exists() and dest.resolve() != src_path.resolve():
+            raise FileExistsError(f"目标已存在: {dest}")
         try:
             src_path.rename(dest)
             log_operation("rename", str(src_path), "ok", dest=str(dest))
+            _note_index_move(str(src_path), str(dest))
             return str(dest)
         except OSError as exc:
             log_operation("rename", str(src_path), "failed", dest=str(dest), detail=str(exc))
@@ -265,6 +302,7 @@ def delete_file(path: str) -> str:
             dest = _unique_dest(trash / target.name)
             shutil.move(str(target), str(dest))
         log_operation("delete", str(target), "ok", dest=str(dest))
+        _note_index_removed(str(target))
         return str(dest)
     except OSError as exc:
         log_operation("delete", str(target), "failed", detail=str(exc))

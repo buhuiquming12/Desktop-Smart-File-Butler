@@ -55,4 +55,7 @@ def test_build_task_summary_counts_statuses_and_collects_paths() -> None:
 
 def test_build_task_summary_empty() -> None:
     summary = build_task_summary([])
-    assert summary == {"ok": 0, "failed": 0, "skipped": 0, "files": [], "operations": []}
+    # previews：Agent 生成的操作预览编号（供界面“打开预览”入口使用）。
+    assert summary == {
+        "ok": 0, "failed": 0, "skipped": 0, "files": [], "operations": [], "previews": [],
+    }

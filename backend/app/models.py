@@ -132,3 +132,103 @@ class WSEvent(BaseModel):
     type: WSEventType
     thread_id: str
     payload: Dict[str, Any] = Field(default_factory=dict)
+
+
+# ---------------- 新增能力的请求模型（P0–P6） ----------------
+
+class PreviewFilter(BaseModel):
+    """预览使用的确定性过滤条件（与 batch_* 的 filter 语义一致）。"""
+
+    extensions: List[str] = Field(default_factory=list, max_length=200)
+    names: List[str] = Field(default_factory=list, max_length=500)
+    name_contains: str = Field(default="", max_length=200)
+    min_size: Optional[int] = Field(default=None, ge=0)
+    max_size: Optional[int] = Field(default=None, ge=0)
+
+
+class PreviewCreate(BaseModel):
+    """生成操作预览。``directory`` 与 ``scan_id`` 至少给一个。"""
+
+    op: str = Field(pattern="^(move|rename|classify|delete)$")
+    directory: str = Field(default="", max_length=1000)
+    scan_id: str = Field(default="", max_length=64)
+    recursive: bool = True
+    filter: PreviewFilter = Field(default_factory=PreviewFilter)
+    dest_dir: str = Field(default="", max_length=1000)
+    dest_root: str = Field(default="", max_length=1000)
+    mode: str = Field(default="extension", pattern="^(extension|content)$")
+    prefix: str = Field(default="", max_length=200)
+    suffix: str = Field(default="", max_length=200)
+    find: str = Field(default="", max_length=200)
+    replace: str = Field(default="", max_length=200)
+    case_sensitive: bool = False
+    template: str = Field(default="", max_length=300)
+    sequence_start: int = Field(default=1, ge=0, le=999_999)
+    sequence_step: int = Field(default=1, ge=1, le=1000)
+    sequence_padding: int = Field(default=3, ge=1, le=10)
+    sequence_position: str = Field(default="suffix", pattern="^(prefix|suffix)$")
+    date_source: str = Field(default="modified", pattern="^(modified|created|now|content)$")
+    date_format: str = Field(default="YYYYMMDD", max_length=40)
+    use_sequence: bool = False
+    use_date: bool = False
+    content_budget: int = Field(default=30, ge=0, le=500)
+
+
+class PreviewConfirm(BaseModel):
+    item_ids: List[str] = Field(min_length=1, max_length=5000)
+    # 删除与超阈值批量必须显式确认；后端不会因为“打开过预览”就视为授权。
+    approve: bool = False
+    # 类别覆盖必须在这里提交：确认绑定最终落点，执行时不能临时改目标。
+    category_overrides: Dict[str, str] = Field(default_factory=dict, max_length=5000)
+
+
+class PreviewExecute(BaseModel):
+    item_ids: List[str] = Field(min_length=1, max_length=5000)
+    confirm_token: str = Field(min_length=1, max_length=128)
+    category_overrides: Dict[str, str] = Field(default_factory=dict)
+
+
+class DuplicateScanRequest(BaseModel):
+    directories: List[str] = Field(min_length=1, max_length=20)
+    min_size: int = Field(default=1, ge=0, le=10 * 1024 * 1024)
+
+
+class DuplicateCleanupRequest(BaseModel):
+    group_ids: List[str] = Field(default_factory=list, max_length=5000)
+    keep_map: Dict[str, str] = Field(default_factory=dict)
+    # 清理会删除文件（进回收站），必须显式确认。
+    confirm: bool = False
+
+
+class IndexRequest(BaseModel):
+    directory: str = Field(min_length=1, max_length=1000)
+    recursive: bool = True
+
+
+class SearchRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=500)
+    limit: int = Field(default=50, ge=1, le=200)
+    offset: int = Field(default=0, ge=0)
+    backend: str = Field(default="keyword", max_length=40)
+
+
+class RuleCreate(BaseModel):
+    directory: str = Field(min_length=1, max_length=1000)
+    dest_root: str = Field(min_length=1, max_length=1000)
+    mode: str = Field(default="extension", pattern="^(extension|content)$")
+    instruction: str = Field(default="", max_length=2000)
+    enabled: bool = True
+    settle_seconds: int = Field(default=5, ge=1, le=3600)
+
+
+class RuleUpdate(BaseModel):
+    directory: Optional[str] = Field(default=None, max_length=1000)
+    dest_root: Optional[str] = Field(default=None, max_length=1000)
+    mode: Optional[str] = Field(default=None, pattern="^(extension|content)$")
+    instruction: Optional[str] = Field(default=None, max_length=2000)
+    enabled: Optional[bool] = None
+    settle_seconds: Optional[int] = Field(default=None, ge=1, le=3600)
+
+
+class TrashRestoreRequest(BaseModel):
+    op_ids: List[int] = Field(min_length=1, max_length=500)

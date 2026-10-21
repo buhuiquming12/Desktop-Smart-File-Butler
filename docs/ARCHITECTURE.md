@@ -387,8 +387,16 @@ CI 不只验证代码和单元测试，也验证 Windows 桌面交付链能够�
 | tools/manifests.py | 完整扫描清单与确定性过滤 |
 | tools/path_locks.py | 目录级 mutation 锁 |
 | tools/filesystem.py | 文件操作、软删除、回滚 |
+| tools/naming.py | 确定性重命名（预览与批量执行共用同一函数） |
+| tools/preview.py | 逐文件预览、确认令牌、执行前失效重检 |
+| tools/duplicates.py | 大小分组 + 流式哈希、硬链接与变化检测 |
+| tools/indexer.py | 内容索引（FTS5 单字短语 / LIKE 回退）与检索 |
+| tools/classify.py | 按内容分类：缓存、预算、明确回退 |
+| tools/watcher.py | 目录轮询、稳定判定、去重与自动整理 |
+| tools/trash.py | 回收站列表与恢复 |
 | api/auth.py | session token 与 Origin 校验 |
 | api/connections.py | WebSocket 连接管理 |
+| api/features.py | 预览、重复文件、索引/搜索、规则、回收站 API |
 | api/management.py | 设置、日志、回滚、定时任务 API |
 | runtime/threads.py | thread 锁、活动状态和取消注册 |
 | frontend/src/api/client.ts | REST、WebSocket、状态 reconciliation |
@@ -429,4 +437,5 @@ LangGraph、文档解析和 OCR 生态集中在 Python；Electron 更适合桌�
 5. main.py、graph.py、App.tsx 已开始拆分，但仍可继续抽出 workflow service、Agent transport 和 conversation controller。
 6. API Key 当前不回传 Renderer，但本地 SQLite 仍是明文；正式产品可接系统 Keychain 或 Credential Manager。
 7. 正式发布还需要代码签名、品牌图标与全新 Windows VM 的安装级验证。
+7.1 内容检索目前是关键词后端（中文按单字短语匹配），语义检索只预留 `SearchBackend` 接口；重复扫描结果与索引任务状态保存在进程内存，重启后需重新扫描/建索引；自动整理是进程内轮询，应用退出即停止。
 8. 长期偏好目前是键值列表（可查看/更新/删除），还没有按语义检索；跨会话只隔离 thread 状态，不隔离偏好（偏好本就是全局设置）。

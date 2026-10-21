@@ -1,5 +1,19 @@
 import type {
   ApprovalResponse,
+  DuplicateCleanupResult,
+  DuplicateScan,
+  IndexJob,
+  IndexStats,
+  OrganizeRule,
+  PreviewConfirmResult,
+  PreviewCreateInput,
+  PreviewExecuteResult,
+  PreviewListItem,
+  PreviewPage,
+  RuleListResponse,
+  SearchResponse,
+  TrashList,
+  TrashRestoreResult,
   BackendConfig,
   ChatRequest,
   ChatResponse,
@@ -28,11 +42,14 @@ const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
 
 export class ApiError extends Error {
   readonly status: number;
+  /** 结构化错误体：后端用 detail.code / requires_approval 等字段表达可恢复状态。 */
+  readonly body: Record<string, unknown>;
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, body: Record<string, unknown> = {}) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
+    this.body = body;
   }
 }
 
@@ -79,8 +96,22 @@ function getErrorMessage(value: unknown): string {
   if (value && typeof value === 'object' && 'detail' in value) {
     const detail = (value as { detail?: unknown }).detail;
     if (typeof detail === 'string') return detail;
+    // 新接口用 {detail: {message, code, ...}} 表达“需要确认/预览失效”等可恢复错误。
+    if (detail && typeof detail === 'object' && 'message' in detail) {
+      const message = (detail as { message?: unknown }).message;
+      if (typeof message === 'string') return message;
+    }
   }
   return '请求失败';
+}
+
+/** 把错误体展开成普通对象，供界面读取 code / requires_approval 等字段。 */
+function errorBody(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== 'object') return {};
+  const detail = (value as { detail?: unknown }).detail;
+  if (detail && typeof detail === 'object') return detail as Record<string, unknown>;
+  if (typeof detail === 'string') return { message: detail };
+  return {};
 }
 
 export class ApiClient {
@@ -109,7 +140,7 @@ export class ApiClient {
       } catch {
         body = await response.text();
       }
-      throw new ApiError(getErrorMessage(body), response.status);
+      throw new ApiError(getErrorMessage(body), response.status, errorBody(body));
     }
 
     if (response.status === 204) return undefined as T;
@@ -217,6 +248,156 @@ export class ApiClient {
 
   updateToolSettings(update: ToolSettingsUpdate): Promise<ToolSettings> {
     return this.request('/api/settings/tools', { method: 'PUT', body: JSON.stringify(update) });
+  }
+
+  // ---- P0：操作预览 ----
+
+  createPreview(input: PreviewCreateInput): Promise<PreviewPage> {
+    return this.request('/api/previews', { method: 'POST', body: JSON.stringify(input) });
+  }
+
+  getPreview(previewId: string, offset = 0, limit = 100): Promise<PreviewPage> {
+    return this.request(
+      `/api/previews/${encodeURIComponent(previewId)}?offset=${offset}&limit=${limit}`,
+    );
+  }
+
+  /** 最近的预览列表：面板既可以从零新建，也可以直接打开已有 preview_id。 */
+  listPreviews(limit = 20): Promise<PreviewListItem[]> {
+    return this.request(`/api/previews?limit=${limit}`);
+  }
+
+  confirmPreview(
+    previewId: string,
+    itemIds: string[],
+    approve: boolean,
+    categoryOverrides: Record<string, string> = {},
+  ): Promise<PreviewConfirmResult> {
+    return this.request(`/api/previews/${encodeURIComponent(previewId)}/confirm`, {
+      method: 'POST',
+      // 类别覆盖必须在确认时提交：后端把它和最终落点一起写进确认记录，
+      // 执行时再改目标会被拒绝（不会出现“确认 A 目录、写入 B 目录”）。
+      body: JSON.stringify({ item_ids: itemIds, approve, category_overrides: categoryOverrides }),
+    });
+  }
+
+  executePreview(
+    previewId: string,
+    itemIds: string[],
+    confirmToken: string,
+    categoryOverrides: Record<string, string> = {},
+  ): Promise<PreviewExecuteResult> {
+    return this.request(`/api/previews/${encodeURIComponent(previewId)}/execute`, {
+      method: 'POST',
+      body: JSON.stringify({
+        item_ids: itemIds,
+        confirm_token: confirmToken,
+        category_overrides: categoryOverrides,
+      }),
+    });
+  }
+
+  // ---- P1：重复文件 ----
+
+  scanDuplicates(directories: string[], minSize = 1): Promise<{ scan_id: string; status: string }> {
+    return this.request('/api/duplicates/scan', {
+      method: 'POST',
+      body: JSON.stringify({ directories, min_size: minSize }),
+    });
+  }
+
+  getDuplicateScan(scanId: string): Promise<DuplicateScan> {
+    return this.request(`/api/duplicates/${encodeURIComponent(scanId)}`);
+  }
+
+  cancelDuplicateScan(scanId: string): Promise<unknown> {
+    return this.request(`/api/duplicates/${encodeURIComponent(scanId)}/cancel`, { method: 'POST' });
+  }
+
+  cleanupDuplicates(
+    scanId: string,
+    keepMap: Record<string, string>,
+    groupIds: string[] = [],
+  ): Promise<DuplicateCleanupResult> {
+    return this.request(`/api/duplicates/${encodeURIComponent(scanId)}/cleanup`, {
+      method: 'POST',
+      body: JSON.stringify({ keep_map: keepMap, group_ids: groupIds, confirm: true }),
+    });
+  }
+
+  // ---- P2：内容索引与搜索 ----
+
+  startIndex(directory: string, recursive = true): Promise<{ job_id: string; status: string }> {
+    return this.request('/api/index/scan', {
+      method: 'POST',
+      body: JSON.stringify({ directory, recursive }),
+    });
+  }
+
+  getIndexJob(jobId: string): Promise<IndexJob> {
+    return this.request(`/api/index/jobs/${encodeURIComponent(jobId)}`);
+  }
+
+  cancelIndex(jobId: string): Promise<unknown> {
+    return this.request(`/api/index/jobs/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' });
+  }
+
+  getIndexStats(): Promise<IndexStats> {
+    return this.request('/api/index/stats');
+  }
+
+  searchContent(query: string, limit = 50, offset = 0): Promise<SearchResponse> {
+    return this.request('/api/search', {
+      method: 'POST',
+      body: JSON.stringify({ query, limit, offset }),
+    });
+  }
+
+  // ---- P5：自动整理规则 ----
+
+  listRules(): Promise<RuleListResponse> {
+    return this.request('/api/rules');
+  }
+
+  createRule(input: {
+    directory: string;
+    dest_root: string;
+    mode: 'extension' | 'content';
+    instruction?: string;
+    enabled?: boolean;
+    settle_seconds?: number;
+  }): Promise<OrganizeRule> {
+    return this.request('/api/rules', { method: 'POST', body: JSON.stringify(input) });
+  }
+
+  updateRule(ruleId: string, changes: Partial<Pick<OrganizeRule,
+    'directory' | 'dest_root' | 'mode' | 'instruction' | 'enabled' | 'settle_seconds'>>): Promise<OrganizeRule> {
+    return this.request(`/api/rules/${encodeURIComponent(ruleId)}`, {
+      method: 'PUT',
+      body: JSON.stringify(changes),
+    });
+  }
+
+  deleteRule(ruleId: string): Promise<unknown> {
+    return this.request(`/api/rules/${encodeURIComponent(ruleId)}`, { method: 'DELETE' });
+  }
+
+  runRule(ruleId: string): Promise<{ processed: number; skipped: number; reason: string }> {
+    return this.request(`/api/rules/${encodeURIComponent(ruleId)}/run`, { method: 'POST' });
+  }
+
+  // ---- P6：回收站 ----
+
+  listTrash(query = '', limit = 200, offset = 0): Promise<TrashList> {
+    const params = new URLSearchParams({ query, limit: String(limit), offset: String(offset) });
+    return this.request(`/api/trash?${params.toString()}`);
+  }
+
+  restoreTrash(opIds: number[]): Promise<TrashRestoreResult> {
+    return this.request('/api/trash/restore', {
+      method: 'POST',
+      body: JSON.stringify({ op_ids: opIds }),
+    });
   }
 }
 

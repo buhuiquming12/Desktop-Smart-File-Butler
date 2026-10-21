@@ -43,6 +43,65 @@ async function main(): Promise<void> {
   if (rollback.kind !== 'error' || !rollback.message.includes('失败 1')) throw new Error('部分回滚失败被显示为全成功');
 
   await checkExternalToolEndpoints();
+  await checkPreviewEndpoints();
+}
+
+/**
+ * 预览接口：确认必须带 category_overrides（后端靠它在确认时锁定最终落点），
+ * 并且面板要能列出/打开既有预览。
+ */
+async function checkPreviewEndpoints(): Promise<void> {
+  const originalFetch = globalThis.fetch;
+  const calls: Array<{ path: string; method: string; body: string }> = [];
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = new URL(String(input));
+    calls.push({
+      path: url.pathname + url.search,
+      method: init?.method ?? 'GET',
+      body: typeof init?.body === 'string' ? init.body : '',
+    });
+    const preview = {
+      preview_id: 'p-1', created_at: '2026-01-01T00:00:00Z', op: 'classify',
+      directory: 'D:\\in', digest: 'd', status: 'preview', spec: {}, counts: {},
+      items: [], offset: 0, limit: 100, has_more: false, approval: null,
+    };
+    const payload = url.pathname.endsWith('/confirm')
+      ? { preview_id: 'p-1', approval_id: 'a-1', count: 1, requires_approval: false, threshold: 20, selection_digest: 's' }
+      : url.pathname.endsWith('/execute')
+        ? { preview_id: 'p-1', op: 'classify', selected: 1, ok: 1, failed: 0, skipped: 0, results: [], rollback_thread_id: 't' }
+        : url.pathname === '/api/previews'
+          ? [{
+              preview_id: 'p-1', created_at: '2026-01-01T00:00:00Z', op: 'classify',
+              directory: 'D:\\in', digest: 'd', status: 'preview',
+            }]
+          : preview;
+    return new Response(JSON.stringify(payload), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    });
+  }) as typeof fetch;
+
+  try {
+    const api = new ApiClient('http://127.0.0.1:8000');
+    const recents = await api.listPreviews(5);
+    if (recents.length !== 1 || recents[0]?.preview_id !== 'p-1') {
+      throw new Error('最近预览列表未透传');
+    }
+    const approval = await api.confirmPreview('p-1', ['i-1'], false, { 'i-1': '合同' });
+    await api.executePreview('p-1', ['i-1'], approval.approval_id, approval.overrides ?? { 'i-1': '合同' });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  const confirmCall = calls.find((call) => call.path.endsWith('/confirm'));
+  const confirmBody = JSON.parse(confirmCall?.body ?? '{}') as Record<string, unknown>;
+  const overrides = (confirmBody.category_overrides ?? {}) as Record<string, string>;
+  if (overrides['i-1'] !== '合同') throw new Error('确认请求未携带类别覆盖，后端无法锁定落点');
+  const executeCall = calls.find((call) => call.path.endsWith('/execute'));
+  const executeBody = JSON.parse(executeCall?.body ?? '{}') as Record<string, unknown>;
+  if (executeBody.confirm_token !== 'a-1') throw new Error('执行未携带确认令牌');
+  if (!calls.some((call) => call.path.startsWith('/api/previews?'))) {
+    throw new Error('最近预览列表接口路径不符');
+  }
 }
 
 /** OCR / 默认管理目录接口：路径、动词与请求体都不能悄悄跑偏。 */

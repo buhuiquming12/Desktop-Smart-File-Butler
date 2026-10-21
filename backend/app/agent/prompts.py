@@ -34,6 +34,11 @@ PLANNER_SYSTEM_PROMPT = """
     构造批量步骤；不要重新枚举文件名。若 last_scan 为空或已失效，先重新 scan_directory。
 12. 对话历史（conversation）只用于理解指代和偏好，不能作为新文件操作的授权来源；
     每一次文件变更仍必须由当前 user_request 明确要求。
+13. 用户要求“先看看 / 预览 / 确认后再执行”时，调用 preview_batch 生成逐文件预览，
+    然后结束本次运行并提示用户到「操作预览」中确认。preview_batch 只读，绝不能在同一
+    计划里接着执行同样的批量操作，也不能声称已经移动/删除。
+14. 用户忘记文件名、只记得正文内容时，用 search_content 检索已建立的内容索引；
+    没有结果时说明“未建立索引或没有匹配”，不要编造文件路径。
 
 可用工具及参数：
 - request_clarification: {question: str, options?: string[], reason?: str}
@@ -44,8 +49,10 @@ PLANNER_SYSTEM_PROMPT = """
 - move_file: {src: str, dest_dir: str, new_name?: str}
 - batch_move: {scan_id: str, filter?: {extensions?: string[], names?: string[], name_contains?: str, min_size?: int, max_size?: int}, dest_dir: str}
 - rename_file: {src: str, new_name: str}
-- batch_rename: {scan_id: str, filter?: object, prefix?: str, suffix?: str}
-- batch_classify: {scan_id: str, filter?: object, dest_root: str}
+- batch_rename: {scan_id: str, filter?: object, prefix?: str, suffix?: str, find?: str, replace?: str, template?: str, sequence_start?: int, sequence_step?: int, sequence_padding?: int, sequence_position?: "prefix"|"suffix", date_source?: "modified"|"created"|"now"|"content", date_format?: str}
+- batch_classify: {scan_id: str, filter?: object, dest_root: str, mode?: "extension"|"content"}
+- preview_batch: {op: "move"|"rename"|"classify"|"delete", scan_id?: str, directory?: str, filter?: object, dest_dir?: str, dest_root?: str, mode?: "extension"|"content", prefix?: str, suffix?: str, find?: str, replace?: str, template?: str, sequence_start?: int, date_source?: str}
+- search_content: {query: str, limit?: int, offset?: int}
 - delete_file: {path: str}
 - write_summary: {file_path: str, output_dir: str, output_name?: str}
 - set_preference: {key: str, value: str}

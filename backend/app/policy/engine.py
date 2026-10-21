@@ -77,7 +77,7 @@ _CJK_STRONG_COMMANDS = (
 
 # 路径之后单独出现的英文动作词是命令；scan/list 之类只读词与目录名无法区分
 # （``D:\My scan``、``D:\scan list`` 都是合法目录名），因此仍按路径处理。
-# 只读新任务通常把动词放在最前（``list D:\scan``），那条路径不受影响。
+# 带宾语的只读短语由 _ascii_read_command_start 单独识别。
 _ASCII_COMMAND_KINDS = ("move", "rename", "delete")
 
 
@@ -151,6 +151,25 @@ def _is_command_chunk(chunk: str) -> bool:
             for term in _INTENT_TERMS[kind]
         )
     return _looks_like_command_chunk(lowered) or _contains_command_phrase(lowered)
+
+
+def _ascii_read_command_start(text: str) -> bool:
+    """有动作和宾语才切断路径；My scan / scan list 仍可作为目录名。"""
+    verbs = "|".join(
+        re.escape(term) for term in sorted(_INTENT_TERMS["read"], key=len, reverse=True)
+        if term.isascii()
+    )
+    match = re.match(
+        rf"(?i)(?P<prefix>(?:(?:and\s+then|then|and|please|just|only)\s+)*)"
+        rf"(?:{verbs})\s+(?P<determiners>(?:(?:me|the|all|these|those|my)\s+)*)"
+        r"(?P<object>files?|folders?|directories|directory|contents?|pdfs?|documents?|items?)"
+        r"(?=$|[\s,;.!?])(?!\.[\w])",
+        text,
+    )
+    # “scan folder”本身仍可能是名称；连接词、限定词或复数宾语提供指令信号。
+    return bool(match and (
+        match["prefix"] or match["determiners"] or match["object"].casefold().endswith("s")
+    ))
 
 
 def _looks_like_path(text: str) -> bool:
@@ -237,7 +256,7 @@ def _is_bare_path(text: str) -> bool:
         return False
     # 空格之后的片段是动作（``D:\scan 删除``、``D:\scan delete``）时同理。
     return not any(
-        _is_command_chunk(match.group(0))
+        _is_command_chunk(match.group(0)) or _ascii_read_command_start(value[match.start():])
         for match in list(re.finditer(r"\S+", value))[1:]
     )
 
@@ -287,10 +306,16 @@ def _consume_path(text: str, start: int) -> int:
         cursor = index
         while cursor < length and text[cursor] in " \t":
             cursor += 1
+        if _ascii_read_command_start(text[cursor:]):
+            break
         end = cursor
         while end < length and text[end] not in _SEGMENT_STOP:
             end += 1
         chunk = text[cursor:end]
+        if chunk.casefold() in {"文件夹", "目录", "folder", "directory"} and re.search(
+            r"新建|创建|建个|\b(?:create|make)\b", text[:start], re.IGNORECASE
+        ):
+            break
         if not chunk or not _continues_path(chunk):
             break
         index = end
@@ -392,7 +417,8 @@ def explicit_intent_effects(intent: str) -> set[str]:
     明确说“新建目录/文件夹”才把建目录本身当作目标：说了就必须真的建成，
     否则不能判定成功。“创建摘要文件”这类写入请求不算建目录目标。
     """
-    text = strip_paths((intent or "").casefold())
+    # 路径用等长空白屏蔽；匹配目标时压缩空白，避免长路径挤出短语长度限制。
+    text = " ".join(strip_paths((intent or "").casefold()).split())
     effects: set[str] = set()
     for kind, patterns in _EXPLICIT_PATTERNS.items():
         for pattern in patterns:

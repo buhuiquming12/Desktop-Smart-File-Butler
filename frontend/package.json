@@ -2,7 +2,7 @@
   "name": "desktop-smart-file-butler",
   "private": true,
   "version": "0.1.0",
-  "description": "通过自然语言安全整理、分类和摘要本地文件的桌面 AI Agent",
+  "description": "\u901a\u8fc7\u81ea\u7136\u8bed\u8a00\u5b89\u5168\u6574\u7406\u3001\u5206\u7c7b\u548c\u6458\u8981\u672c\u5730\u6587\u4ef6\u7684\u684c\u9762 AI Agent",
   "author": "Desktop Smart File Butler Contributors",
   "type": "module",
   "main": "dist-electron/main.js",
@@ -14,7 +14,7 @@
     "build:sidecar": "python ../backend/build_sidecar.py",
     "preview": "vite preview",
     "typecheck": "tsc -b --pretty false",
-    "test": "tsc -p tsconfig.test.json --pretty false && tsc -p tsconfig.electron-test.json --pretty false && node .test-dist/state.test.js && node .test-dist/api.test.js && node .electron-test-dist/singleInstance.test.js"
+    "test": "tsc -p tsconfig.test.json --pretty false && tsc -p tsconfig.electron-test.json --pretty false && node .test-dist/state.test.js && node .test-dist/api.test.js && node .test-dist/features.test.js && node .electron-test-dist/singleInstance.test.js"
   },
   "dependencies": {
     "react": "19.3.0",
@@ -35,14 +35,17 @@
   },
   "build": {
     "appId": "com.filebutler.desktop",
-    "productName": "桌面智能文件管家",
+    "productName": "\u684c\u9762\u667a\u80fd\u6587\u4ef6\u7ba1\u5bb6",
     "files": [
       "dist/**/*",
       "dist-electron/**/*",
       "package.json"
     ],
     "extraResources": [
-      { "from": "../backend/dist/butler-backend.exe", "to": "backend/butler-backend.exe" }
+      {
+        "from": "../backend/dist/butler-backend.exe",
+        "to": "backend/butler-backend.exe"
+      }
     ],
     "directories": {
       "output": "release"

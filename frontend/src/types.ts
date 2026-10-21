@@ -109,6 +109,7 @@ export interface OperationLog {
   dest?: string | null;
   status: string;
   detail: string;
+  thread_id?: string | null;
 }
 
 export interface BackendConfig {
@@ -227,6 +228,13 @@ export interface TaskSummaryOperation {
   dest?: string | null;
 }
 
+/** 摘要里带回的预览引用（preview_batch 的结果）。 */
+export interface TaskPreviewRef {
+  preview_id: string;
+  op: string;
+  counts?: Partial<PreviewCounts>;
+}
+
 /** Token 用量：供应商未提供时 input/output 为 null，source=unknown。 */
 export interface TokenUsage {
   input: number | null;
@@ -252,6 +260,8 @@ export interface TaskSummary {
   skipped: number;
   files: string[];
   operations: TaskSummaryOperation[];
+  /** 本次任务里生成的操作预览：点一下可在预览面板打开并确认执行。 */
+  previews?: TaskPreviewRef[];
   /** 以下字段由后端确定性校验产生；旧后端可能缺省。 */
   outcome?: TaskOutcome | string;
   outcome_label?: string;
@@ -322,4 +332,318 @@ declare global {
   interface Window {
     desktop?: DesktopBridge;
   }
+}
+
+// ---------------- P0：操作预览 ----------------
+
+export type PreviewOp = 'move' | 'rename' | 'classify' | 'delete';
+
+export interface PreviewFilterInput {
+  extensions?: string[];
+  name_contains?: string;
+  min_size?: number;
+  max_size?: number;
+}
+
+export interface PreviewItem {
+  item_id: string;
+  source: string;
+  name: string;
+  op: PreviewOp;
+  size: number;
+  modified: string;
+  target: string;
+  target_name: string;
+  status: 'ready' | 'conflict' | 'skipped';
+  reason: string;
+  category: string;
+  basis: string;
+  fallback: boolean;
+  fallback_reason?: string;
+  editable_category?: boolean;
+}
+
+export interface PreviewCounts {
+  total: number;
+  ready: number;
+  conflict: number;
+  skipped: number;
+  fallback: number;
+  model_calls?: number;
+}
+
+export interface PreviewPage {
+  preview_id: string;
+  created_at: string;
+  op: PreviewOp;
+  directory: string;
+  digest: string;
+  status: string;
+  spec: Record<string, unknown>;
+  counts: PreviewCounts;
+  items: PreviewItem[];
+  offset: number;
+  limit: number;
+  has_more: boolean;
+  approval?: {
+    approval_id: string;
+    count: number;
+    /** 确认绑定后的最终落点：item_id → 目标路径。 */
+    targets?: Record<string, string>;
+    overrides?: Record<string, string>;
+    /** 非空表示这次确认已经用掉，不能再执行。 */
+    used_at?: string;
+  } | null;
+}
+
+/** 预览列表项：用于“打开已有预览”（对话里生成的预览也能在这里打开）。 */
+export interface PreviewListItem {
+  preview_id: string;
+  created_at: string;
+  op: PreviewOp | string;
+  directory: string;
+  digest: string;
+  status: string;
+}
+
+export interface PreviewCreateInput {
+  op: PreviewOp;
+  directory?: string;
+  scan_id?: string;
+  recursive?: boolean;
+  filter?: PreviewFilterInput;
+  dest_dir?: string;
+  dest_root?: string;
+  mode?: 'extension' | 'content';
+  prefix?: string;
+  suffix?: string;
+  find?: string;
+  replace?: string;
+  case_sensitive?: boolean;
+  template?: string;
+  sequence_start?: number;
+  sequence_step?: number;
+  sequence_padding?: number;
+  sequence_position?: 'prefix' | 'suffix';
+  date_source?: 'modified' | 'created' | 'now' | 'content';
+  date_format?: string;
+  use_sequence?: boolean;
+  use_date?: boolean;
+  content_budget?: number;
+}
+
+export interface PreviewConfirmResult {
+  preview_id: string;
+  approval_id: string;
+  count: number;
+  requires_approval: boolean;
+  threshold: number;
+  selection_digest: string;
+  /** 确认时绑定的最终落点（item_id → 目标路径）。 */
+  targets?: Record<string, string>;
+  /** 确认时提交并绑定的类别覆盖；执行时必须原样沿用。 */
+  overrides?: Record<string, string>;
+}
+
+export interface PreviewExecuteItemResult {
+  item_id: string;
+  source: string;
+  op: PreviewOp;
+  target: string;
+  status: 'ok' | 'failed' | 'skipped';
+  detail: string;
+}
+
+export interface PreviewExecuteResult {
+  preview_id: string;
+  op: PreviewOp;
+  selected: number;
+  ok: number;
+  failed: number;
+  skipped: number;
+  results: PreviewExecuteItemResult[];
+  rollback_thread_id: string;
+}
+
+// ---------------- P1：重复文件 ----------------
+
+export interface DuplicateFile {
+  path: string;
+  name: string;
+  size: number;
+  modified: string;
+  hardlink_of: string;
+  keep: boolean;
+  delete_by_default: boolean;
+}
+
+export interface DuplicateGroup {
+  group_id: string;
+  hash: string;
+  size: number;
+  count: number;
+  distinct_inodes: number;
+  reclaimable: number;
+  suggested_keep: string;
+  keep_reason: string;
+  files: DuplicateFile[];
+}
+
+export interface DuplicateSummary {
+  scanned_files: number;
+  duplicate_groups: number;
+  duplicate_files: number;
+  reclaimable_bytes: number;
+  changed_files: number;
+  stale: boolean;
+  errors: number;
+}
+
+export interface DuplicateProgress {
+  phase: string;
+  scanned: number;
+  hashed: number;
+  total_files: number;
+  total_candidates: number;
+  groups_done: number;
+  bytes_read: number;
+  current: string;
+  errors: Array<{ path: string; error: string }>;
+  finished_at: string;
+}
+
+export interface DuplicateScan {
+  scan_id: string;
+  status: 'running' | 'completed' | 'cancelled' | 'failed';
+  error: string;
+  directories: string[];
+  groups: DuplicateGroup[];
+  changed: string[];
+  summary: Partial<DuplicateSummary>;
+  progress: DuplicateProgress;
+}
+
+export interface DuplicateCleanupResult {
+  scan_id: string;
+  thread_id: string;
+  deleted: number;
+  skipped: number;
+  failed: number;
+  freed_bytes: number;
+  results: Array<{ path: string; group_id: string; status: string; detail: string; trash_path?: string }>;
+}
+
+// ---------------- P2：内容索引与搜索 ----------------
+
+export interface IndexProgress {
+  phase: string;
+  scanned: number;
+  indexed: number;
+  skipped: number;
+  failed: number;
+  unchanged: number;
+  removed: number;
+  total: number;
+  current: string;
+  errors: Array<{ path: string; error: string }>;
+  /** 遍历是否被取消或触到文件数上限：此时不会清理任何索引记录。 */
+  truncated?: boolean;
+  truncated_reason?: string;
+  /** 非空表示本次跳过了清理（遍历不完整或非递归）。 */
+  prune_skipped?: string;
+}
+
+export interface IndexJob {
+  job_id: string;
+  root: string;
+  status: 'running' | 'completed' | 'cancelled' | 'failed';
+  error: string;
+  progress: IndexProgress;
+}
+
+export interface IndexStats {
+  documents: number;
+  by_status: Record<string, number>;
+  indexed_bytes: number;
+  fts5: boolean;
+  jobs: IndexJob[];
+}
+
+export interface SearchHit {
+  path: string;
+  name: string;
+  size: number;
+  ext: string;
+  status: string;
+  truncated: boolean;
+  indexed_at: string;
+  snippet: string;
+}
+
+export interface SearchResponse {
+  query: string;
+  backend: string;
+  total: number;
+  offset: number;
+  limit: number;
+  results: SearchHit[];
+  capabilities: { fts5: boolean; semantic: boolean };
+}
+
+// ---------------- P5：自动整理规则 ----------------
+
+export interface OrganizeRule {
+  rule_id: string;
+  directory: string;
+  dest_root: string;
+  mode: 'extension' | 'content';
+  instruction: string;
+  enabled: boolean;
+  settle_seconds: number;
+  created_at: string;
+  updated_at: string;
+  last_run_at: string;
+  last_result: string;
+  processed_count: number;
+}
+
+export interface RuleListResponse {
+  rules: OrganizeRule[];
+  running: boolean;
+}
+
+// ---------------- P6：回收站 ----------------
+
+export interface TrashEntry {
+  op_id: number;
+  original_path: string;
+  name: string;
+  trash_path: string;
+  deleted_at: string;
+  size: number;
+  thread_id: string;
+  task: string;
+  detail: string;
+  conflict: boolean;
+}
+
+export interface TrashList {
+  total: number;
+  offset: number;
+  limit: number;
+  entries: TrashEntry[];
+}
+
+export interface TrashRestoreResult {
+  ok: number;
+  skipped: number;
+  failed: number;
+  results: Array<{
+    op_id: number;
+    original_path?: string;
+    status: string;
+    detail: string;
+    restored_to?: string;
+    conflict?: boolean;
+  }>;
 }

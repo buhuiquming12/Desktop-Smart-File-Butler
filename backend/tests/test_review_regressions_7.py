@@ -127,7 +127,12 @@ class _ReplanTillMove:
 
 @pytest.mark.parametrize(
     "answer",
-    ["show me the files", "check the folder", "find all pdfs", "看看这个目录"],
+    [
+        "show me the files", "check the folder", "find all pdfs", "看看这个目录",
+        r"D:\scan then list files",
+        r"D:\My Documents\scan please show the files",
+        "/home/me/scan then check the folder",
+    ],
 )
 def test_english_read_only_answer_does_not_inherit_move_authorization(
     sandbox: Path, monkeypatch: pytest.MonkeyPatch, answer: str
@@ -175,7 +180,7 @@ def test_attributive_create_is_not_a_target() -> None:
     assert explicit_intent_effects("把 PDF 移动到新建的 out 文件夹") == set()
 
 
-def test_missing_make_dir_in_mixed_request_is_partial(sandbox: Path) -> None:
+def test_missing_independent_directory_in_mixed_request_is_partial(sandbox: Path) -> None:
     moved = {"id": "m", "tool": "move_file", "status": "ok",
              "args": {"src": str(sandbox / "a.txt"), "dest_dir": str(sandbox / "out")},
              "result": str(sandbox / "out" / "a.txt")}
@@ -185,7 +190,7 @@ def test_missing_make_dir_in_mixed_request_is_partial(sandbox: Path) -> None:
         "observations": [moved],
         "plan": [{"id": "m", "tool": "move_file", "description": "移动"}],
         "step_index": 1,
-        "trusted_user_intent": "新建一个备份文件夹，然后把 PDF 移动进去",
+        "trusted_user_intent": "把 PDF 移动到 out，另外新建一个空的备份文件夹",
         "mutations": {"move": 1, "rename": 0, "delete": 0},
     })
     assert completion["unmet_effects"] == ["create"]

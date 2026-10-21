@@ -4,9 +4,14 @@ import { helpText, isCommandName, type SlashCommandName } from './commands';
 import { ActivityCenter } from './components/ActivityCenter';
 import { ApprovalModal } from './components/ApprovalModal';
 import { ChatPanel } from './components/ChatPanel';
+import { DuplicatesPanel } from './components/DuplicatesPanel';
 import { NewConversationModal } from './components/NewConversationModal';
+import { PreviewPanel } from './components/PreviewPanel';
+import { RulesPanel } from './components/RulesPanel';
+import { SearchPanel } from './components/SearchPanel';
 import { Settings } from './components/Settings';
 import { ToastStack, type ToastItem, type ToastKind } from './components/ToastStack';
+import { TrashPanel } from './components/TrashPanel';
 import { useBackendConfig } from './hooks/useBackendConfig';
 import { useSettingsController } from './hooks/useSettingsController';
 import type {
@@ -43,11 +48,26 @@ import {
   type ThreadViewState,
 } from './state';
 
+/** 主工作区视图：智能对话与其他管理面板共用同一套外壳。 */
+type AppView = 'chat' | 'preview' | 'duplicates' | 'search' | 'trash' | 'rules';
+
+const navItems: Array<{ id?: AppView; icon: string; label: string }> = [
+  { id: 'chat', icon: '⌁', label: '智能对话' },
+  { id: 'preview', icon: '☰', label: '操作预览' },
+  { id: 'duplicates', icon: '⧉', label: '重复文件' },
+  { id: 'search', icon: '⌕', label: '内容搜索' },
+  { id: 'trash', icon: '♻', label: '回收站' },
+  { id: 'rules', icon: '⇄', label: '自动整理' },
+];
+
 function createId(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
 export function App() {
+  const [view, setView] = useState<AppView>('chat');
+  // 从对话/摘要里点“打开预览”时带过去的 preview_id：面板据此加载既有预览。
+  const [previewToOpen, setPreviewToOpen] = useState<string | undefined>(undefined);
   const [connectionState, setConnectionState] = useState<ConnectionState>('connecting');
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [tasks, setTasks] = useState<TaskItem[]>([]);
@@ -486,6 +506,17 @@ export function App() {
     }
   }, [api, loadSettingsData, notify]);
 
+  /** 从对话里的任务结果卡打开 Agent 生成的预览：切到预览面板并加载该 preview_id。 */
+  const openPreview = useCallback((previewId: string) => {
+    const id = (previewId ?? '').trim();
+    if (!id) {
+      notify('这条预览没有有效的编号。', 'error');
+      return;
+    }
+    setPreviewToOpen(id);
+    setView('preview');
+  }, [notify]);
+
   /** 从后台视图切换到前台会话：取回该会话的消息/任务/忙碌态，并从后台表中移除。 */
   const switchToThread = useCallback((targetId: string) => {
     const view = threadViews[targetId];
@@ -592,7 +623,22 @@ export function App() {
       <aside className="sidebar">
         <div className="brand"><span className="brand-mark" aria-hidden="true">F</span><div><strong>文件管家</strong><small>Smart Butler</small></div></div>
         <nav className="main-nav" aria-label="主导航">
-          <button className="active" type="button"><span aria-hidden="true">⌁</span>智能对话</button>
+          {navItems.map((item) => (
+            <button
+              key={item.label}
+              type="button"
+              className={view === item.id ? 'active' : undefined}
+              aria-current={view === item.id ? 'page' : undefined}
+              onClick={() => {
+                closeSettings();
+                // 从侧边栏进入预览面板时清掉上次打开的编号，避免“点导航却看到旧预览”。
+                if (item.id === 'preview') setPreviewToOpen(undefined);
+                if (item.id) setView(item.id);
+              }}
+            >
+              <span aria-hidden="true">{item.icon}</span>{item.label}
+            </button>
+          ))}
           <button type="button" onClick={() => openSettings('schedules')}><span aria-hidden="true">◷</span>定时任务</button>
           <button type="button" onClick={() => openSettings('logs')}><span aria-hidden="true">≡</span>操作日志</button>
           <button type="button" onClick={() => openSettings('preferences')}><span aria-hidden="true">◇</span>偏好设置</button>
@@ -612,7 +658,9 @@ export function App() {
         </button>
       </aside>
 
-      <main className="workspace">
+      <main className={view === 'chat' ? 'workspace' : 'workspace workspace--single'}>
+        {view === 'chat' ? (
+          <>
         <ChatPanel
           messages={chatMessages}
           connectionState={connectionState}
@@ -628,6 +676,7 @@ export function App() {
           onRetrySetup={() => void refreshSetupCheck()}
           onNotify={notify}
           onRollbackThread={(threadId) => void rollbackThread(threadId)}
+          onOpenPreview={openPreview}
         />
         <ActivityCenter
           items={activityItems}
@@ -636,6 +685,21 @@ export function App() {
           onViewResult={viewActivityResult}
           onCopyResult={(item) => void copyActivityResult(item)}
         />
+          </>
+        ) : null}
+        {view === 'preview' && (
+          <PreviewPanel
+            key={previewToOpen ?? 'new-preview'}
+            api={api}
+            notify={notify}
+            onBack={() => setView('chat')}
+            initialPreviewId={previewToOpen}
+          />
+        )}
+        {view === 'duplicates' && <DuplicatesPanel api={api} notify={notify} onBack={() => setView('chat')} />}
+        {view === 'search' && <SearchPanel api={api} notify={notify} onBack={() => setView('chat')} />}
+        {view === 'trash' && <TrashPanel api={api} notify={notify} onBack={() => setView('chat')} />}
+        {view === 'rules' && <RulesPanel api={api} notify={notify} onBack={() => setView('chat')} />}
       </main>
 
       <ApprovalModal approval={approvalQueue[0] ?? null} queueSize={approvalQueue.length} submitting={approvalSubmitting} onDecision={(decision) => void decideApproval(decision)} />

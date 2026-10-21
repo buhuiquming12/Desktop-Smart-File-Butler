@@ -9,6 +9,8 @@ interface TaskSummaryCardProps {
   onCopy: (value: string) => void;
   onReveal: (path: string) => Promise<boolean | void>;
   onRollback?: (() => void) | undefined;
+  /** 打开本次任务里生成的操作预览（面板会加载这个 preview_id）。 */
+  onOpenPreview?: ((previewId: string) => void) | undefined;
   onNotify?: ((content: string, kind?: ToastKind) => void) | undefined;
 }
 
@@ -37,7 +39,9 @@ const OUTCOME_TONE: Record<string, string> = {
 };
 
 /** 复制/打开目录只处理后端摘要里已校验过的路径；不使用 dangerouslySetInnerHTML。 */
-export function TaskSummaryCard({ summary, threadId, onCopy, onReveal, onRollback }: TaskSummaryCardProps) {
+export function TaskSummaryCard({
+  summary, threadId, onCopy, onReveal, onRollback, onOpenPreview,
+}: TaskSummaryCardProps) {
   const [expanded, setExpanded] = useState(false);
   const [confirmingRollback, setConfirmingRollback] = useState(false);
   const confirmTimerRef = useRef<number | null>(null);
@@ -104,6 +108,33 @@ export function TaskSummaryCard({ summary, threadId, onCopy, onReveal, onRollbac
           <span className="summary-stat summary-stat--ok">工具成功 <b>{summary.ok}</b></span>
           <span className="summary-stat summary-stat--failed">工具失败 <b>{summary.failed}</b></span>
           <span className="summary-stat summary-stat--skipped">工具跳过 <b>{summary.skipped}</b></span>
+        </div>
+      )}
+
+      {(summary.previews?.length ?? 0) > 0 && (
+        <div className="summary-previews">
+          <p className="summary-files__title">本次生成的操作预览</p>
+          <p className="muted">预览只读；打开后在预览面板里逐项确认，才会真正修改文件。</p>
+          <ul className="result-list">
+            {summary.previews?.map((entry) => (
+              <li key={entry.preview_id}>
+                <span className="badge badge--warn">待确认</span>
+                <code title={entry.preview_id}>{entry.preview_id}</code>
+                {entry.counts?.total !== undefined && (
+                  <span className="muted">共 {entry.counts.total} 个文件</span>
+                )}
+                {onOpenPreview && (
+                  <button
+                    type="button"
+                    className="text-button"
+                    onClick={() => onOpenPreview(entry.preview_id)}
+                  >
+                    打开预览
+                  </button>
+                )}
+              </li>
+            ))}
+          </ul>
         </div>
       )}
 

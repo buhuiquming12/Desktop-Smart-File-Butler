@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
@@ -156,6 +157,58 @@ def _verify_observation(obs: Dict[str, Any], *, superseded: Optional[set[str]] =
     return check
 
 
+def _implicit_directory_goal_met(intent: str, observations: list) -> bool:
+    """确认“建目录，然后移进去”中的目录已由移动工具实际建成。
+
+    只接受明确指向前一个目录的后续动作；独立的“另外新建备份目录”
+    不能由其他移动目标代替。命名的路径/目录还必须与实际目标匹配。
+    """
+    clauses = re.split(r"[，。；;,\n]|然后|接着|\bthen\b", intent, flags=re.IGNORECASE)
+    creates = [i for i, clause in enumerate(clauses) if "create" in explicit_intent_effects(clause)]
+    if len(creates) != 1:
+        return False
+    index = creates[0]
+    tail = " ".join(clauses[index + 1:])
+    if "move" not in intent_effects(tail) or re.search(
+        r"进去|其中|该目录|该文件夹|这个目录|这个文件夹|里面|\b(?:into|to)\s+it\b",
+        tail, re.IGNORECASE,
+    ) is None:
+        return False
+    clause = clauses[index]
+    # 引号或拉丁名称表示明确命名，不能用任意一个新目录冒充。
+    quoted_name = r'["“\x27]([^"”\x27]+)["”\x27]'
+    names = re.findall(quoted_name, clause)
+    names.extend(re.findall(
+        r"(?<!\w)(?:[A-Za-z]:[\\/]|\\\\|/|\.{1,2}[\\/])[^\s\"'，。；;,]+",
+        re.sub(quoted_name, " ", clause),
+    ))
+    named = re.search(r"(?:新建|创建|建个)\s*(?:一个\s*)?([A-Za-z][\w .-]*?)\s*(?:文件夹|目录)", clause)
+    if named:
+        names.append(named.group(1).strip())
+    if len(re.findall(r"新建|创建|建个|\bcreate\b|\bmake\b", clause, re.IGNORECASE)) > 1:
+        return False
+    for obs in observations:
+        if obs.get("status") != "ok" or obs.get("tool") not in {"move_file", "batch_move"}:
+            continue
+        args = obs.get("args") or {}
+        raw = args.get("dest_dir")
+        if not raw:
+            continue
+        directory = Path(raw)
+        if names and any(
+            _norm_path(name) != _norm_path(raw) and name.casefold() != directory.name.casefold()
+            for name in names
+        ):
+            continue
+        paths = _result_paths(obs)
+        if directory.is_dir() and any(
+            Path(path).is_file() and _norm_path(Path(path).parent) == _norm_path(directory)
+            for path in paths
+        ):
+            return True
+    return False
+
+
 def _unmet_effects(intent: str, observations: list) -> list[str]:
     """用户要求、但本次运行从未成功产生的副作用。
 
@@ -177,6 +230,8 @@ def _unmet_effects(intent: str, observations: list) -> list[str]:
         contract = TOOL_CONTRACTS.get(str(obs.get("tool") or ""))
         if contract is not None:
             performed.add(contract.side_effect)
+    if "create" in required - performed and _implicit_directory_goal_met(intent, observations):
+        performed.add("create")
     return sorted(required - performed)
 
 

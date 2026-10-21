@@ -1,7 +1,11 @@
 {
   "compilerOptions": {
     "target": "ES2022",
-    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "lib": [
+      "ES2022",
+      "DOM",
+      "DOM.Iterable"
+    ],
     "module": "ESNext",
     "moduleResolution": "Bundler",
     "rootDir": "src",
@@ -12,5 +16,10 @@
     "exactOptionalPropertyTypes": true,
     "esModuleInterop": true
   },
-  "files": ["src/state.test.ts", "src/api.test.ts", "src/vite-env.d.ts"]
+  "files": [
+    "src/state.test.ts",
+    "src/api.test.ts",
+    "src/features.test.ts",
+    "src/vite-env.d.ts"
+  ]
 }

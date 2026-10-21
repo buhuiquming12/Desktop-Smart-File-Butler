@@ -170,6 +170,31 @@ def _summarize_observation(obs: Dict[str, Any]) -> Dict[str, Any]:
                 slim["result"][key] = values[:_PLANNER_SAMPLE]
         return slim
 
+    if tool == "preview_batch" and isinstance(result, dict):
+        slim["result"] = {
+            "preview_id": result.get("preview_id"),
+            "op": result.get("op"),
+            "counts": result.get("counts"),
+            "sample": (result.get("items") or [])[:5],
+            "note": result.get("note"),
+        }
+        return slim
+
+    if tool == "search_content" and isinstance(result, dict):
+        slim["result"] = {
+            "query": result.get("query"),
+            "total": result.get("total"),
+            "results": [
+                {
+                    "path": item.get("path"),
+                    "name": item.get("name"),
+                    "snippet": str(item.get("snippet") or "")[:200],
+                }
+                for item in (result.get("results") or [])[:5]
+            ],
+        }
+        return slim
+
     if isinstance(result, str) and len(result) > _PLANNER_TEXT_CAP:
         slim["result"] = result[:_PLANNER_TEXT_CAP] + f"……（已截断，原文共 {len(result)} 字符）"
         return slim
@@ -737,7 +762,7 @@ class AgentRuntime:
                 state, tool_calls=1, model_calls=inner_model_calls
             ),
         }
-        if tool in {"scan_directory", "extract_text", "classify_file"}:
+        if tool in {"scan_directory", "extract_text", "classify_file", "search_content", "preview_batch"}:
             update["untrusted_file_data"] = [
                 *state.get("untrusted_file_data", []), _summarize_observation(observation)
             ]

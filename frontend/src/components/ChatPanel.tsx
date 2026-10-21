@@ -27,6 +27,8 @@ interface ChatPanelProps {
   onNotify?: (content: string, kind?: ToastKind) => void;
   /** 撤销指定会话的文件操作（由任务结果卡触发）。 */
   onRollbackThread?: (threadId: string) => void;
+  /** 打开 Agent 在对话里生成的操作预览（切到预览面板并加载该 preview_id）。 */
+  onOpenPreview?: (previewId: string) => void;
 }
 
 const suggestedPrompts = [
@@ -79,6 +81,7 @@ export function ChatPanel({
   onRetrySetup,
   onNotify,
   onRollbackThread,
+  onOpenPreview,
 }: ChatPanelProps) {
   const [draft, setDraft] = useState(readDraft);
   // 指令面板：输入以 / 开头即展开；Esc 只关闭本次，继续输入会重新展开。
@@ -327,6 +330,7 @@ export function ChatPanel({
                   onCopy={copyValue}
                   onReveal={revealPath}
                   onRollback={message.threadId ? () => { onRollbackThread?.(message.threadId ?? ''); } : undefined}
+                  onOpenPreview={onOpenPreview}
                   onNotify={onNotify}
                 />
               )}

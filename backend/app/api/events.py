@@ -160,6 +160,9 @@ def build_task_summary(
     skipped = 0
     files: list[str] = []
     operations: list[Dict[str, Any]] = []
+    # Agent 生成的操作预览：把 preview_id 带回界面，用户点一下就能在预览面板里
+    # 打开它并完成确认/执行（panel 只负责展示与确认，不重新算计划）。
+    previews: list[Dict[str, Any]] = []
 
     def add_file(value: str) -> None:
         value = (value or "").strip()
@@ -178,6 +181,15 @@ def build_task_summary(
         path, dest = _observation_paths(obs)
         add_file(path)
         add_file(dest)
+        result = obs.get("result")
+        if str(obs.get("tool") or "") == "preview_batch" and isinstance(result, dict):
+            preview_id = str(result.get("preview_id") or "")
+            if preview_id and all(entry["preview_id"] != preview_id for entry in previews):
+                previews.append({
+                    "preview_id": preview_id,
+                    "op": str(result.get("op") or ""),
+                    "counts": result.get("counts") or {},
+                })
         operations.append({
             "tool": str(obs.get("tool") or ""),
             "tool_label": _TOOL_LABELS.get(str(obs.get("tool") or ""), str(obs.get("tool") or "文件操作")),
@@ -194,6 +206,7 @@ def build_task_summary(
         "skipped": skipped,
         "files": files[:12],
         "operations": operations,
+        "previews": previews,
     }
     if state is None:
         # 兼容既有调用方：没有会话状态时维持原来的精简结构。

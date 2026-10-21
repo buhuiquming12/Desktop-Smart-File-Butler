@@ -14,7 +14,7 @@ from .. import db
 from ..logging_conf import get_logger
 from ..models import ScheduledJob
 from ..security import resolve_in_sandbox
-from ..tools import categories, extract, filesystem, manifests, scheduler
+from ..tools import categories, classify, extract, filesystem, indexer, manifests, naming, preview, scheduler
 from ..tools.contracts import validate_tool_args
 from ..tools.path_locks import path_locks
 
@@ -140,6 +140,14 @@ class ToolExecutor:
                     "options": list(args.get("options") or []),
                     "reason": str(args.get("reason") or ""),
                 }
+            elif tool == "preview_batch":
+                result = self.preview_batch(args)
+            elif tool == "search_content":
+                result = indexer.search(
+                    str(args["query"]),
+                    limit=int(args.get("limit") or 20),
+                    offset=int(args.get("offset") or 0),
+                )
             elif tool == "create_schedule":
                 result = self.create_schedule(args)
             else:
@@ -202,58 +210,184 @@ class ToolExecutor:
         )
 
     def batch_rename(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        manifest = manifests.load(str(args["scan_id"]))
-        items = manifests.match(str(args["scan_id"]), dict(args.get("filter") or {}))
-        prefix, suffix = str(args.get("prefix") or ""), str(args.get("suffix") or "")
-        if not prefix and not suffix:
-            raise ValueError("batch_rename 至少需要 prefix 或 suffix")
-        successes: list[str] = []
-        sources: list[str] = []
-        failed: list[dict] = []
-        skipped: list[dict] = []
-        for item in items:
-            source = Path(str(item.get("path") or ""))
-            new_name = f"{prefix}{source.stem}{suffix}{source.suffix}"
-            try:
-                successes.append(filesystem.rename_file(str(source), new_name))
-                sources.append(str(source))
-            except FileNotFoundError:
-                skipped.append({"path": str(source), "reason": "source_missing"})
-            except Exception as exc:  # noqa: BLE001
-                failed.append({"path": str(source), "error": str(exc)})
-        meta = manifest.get("metadata") or {}
-        return self.batch_result(
-            len(items), successes, failed, skipped,
-            truncated=bool(meta.get("truncated")),
-            reason=str(meta.get("reason") or "none"),
-            sources=sources,
-        )
+        """批量重命名：与预览使用同一套命名逻辑（``naming``）。
 
-    def batch_classify(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        支持前缀/后缀、查找替换、序号、日期模板；日期来源必须显式声明，取不到时
+        跳过该文件并说明原因，不会猜测日期。
+        """
         manifest = manifests.load(str(args["scan_id"]))
         items = manifests.match(str(args["scan_id"]), dict(args.get("filter") or {}))
-        root = Path(str(args["dest_root"]))
+        rule = naming.RenameRule(
+            prefix=str(args.get("prefix") or ""),
+            suffix=str(args.get("suffix") or ""),
+            find=str(args.get("find") or ""),
+            replace=str(args.get("replace") or ""),
+            case_sensitive=bool(args.get("case_sensitive", False)),
+            template=str(args.get("template") or ""),
+            sequence_start=int(args.get("sequence_start") if args.get("sequence_start") is not None else 1),
+            sequence_step=int(args.get("sequence_step") or 1),
+            sequence_padding=int(args.get("sequence_padding") or 3),
+            sequence_position=str(args.get("sequence_position") or "suffix"),
+            date_format=str(args.get("date_format") or "YYYYMMDD"),
+        )
+        use_sequence = args.get("sequence_start") is not None or "{seq}" in rule.template
+        date_source = args.get("date_source")
+        use_date = bool(date_source) or "{date}" in rule.template
+        records = []
+        for item in items:
+            path = Path(str(item.get("path") or ""))
+            date_value, date_reason = preview.resolve_date(item, str(date_source or "modified"))
+            records.append({
+                "meta": item,
+                "stem": path.stem,
+                "ext": path.suffix,
+                "date": date_value,
+                "date_reason": date_reason,
+            })
+        planned = naming.plan_names(
+            records, rule, use_sequence=use_sequence, use_date=use_date,
+            source_date=str(date_source or "modified"),
+        )
         successes: list[str] = []
         sources: list[str] = []
         failed: list[dict] = []
         skipped: list[dict] = []
-        for item in items:
-            source = str(item.get("path") or "")
-            category = categories.rule_category(str(item.get("ext") or ""))
+        for record in planned:
+            source = str(record["meta"].get("path") or "")
+            if record["status"] != "ready":
+                reason = "source_missing" if record["status"] == "skipped" and not record["target_name"] else record["reason"]
+                skipped.append({"path": source, "reason": reason})
+                continue
             try:
-                successes.append(filesystem.move_file(source, str(root / category)))
+                successes.append(filesystem.rename_file(source, str(record["target_name"])))
                 sources.append(source)
             except FileNotFoundError:
                 skipped.append({"path": source, "reason": "source_missing"})
             except Exception as exc:  # noqa: BLE001
                 failed.append({"path": source, "error": str(exc)})
         meta = manifest.get("metadata") or {}
-        return self.batch_result(
+        result = self.batch_result(
             len(items), successes, failed, skipped,
             truncated=bool(meta.get("truncated")),
             reason=str(meta.get("reason") or "none"),
             sources=sources,
         )
+        result["renamed"] = len(successes)
+        result["skip_reasons"] = [item.get("reason") for item in skipped][:10]
+        return result
+
+    def batch_classify(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """批量分类：``extension`` 按扩展名，``content`` 按正文（缓存 + 预算 + 明确回退）。"""
+        manifest = manifests.load(str(args["scan_id"]))
+        items = manifests.match(str(args["scan_id"]), dict(args.get("filter") or {}))
+        root = Path(str(args["dest_root"]))
+        mode = str(args.get("mode") or "extension")
+        limit = getattr(self._model_usage, "limit", None)
+        used = int(getattr(self._model_usage, "calls", 0))
+        # limit=None 表示“直接调用、不设上限”；有运行时预算时按**剩余**额度限制，
+        # 而不是每次都重新发满额（否则前序步骤已消耗的额度会被重复发放）。
+        budget = classify.Budget(
+            remaining=max(0, int(limit) - used) if limit is not None else 10_000
+        )
+        successes: list[str] = []
+        sources: list[str] = []
+        failed: list[dict] = []
+        skipped: list[dict] = []
+        categories_seen: dict[str, int] = {}
+        fallbacks = 0
+        fallback_items: list[dict] = []
+        for item in items:
+            source = str(item.get("path") or "")
+            try:
+                result = classify.classify_path(Path(source), llm=self.llm, mode=mode, budget=budget)
+                category = result["category"]
+                if result["fallback"]:
+                    fallbacks += 1
+                    if len(fallback_items) < 10:
+                        fallback_items.append({
+                            "path": source,
+                            "reason": result["fallback_reason"],
+                        })
+                categories_seen[category] = categories_seen.get(category, 0) + 1
+                successes.append(filesystem.move_file(source, str(root / category)))
+                sources.append(source)
+                try:
+                    indexer.note_path_moved(source, successes[-1])
+                except Exception:  # noqa: BLE001 - 索引更新失败不影响文件操作
+                    logger.debug("分类后更新索引失败", exc_info=True)
+            except FileNotFoundError:
+                skipped.append({"path": source, "reason": "source_missing"})
+            except Exception as exc:  # noqa: BLE001
+                failed.append({"path": source, "error": str(exc)})
+        meta = manifest.get("metadata") or {}
+        result = self.batch_result(
+            len(items), successes, failed, skipped,
+            truncated=bool(meta.get("truncated")),
+            reason=str(meta.get("reason") or "none"),
+            sources=sources,
+        )
+        # 内容分类内部的模型调用也要计入本次运行预算（与摘要工具一致）。
+        self._model_usage.calls = int(getattr(self._model_usage, "calls", 0)) + budget.used
+        result.update({
+            "mode": mode,
+            "categories": dict(sorted(categories_seen.items())),
+            "fallback": fallbacks,
+            "fallback_items": fallback_items,
+            "budget_remaining": budget.remaining,
+        })
+        return result
+
+    def preview_batch(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """生成预览（只读）并把 preview_id 交给界面处理。"""
+        op = str(args.get("op"))
+        spec: Dict[str, Any] = {
+            "op": op,
+            "filter": dict(args.get("filter") or {}),
+            "dest_dir": args.get("dest_dir") or "",
+            "dest_root": args.get("dest_root") or "",
+            "mode": args.get("mode") or "extension",
+            "prefix": args.get("prefix") or "",
+            "suffix": args.get("suffix") or "",
+            "find": args.get("find") or "",
+            "replace": args.get("replace") or "",
+            "case_sensitive": bool(args.get("case_sensitive", False)),
+            "template": args.get("template") or "",
+            "sequence_start": args.get("sequence_start"),
+            "sequence_step": args.get("sequence_step") or 1,
+            "sequence_padding": args.get("sequence_padding") or 3,
+            "sequence_position": args.get("sequence_position") or "suffix",
+            "date_source": args.get("date_source") or "modified",
+            "date_format": args.get("date_format") or "YYYYMMDD",
+            "use_sequence": args.get("sequence_start") is not None,
+            "use_date": bool(args.get("date_source")),
+        }
+        if args.get("scan_id"):
+            spec["scan_id"] = str(args["scan_id"])
+        else:
+            spec["directory"] = str(args.get("directory") or "")
+            spec["recursive"] = True
+        # 预览里的内容分类同样要受本次运行的模型预算约束：此前这里没传预算，
+        # 预览会按默认 30 次自由调用模型（预算已耗尽也照调），而统计恒记 0。
+        limit = getattr(self._model_usage, "limit", None)
+        used = int(getattr(self._model_usage, "calls", 0))
+        if limit is None:
+            content_budget = preview.DEFAULT_CONTENT_BUDGET
+        else:
+            content_budget = max(0, min(preview.DEFAULT_CONTENT_BUDGET, int(limit) - used))
+        page = preview.create(spec, llm=self.llm, content_budget=content_budget)
+        model_calls = int(page["counts"].get("model_calls", 0))
+        self._model_usage.calls = used + model_calls
+        return {
+            "preview_id": page["preview_id"],
+            "op": page["op"],
+            "counts": page["counts"],
+            "content_budget": content_budget,
+            "model_calls": model_calls,
+            "items": page["items"][:20],
+            "digest": page["digest"],
+            "note": "预览只读，未修改任何文件；确认与执行需要用户在界面上完成。",
+        }
+
 
     def llm_classify(self, name: str, rule: str, text: str) -> Optional[str]:
         if self.llm is None:
