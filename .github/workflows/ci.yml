@@ -6,13 +6,18 @@ on:
   pull_request:
     branches: [main]
 
+env:
+  # Windows runner 的控制台编码是 cp1252，Python 打印中文日志会直接抛
+  # UnicodeEncodeError（曾让 sidecar 构建在第一步失败）。统一固定 UTF-8 stdio。
+  PYTHONIOENCODING: utf-8
+
 jobs:
   backend:
     name: 后端测试 (pytest)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
           cache: pip
@@ -29,7 +34,7 @@ jobs:
           python -m pytest -q --basetemp=./.pytest-tmp -ra 2>&1 | tee pytest.log
       - name: 上传 pytest 日志
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pytest-log
           path: backend/pytest.log
@@ -51,8 +56,8 @@ jobs:
     name: 前端测试与构建
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: '20'
           cache: npm
@@ -74,13 +79,13 @@ jobs:
     name: Windows sidecar 与 Electron 打包
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
           cache: pip
           cache-dependency-path: backend/requirements.txt
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '20'
           cache: npm
@@ -101,7 +106,7 @@ jobs:
       - name: 构建 Electron portable 包
         working-directory: frontend
         run: npm run dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: desktop-windows-portable
           path: frontend/release/*.exe

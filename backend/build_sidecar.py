@@ -16,6 +16,32 @@ FRONTEND_DIST = ROOT / "frontend" / "dist"
 _REEXEC_FLAG = "BUTLER_SIDECAR_REEXEC"
 
 
+def _configure_utf8_stdio() -> None:
+    """把构建日志的 stdio 固定为 UTF-8。
+
+    Windows CI 与部分英文 Windows 终端的默认编码是 cp1252，打印中文日志会直接抛
+    ``UnicodeEncodeError`` 让打包在第一步失败（CI 运行 39562851705）。这里主动切到
+    UTF-8，并允许替换无法编码的字符，保证日志本身永远不会中断构建。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            # 流被重定向成不支持重配置的对象时保持原样即可。
+            pass
+
+
+def _build_env() -> dict[str, str]:
+    """子进程（重新执行的脚本 / PyInstaller）的 stdio 同样使用 UTF-8。
+
+    只固定 IO 编码，不改 ``PYTHONUTF8``，避免顺带改变子进程的文件系统编码语义。
+    """
+    return {**os.environ, "PYTHONIOENCODING": "utf-8"}
+
+
 def _candidate_interpreters() -> list[str]:
     """项目 venv 的解释器候选（Windows 与 POSIX 布局都覆盖）。"""
     candidates = [
@@ -47,7 +73,7 @@ def _reexec_with_venv() -> int | None:
     for candidate in ([explicit] if explicit else []) + _candidate_interpreters():
         if not candidate or Path(candidate) == Path(sys.executable):
             continue
-        env = {**os.environ, _REEXEC_FLAG: "1"}
+        env = {**_build_env(), _REEXEC_FLAG: "1"}
         print(f"[build_sidecar] 当前解释器缺少 PyInstaller，改用 {candidate}", flush=True)
         return subprocess.call([candidate, str(Path(__file__).resolve()), *sys.argv[1:]],
                                cwd=str(ROOT), env=env)
@@ -59,6 +85,7 @@ def _reexec_with_venv() -> int | None:
 
 
 def main() -> int:
+    _configure_utf8_stdio()
     reexec = _reexec_with_venv()
     if reexec is not None:
         return reexec
@@ -87,7 +114,7 @@ def main() -> int:
                "--exclude-module", "langchain_community.embeddings",
                "--distpath", str(BACKEND / "dist"), "--workpath", str(BACKEND / "build"),
                "--specpath", str(BACKEND), str(BACKEND / "sidecar.py")]
-    return subprocess.call(command, cwd=ROOT)
+    return subprocess.call(command, cwd=ROOT, env=_build_env())
 
 
 if __name__ == "__main__":
