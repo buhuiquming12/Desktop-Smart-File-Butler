@@ -1,6 +1,7 @@
 # ============ Python 后端 ============
 __pycache__/
 *.py[cod]
+*.pyo
 *$py.class
 .venv/
 venv/
@@ -12,9 +13,8 @@ dist/
 .mypy_cache/
 .ruff_cache/
 .pytest_cache/
-# pytest --basetemp 的固定落点（CI 与本地验证命令均使用，见 README/CI）
-.pytest-tmp/
-backend/.pytest-tmp/
+# pytest --basetemp 的落点：仓库根与 backend/ 的固定目录，以及临时的 -run/-full 变体
+.pytest-tmp*/
 .tox/
 .nox/
 .coverage
@@ -24,7 +24,6 @@ coverage.xml
 
 # ============ Node / 前端 ============
 node_modules/
-frontend/node_modules/
 frontend/dist/
 frontend/dist-electron/
 frontend/release/
@@ -45,24 +44,39 @@ data/
 logs/
 backend/data/
 backend/logs/
+# SQLite 主库与 WAL 边车文件：journal_mode=WAL 会额外生成 -wal / -shm
 *.db
+*.db-wal
+*.db-shm
 *.sqlite
+*.sqlite-wal
+*.sqlite-shm
 *.sqlite3
 *.log
+*.log.*
 
-# ============ Codex / 代理工作目录 ============
+# ============ 本地 Agent / 工具数据 ============
+# 会话记忆与运行数据属于本机状态，不入库；项目级 skills 需要团队共享，显式放行
+.workbuddy/*
+!.workbuddy/skills/
 .codex/
 .agents/
 
 # ============ 编辑器 / IDE ============
 .idea/
 .vscode/
+.history/
 *.swp
 *.swo
 *~
 
 # ============ 操作系统 / 杂项 ============
 .DS_Store
+._*
 Thumbs.db
+ehthumbs.db
 desktop.ini
 $RECYCLE.BIN/
+# 合并 / 补丁残留
+*.orig
+*.rej
