@@ -346,7 +346,7 @@ def test_clarification_only_shrinks_limits(sandbox: Path) -> None:
     assert inherited.max_items <= 5
 
 
-def test_completed_request_does_not_inherit_scope() -> None:
+def test_completed_request_does_not_inherit_scope(sandbox: Path) -> None:
     """已完成请求的旧 scope 不能被下一次运行继承（start_stream 传 inherit=False）。"""
     previous = {
         "status": "completed",

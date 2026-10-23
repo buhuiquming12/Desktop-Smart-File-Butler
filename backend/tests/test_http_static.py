@@ -6,10 +6,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Iterator
 
 import pytest
 from fastapi.testclient import TestClient
 
+from app import db
+from app.config import get_settings
 from app.main import app, get_session_token
 
 _DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
@@ -20,8 +23,18 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture()
-def client() -> TestClient:
-    return TestClient(app)
+def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
+    monkeypatch.setenv("SANDBOX_ROOTS", str(tmp_path))
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "butler.db"))
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+    get_settings.cache_clear()
+    db._initialized = False
+    db.init_db()
+    try:
+        yield TestClient(app)
+    finally:
+        get_settings.cache_clear()
+        db._initialized = False
 
 
 def test_root_serves_spa(client: TestClient) -> None:
