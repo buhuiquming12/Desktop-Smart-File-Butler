@@ -23,6 +23,7 @@ from app.agent.state import PlanOutput, PlanStep, ReflectionOutput
 from app.agent.tool_executor import ToolExecutor
 from app.config import get_settings
 from app.policy.engine import explicit_intent_effects, intent_effects
+from scopes import scope_for
 
 BATCH_N = 25  # > 默认阈值 20
 
@@ -172,7 +173,7 @@ def test_create_is_subordinate_when_a_move_is_requested(sandbox: Path) -> None:
 def test_created_directory_satisfies_the_target(sandbox: Path) -> None:
     target = sandbox / "backup"
     step = {"id": "mk", "tool": "make_dir", "args": {"path": str(target)}}
-    observation = ToolExecutor().execute(step)
+    observation = ToolExecutor().execute(step, authorization_scope=scope_for(sandbox))
     completion = evaluate_completion({
         "observations": [observation],
         "plan": [step],
@@ -206,18 +207,24 @@ def test_successful_batch_chain_is_not_partial(sandbox: Path) -> None:
     scan_src = executor.execute(
         {"id": "s1", "tool": "scan_directory", "args": {"directory": str(source)}}
     )
-    moved = executor.execute({
-        "id": "m", "tool": "batch_move",
-        "args": {"scan_id": scan_src["result"]["scan_id"],
-                 "filter": {"extensions": ["pdf"]}, "dest_dir": str(stage)},
-    })
+    moved = executor.execute(
+        {
+            "id": "m", "tool": "batch_move",
+            "args": {"scan_id": scan_src["result"]["scan_id"],
+                     "filter": {"extensions": ["pdf"]}, "dest_dir": str(stage)},
+        },
+        authorization_scope=scope_for(source, target_roots=[stage]),
+    )
     scan_stage = executor.execute(
         {"id": "s2", "tool": "scan_directory", "args": {"directory": str(stage)}}
     )
-    classified = executor.execute({
-        "id": "c", "tool": "batch_classify",
-        "args": {"scan_id": scan_stage["result"]["scan_id"], "dest_root": str(final)},
-    })
+    classified = executor.execute(
+        {
+            "id": "c", "tool": "batch_classify",
+            "args": {"scan_id": scan_stage["result"]["scan_id"], "dest_root": str(final)},
+        },
+        authorization_scope=scope_for(stage, target_roots=[final]),
+    )
     assert moved["result"]["success"] == 2
     assert classified["result"]["success"] == 2
     assert classified["result"]["sources"], "批量结果必须记录被消费的源路径"

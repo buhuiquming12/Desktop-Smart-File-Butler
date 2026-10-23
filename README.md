@@ -18,9 +18,12 @@
 - 自然语言驱动的扫描、分类、移动、重命名、摘要和软删除。
 - 完整扫描结果保存为 manifest，以 `scan_id` 交给确定性批量工具处理。
 - `batch_move`、`batch_rename`、`batch_classify` 不依赖 Planner 的有限预览。
+- 强类型授权契约（`AuthorizationScope`）：由后端根据原始用户请求生成，工具执行前校验副作用、源/目标根目录、过滤条件、数量上限与递归范围；文件正文、OCR、工具输出和模型内容都不能扩大它。
 - 请求级累计审批：重新规划不会重置 move、rename、delete 的累计数量。
+- 审批绑定具体执行内容（请求指纹、授权范围指纹、选中条目指纹、目标路径、一次性 token、过期时间），执行前重新核验源文件与目标冲突。
 - 删除进入沙箱内的 `.butler-trash/`；move、rename、delete 支持审计和回滚。
 - SQLite 持久化会话、LangGraph checkpoint、审批、操作日志和扫描清单。
+- **本地密钥保护**：API Key 保存在 Windows DPAPI（当前用户）加密存储中，不写入 SQLite 明文，不进入 API 响应、日志、WebSocket 事件或 checkpoint；历史明文在首次读取时自动迁移。
 - WebSocket 实时状态同步；断线重连后通过 REST 恢复 thread 快照。
 - 支持 OpenAI-Compatible 模型和 Ollama；仅在明确不支持 structured output 时自动降级。
 - PDF、DOCX、文本和图片 OCR 内容提取；旧版二进制 `.doc` 会明确报告不支持。
@@ -49,7 +52,7 @@
 LangGraph Planner ◄── 文件名、OCR、文档内容、工具结果（不可信数据）
       │ 规则 + scan_id
       ▼
-PolicyEngine ── 意图授权 / 风险等级 / 累计审批阈值
+PolicyEngine ── 授权契约（AuthorizationScope）/ 风险等级 / 累计审批阈值 / 审批绑定
       │
       ├── 需要审批 ──► React Approval UI ──► LangGraph resume
       │
@@ -71,6 +74,7 @@ Electron 单实例主进程
 Agent 状态明确区分：
 
 - `trusted_user_intent`：唯一可作为用户授权依据的原始请求。
+- `authorization_scope`：由原始请求生成并随请求保存的强类型授权范围（副作用、源/目标根目录、过滤条件、数量上限、递归、过期时间、请求指纹）。重规划不会重置。
 - `untrusted_file_data`：文件名、OCR、文档正文和扫描数据。
 - `tool_observations`：工具返回的受限摘要。
 - `mutations`：当前用户请求累计执行的 move、rename、delete 数量。
@@ -93,6 +97,7 @@ Agent 状态明确区分：
 |---|---|---|
 | `success` | 所有可验证后置条件通过 | 成功 N / 失败 0 |
 | `partial` | 部分完成、扫描截断、目标要求未做，或仍有未执行步骤 | 成功 8 / 失败 2，并说明原因 |
+| `goal_unmet` | 用户要求的 move/rename/delete 完全没有发生（只有扫描/摘要/只读查询） | 明确“目标未达成”与未满足的副作用 |
 | `rejected` | 用户拒绝了关键审批 | 未执行，文件未变 |
 | `cancelled` | 用户取消 | 已完成操作保留，可撤销 |
 | `budget_exhausted` | 重规划或运行预算耗尽 | 说明未完成内容与停止原因 |
@@ -101,7 +106,84 @@ Agent 状态明确区分：
 
 统计口径分开：`ok/failed/skipped` 是工具调用次数；`files_ok/files_failed/files_skipped/matched` 是文件级结果。校验动作只读元数据，不会产生新的文件变更；后置条件在工具刚执行完时记录，收尾时再复核最终状态，因此 `A→B` 再 `B→C` 不会被误判，而“结果在任务结束前消失”也不会被缓存掩盖。
 
-目标要求来自用户原话：用户说“移动”却只做了扫描时，`stop_reason=goal_unmet` 并给出 `unmet_effects`，不会被算作完成。否定句（“不要移动”）不算授权。
+目标要求来自用户原话：用户说“移动”却只做了扫描时，`outcome=goal_unmet`、`stop_reason=goal_unmet` 并给出 `unmet_effects`，不会被算作完成。否定句（“不要移动”）不算授权。
+
+## 本地密钥保护（SecretStore）
+
+实现位置：`backend/app/security/secrets.py`（路径沙箱仍在 `backend/app/security/__init__.py`）。
+
+| 能力 | 行为 |
+|---|---|
+| 存储后端 | Windows 使用 **DPAPI**（当前用户作用域）加密后落盘，每个密钥一个文件；非 Windows / 无 DPAPI 时返回 **fail-closed** 的 `UnavailableSecretStore`（写入直接报错，绝不退化为明文文件） |
+| 保存 / 读取 / 删除 / 轮换 | `SecretStore.set_secret` / `get_secret` / `delete_secret` / `rotate_secret` / `is_configured`；写入后立即回读校验 |
+| 按需读取 | `llm_config.resolve_api_key()` 每次从 SecretStore 读取，不把完整密钥放进全局状态或 checkpoint |
+| 历史明文迁移 | 启动时与首次读取时各尝试一次：写入 SecretStore → **回读一致** → 才删除 SQLite `llm_config.openai_api_key`；任何失败都保留旧值并给出脱敏诊断 |
+| 显式清除 / 重新配置 | `DELETE /api/settings/llm/key`、`PUT /api/settings/llm`（`openai_api_key` 显式传空串 = 清除）、`POST /api/settings/llm/key/migrate`（重试迁移） |
+| 出口脱敏 | 日志 handler、WS 事件、REST thread 快照统一走 `redact_text` / `redact_payload`；已知密钥与 `sk-…` 形态都会被替换 |
+
+迁移的状态机是 `not_needed` / `migrated` / `superseded` / `configured` / `rotated` / `cleared` / `failed`：
+
+- `migrated`：明文写入 SecretStore 且回读一致，旧记录已删除；
+- `superseded`：SecretStore 已有更新的密钥，旧明文只是残留，安全清理；
+- `failed`：保留旧明文（不丢密钥），通过 `api_key_storage.diagnostic` 告诉用户原因，可重试迁移或直接重新配置；
+- 迁移过程与结果都不记录密钥内容，API 只返回 `api_key_set: true/false` 与存储元信息。
+
+`GET /api/config` 与 `GET /api/settings/llm` 只返回布尔字段 `api_key_set`（并保留兼容字段 `openai_api_key_set`），不返回任何密钥字符；普通 `/api/preferences/*` 也不允许读写密钥类键。
+
+非 Windows 环境下用 `MemorySecretStore` 注入测试替身（`set_secret_store`），CI 不依赖真实系统凭据管理器，也不会因导入 Windows 专用 API 而失败。
+
+## 强类型授权范围与审批绑定
+
+### AuthorizationScope
+
+`backend/app/policy/authorization.py` 定义由**原始用户请求**生成的授权契约（随请求保存在 `state["authorization_scope"]`，重规划不重置）：
+
+| 字段 | 作用 |
+|---|---|
+| `request_id` / `thread_id` | 绑定到具体请求与会话 |
+| `allowed_effects` | 允许的副作用集合（read 永远允许；mutation 必须显式出现于用户原话） |
+| `source_roots` / `target_roots` | 允许读取/写入的根目录（越界即拒绝） |
+| `filter` | 允许的过滤条件；请求只能收紧，不能放宽 |
+| `max_items` / `recursive` | 单次数量上限与是否允许递归 |
+| `destructive` | 是否包含删除能力 |
+| `expires_at` / `request_digest` | 过期时间与请求指纹 |
+
+工具执行前（`PolicyEngine.evaluate(args=...)` 与 `ToolExecutor.execute(authorization_scope=...)` 双重校验）会拒绝：
+
+- 未知工具或缺少工具契约；
+- 缺少授权范围、授权范围与请求指纹不匹配、范围已过期；
+- 副作用不在 `allowed_effects` 内（`batch_classify` 与 `move` 同类，`delete` 必须显式出现）；
+- 源路径 / 目标目录不在对应根目录内，或 `rename_file` 的 `new_name` 含路径；
+- 过滤条件放宽（用户只授权 pdf 时不能处理全部文件）、扫描目录递归但范围不允许；
+- 批量匹配数量超过 `max_items`。
+
+授权范围的唯一来源是原始用户意图：澄清回答只能补充同一任务的信息（副作用集合沿用上一轮，`max_items` / 有效期只减不增），换任务、只读请求、已完成请求都不会继承上一轮 mutation 授权。
+
+### 审批绑定
+
+`backend/app/policy/approval.py` 为每次高危操作生成不可复用的审批记录：
+
+```
+approval_id, token, thread_id, request_id,
+request_digest, authorization_scope_digest,
+selected_item_digest, mutation_count, target_paths,
+expires_at, selected_items(size/mtime)
+```
+
+`POST /api/approvals/respond` 在恢复执行前调用 `verify_pending_approval`，以下任一情况返回 **409** 且不执行任何文件操作：
+
+| code | 触发条件 |
+|---|---|
+| `token_mismatch` / `approval_used` / `approval_expired` | 一次性 token 不匹配、已用过或过期 |
+| `request_changed` / `scope_changed` / `thread_changed` | 审批属于其他请求/范围/会话 |
+| `selection_changed` | 选中条目集合扩大或指纹不一致 |
+| `operation_changed` / `targets_changed` | 工具/参数/目标路径在审批后改变 |
+| `mutation_changed` | 审批后累计 mutation 数量变化 |
+| `stale_source` / `target_conflict` | 源文件大小或 mtime 变化、目标被占用 |
+
+审批被拒绝后，同一份审批内容（工具 + 参数 + 授权范围 + 请求指纹）会被记录为已拒绝，重规划不会再次弹出相同审批。
+
+操作预览复用同一套思路：`confirm` 生成一次性 `token`（并记录 `request_digest`、`authorization_scope_digest`、`selected_item_digest`、`mutation_count`、`target_paths`、`expires_at`），`execute` 任何一项不一致都返回 409（`selection_changed` / `targets_changed` / `operation_changed` / `request_changed` / `scope_changed` / `stale_preview`）。
 
 ## 批量执行与扫描语义
 
@@ -144,17 +226,21 @@ Planner 随后生成规则，而不是枚举数百条文件路径：
 
 预览由 Python 根据完整 manifest 与确定性规则生成，LLM 只提供规则，不枚举文件：
 
-1. `POST /api/previews` 生成计划（只读），返回 `preview_id`、逐文件 `source/target/status/reason` 与 `digest`；
+1. `POST /api/previews` 生成计划（只读），返回 `preview_id`、逐文件 `source/target/status/reason` 与 `digest`；同时把由 `op` / 目录 / 目标 / 过滤条件推导的 `authorization_scope` 快照写入预览记录；
 2. 用户翻页、取消勾选、（分类时）修改目标类别；
-3. `POST /api/previews/{id}/confirm` 把**这次选中的条目集合**绑定成一次性 `approval_id`；删除或超过批量阈值时必须显式 `approve=true`，否则返回 409 `approval_required`；
+3. `POST /api/previews/{id}/confirm` 把**这次选中的条目集合**绑定成一次性 `approval_id` + `confirm_token`，并写入 `request_digest`、`authorization_scope_digest`、`selected_item_digest`、`mutation_count`、`target_paths` 与 `expires_at`；删除或超过批量阈值时必须显式 `approve=true`，否则返回 409 `approval_required`；
 4. `POST /api/previews/{id}/execute` 带 `confirm_token` 执行。
 
 执行语义：
 
 - 选择在确认后发生变化（增加/替换条目）一律 409 `selection_changed`，旧确认不会授权更大的操作；
+- 请求指纹、授权范围指纹、选中条目指纹、变更数量、目标路径或操作类型与确认时不一致时，分别返回 409 `request_changed` / `scope_changed` / `selection_changed` / `targets_changed` / `operation_changed`；
+- 确认 token 一次性、有有效期（900 秒），过期返回 409 `confirm_required`；
 - 执行前逐项复核源文件的大小/修改时间与目标冲突，任何一项不一致就整体拒绝（409 `stale_preview`，附带失效清单），不会静默执行“看起来差不多”的结果；
 - 单个文件失败不中断整批，结果逐项返回；批次记录在 `preview-<id>` 线程下，可撤销；
 - 生成预览不创建目录、不移动文件，`preview_batch` 工具在工具契约中登记为 `read`。
+
+> 升级说明：升级前生成的旧预览没有 `authorization_scope` 快照，确认/执行会返回 409 `missing_scope` 并提示重新生成；这是有意的 fail-closed 行为。
 
 ### 重复文件（P1）
 
@@ -272,6 +358,8 @@ Planner 随后生成规则，而不是枚举数百条文件路径：
 | `agent_execution_budget_seconds` | 600 | 执行时间预算（按节点耗时累计，等待审批/补充信息不计入） |
 | `agent_model_timeout_seconds` | 60 | 单次模型请求超时 |
 | `batch_approval_threshold` | 20 | 请求级累计审批阈值 |
+| `authorization_max_items` | 500 | 单个授权范围允许处理的最大条目数 |
+| `authorization_scope_ttl_seconds` | 3600 | 授权范围有效期（秒） |
 
 供应商提供 Token usage 时记录到 `usage`；不提供时标记 `source: unknown`，不会伪造成 0。`model_calls` 也包含摘要/分类工具内部的模型调用。取消与超时只在节点/步骤边界生效；已完成的步骤保留，失败的工具调用不会自动重试。
 
@@ -307,11 +395,13 @@ Planner 随后生成规则，而不是枚举数百条文件路径：
 │   │   │   └── scheduler.py
 │   │   ├── main.py             # FastAPI 装配与 Agent 流协调
 │   │   ├── db.py               # SQLite 数据访问
-│   │   ├── llm_config.py       # 模型配置（数据库覆盖 > .env）
+│   │   ├── llm_config.py       # 模型配置（数据库覆盖 > .env；密钥走 SecretStore）
 │   │   ├── sandbox_config.py   # 授权目录，即安全边界
 │   │   ├── workspace_config.py # 默认管理目录，必须落在授权目录内
 │   │   ├── external_tools_config.py # 外部工具路径（Tesseract 等）
-│   │   └── security.py
+│   │   └── security/
+│   │       ├── __init__.py     # 路径沙箱校验
+│   │       └── secrets.py      # 本地密钥存储（DPAPI / 内存替身 / fail-closed）
 │   ├── tests/
 │   ├── build_sidecar.py        # PyInstaller 构建入口
 │   ├── sidecar.py              # 冻结后的后端程序入口
@@ -394,11 +484,15 @@ npm run dev
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `GET` / `PUT` | `/api/settings/llm` | 模型提供方与密钥 |
+| `GET` / `PUT` | `/api/settings/llm` | 模型提供方与非密钥配置；`PUT` 中的 `openai_api_key` 会写入本地 SecretStore（传空串表示清除） |
+| `DELETE` | `/api/settings/llm/key` | 显式清除本地 API Key（同时清理历史明文残留） |
+| `POST` | `/api/settings/llm/key/migrate` | 重试“历史明文 → SecretStore”迁移，返回脱敏诊断 |
 | `POST` | `/api/settings/llm/models` | 拉取可用模型列表 |
 | `GET` / `PUT` | `/api/settings/sandbox` | 授权目录 |
 | `GET` / `PUT` | `/api/settings/workspace` | 默认管理目录 |
 | `GET` / `PUT` | `/api/settings/tools` | 外部工具路径（当前为 Tesseract） |
+
+`GET /api/settings/llm` 只返回 `api_key_set: true/false` 与 `api_key_storage` 元信息（后端类型、是否持久化、迁移状态），永远不会回传密钥本身。
 
 统一优先级为 **SQLite 运行时配置 > `.env` 默认值 > 系统默认**。读取路径不做缓存，因此保存后立即生效；除 LLM 配置外都不需要重建 Agent runtime，也都不需要重启应用。`PUT /api/settings/tools` 在保存成功后会立刻用新配置重新执行一次能力检测，响应里带回最新结果，因此前端「保存并检测」是一次往返。
 
@@ -575,6 +669,10 @@ npm run build:web
 - 新增设置接口的 GET / PUT / DELETE、422 中文错误消息、清除语义，以及会话令牌校验。
 - preload backend URL、loopback 限制和 Electron 单实例生命周期。
 - 操作预览：生成预览不创建目录/不移动文件；只执行勾选条目；确认后扩大选择被拒；源文件变化或目标被占用时整体拒绝并列出失效项；删除/超阈值必须显式确认；冲突项不可选中；分页正确。
+- 本地密钥：明文 Key 首次读取迁移成功并删除旧记录；SecretStore 读/写失败时保留旧值且诊断不含密钥；清除与轮换；GET 配置/日志/异常/WebSocket/checkpoint 不出现密钥；非 Windows 默认 fail-closed 且可注入内存替身；普通偏好接口不可读写密钥。
+- 授权契约：未知工具、缺少 scope、scope 指纹不匹配、过期、目标越界、过滤扩大、数量超限、递归越权全部拒绝；`batch_classify` 与 move 同类；delete 始终需要审批；scope 下累计 mutation 不因重规划重置；文件正文 Prompt Injection 不能扩大权限；澄清只补充信息、换任务/只读/已完成请求不继承旧 mutation 授权。
+- 审批绑定：token / request_digest / selected_item_digest 不匹配、源文件变化、目标被占用、累计变更数量变化、审批过期或重复使用全部拒绝；审批后扩大选择或改变目标范围返回 409；拒绝后的同一审批不再重复弹窗。
+- 完成判定新增 `goal_unmet`：只有扫描/摘要/只读查询、未发生 move/rename/delete 时明确“目标未达成”。
 - 重复文件：同名不同内容不算重复、异名同内容成组；跳过回收站与符号链接；硬链接不重复计可回收空间；哈希期间文件变化标记失效；清理前重新校验内容并进入回收站；未确认的清理请求被拒。
 - 内容搜索：中文关键词（FTS5 单字短语）与 FTS5 不可用时的中文子串回退均命中；英文检索与分页；修改/移动/重命名/删除后的索引增量与清理；收缩授权目录后旧索引不再返回内容；不支持格式与提取失败被标记；截断被标记；未知检索后端被拒绝。
 - 批量分类：按内容使用模型并展示类别统计；缓存命中不再调用模型；模型未配置/预算耗尽时回退扩展名并说明原因；预览显示依据且允许修改类别；非法类别被拒绝。
@@ -588,14 +686,16 @@ CI 包含：
 - Ubuntu：`npm ci`、typecheck、前端测试、Web build。
 - Windows：sidecar build、sidecar smoke test、Electron portable build、artifact 上传。
 
-最近一次本地完整验证结果为 `547 passed, 1 skipped`（后端）。跳过项是真实 Tesseract 端到端用例（需要 `BUTLER_TEST_TESSERACT_CMD` 指向本机二进制）；Windows 未开启开发者模式时无法创建目录链接的用例会自动跳过。前端 `typecheck`、`npm test`（状态 / API / 新能力纯函数 / Electron 生命周期）与 Vite 生产构建均通过。真实模型的多轮对话评测需要配置模型，本次未运行。
+最近一次本地完整验证结果为 `633 passed, 3 skipped`（后端）。跳过项包含真实 Tesseract 端到端用例（需要 `BUTLER_TEST_TESSERACT_CMD` 指向本机二进制）；Windows 未开启开发者模式时无法创建目录链接的用例会自动跳过。前端 `typecheck`、`npm test`（状态 / API / 新能力纯函数 / Electron 生命周期）与 Vite 生产构建均通过。真实模型的多轮对话评测需要配置模型，本次未运行。
 
 > Windows 上若 `%TEMP%` 不可写，pytest 的 `tmp_path` 会失败；可用 `python -m pytest -q --basetemp=D:/butler-pytest-tmp` 指定可写目录。
 
 ## 安全说明
 
-- **原始意图是唯一授权源**：文件内容、OCR、文件名和工具返回都不可信。
-- **后端策略不可绕过**：风险和审批由 `PolicyEngine` 从 `tools/contracts.py` 的副作用登记推导，不由 LLM 决定；未知工具或参数无效直接拒绝。
+- **原始意图是唯一授权源**：文件内容、OCR、文件名和工具返回都不可信；授权范围（`AuthorizationScope`）只由原始用户请求生成，澄清只能补充信息、不能扩张。
+- **后端策略不可绕过**：风险和审批由 `PolicyEngine` 从 `tools/contracts.py` 的副作用登记推导，不由 LLM 决定；未知工具、缺少授权范围或参数无效直接拒绝（fail closed）。
+- **执行前按契约校验**：副作用、源/目标根目录、过滤条件、数量上限、递归范围全部命中才允许执行；`delete` 始终需要人工审批，`move`/`rename`/`batch_classify` 超过累计阈值也需要审批。
+- **审批绑定执行内容**：一次性 token + 请求/授权范围/选中条目指纹 + 目标路径 + 过期时间；执行前重新核验源文件大小/mtime 与目标冲突，任何不一致返回 409。
 - **路径沙箱**：越界文件访问一律拒绝；链接不会用来绕过沙箱。
 - **默认目录不扩权**：默认管理目录只是「没指定路径时用哪个目录」，保存时必须位于授权目录内，读取时二次校验，越界或已失效的值会被忽略并剪枝；它始终不能替代 `resolve_in_sandbox()`。
 - **安全相关配置不是普通偏好**：`__` 前缀的保留键对 `/api/preferences/{key}`（含 DELETE）和 Agent 的 `set_preference` / `delete_preference` 都不可写、不可删，避免模型自行放宽边界。
@@ -603,7 +703,8 @@ CI 包含：
 - **本地连接限制**：Renderer 不会把 session token 发送到非 loopback 服务。
 - **禁止覆盖**：目标重名时生成唯一名称，并在目标目录锁内完成选择和 mutation。
 - **可撤销与审计**：操作及回滚都写入 SQLite；删除使用项目回收站。
-- **密钥保护范围**：API Key 不返回前端、不进入日志，但当前仍以明文保存在本地 SQLite；数据库文件应视为敏感数据。
+- **密钥保护范围**：API Key 保存在 Windows DPAPI（当前用户）加密文件中，不写入 SQLite 明文，不返回前端、不进入日志/异常/WebSocket/checkpoint；历史明文会在首次读取时迁移，迁移失败则保留旧值并提示重试。非 Windows 且未注入 SecretStore 时按“未配置”处理（fail closed），不会退化为明文文件。
+- **密钥存储的边界**：DPAPI 保护的是“其他 Windows 用户无法解密”，不是“同一用户下的恶意进程无法读取”。同一登录用户下运行的程序仍可调用 DPAPI 解密，因此仍需保证本机账户与进程环境可信。
 
 ## 配置项
 
@@ -620,13 +721,16 @@ CI 包含：
 | `TESSERACT_CMD` | Tesseract 可执行文件；设置界面的值优先 | `C:\...\tesseract.exe` |
 | `TESSDATA_DIR` | Tesseract 语言包目录；设置界面的值优先 | `C:\...\tessdata` |
 | `DB_PATH` | SQLite 路径 | `./data/butler.db` |
+| `SECRET_STORE_DIR` | DPAPI 密文目录；留空时跟随数据库目录下的 `secrets/` | `./data/secrets` |
 | `HOST` / `PORT` | 后端监听地址和端口 | `127.0.0.1` / `8000` |
 
 ## 当前已知限制
 
 - WebSocket 使用状态快照 reconciliation，尚未实现 `event_id` 和断线事件 replay。
 - manifest 暂无 TTL、容量配额和定期压缩策略。
-- 用户意图授权当前是保守的后端词法策略，尚未升级为完整的强类型 intent contract；否定句（如「不要移动」）仍依赖模型不生成该步骤，后端只能约束“是否出现操作”。
+- 用户意图授权已升级为强类型 `AuthorizationScope`，但范围推导仍是保守的后端词法 + 路径解析：它不能真正理解语义，只能保证“没有出现明确授权的副作用就一定拒绝”。否定句、歧义目标、缺失目标目录都按拒绝或澄清处理，而不是猜测用户意图。
+- 授权令牌与审批记录保存在进程内状态 / SQLite 中，没有硬件绑定或逐条签收；它们保证“选择集合与确认绑定、执行前重新核验”，不能证明用户逐行看过预览。
+- 审批与预览的过期时间基于本机时钟；系统时间被大幅回拨/前拨会缩短或延长有效期。
 - 运行追踪的模型/工具调用计数在节点边界统计；如果模型在一次调用内部多次重试（例如结构化输出修复），`model_calls` 只记 1 次。
 - Token 用量依赖供应商返回 usage；本地 Ollama 等场景通常标记为 `unknown`。
 - 真实 Tesseract 端到端用例由环境变量开关控制，CI 环境无二进制，因此上游回归只能靠不依赖真实二进制的那部分用例兜住。

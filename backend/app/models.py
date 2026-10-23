@@ -69,10 +69,15 @@ class ApprovalDecision(str, Enum):
 
 
 class ApprovalResponse(BaseModel):
-    """前端对某次审批请求的回执。"""
+    """前端对某次审批请求的回执。
+
+    ``confirm_token`` 是审批事件里的一次性 token（默认等于 approval_id）。旧前端只回传
+    ``approval_id`` 也能工作；显式回传时后端会校验是否与待审批记录一致。
+    """
     thread_id: str
     approval_id: str
     decision: ApprovalDecision
+    confirm_token: Optional[str] = Field(default=None, max_length=128)
 
 
 class PendingApproval(BaseModel):

@@ -10,6 +10,7 @@ from app import db
 from app.agent.tool_executor import ToolExecutor
 from app.config import get_settings
 from app.tools import classify, preview
+from scopes import scope_for
 
 
 class FakeLLM:
@@ -51,10 +52,13 @@ def test_batch_classify_content_uses_model(sandbox: Path) -> None:
     llm = FakeLLM("财务")
     executor = ToolExecutor(llm)
     scan_id = _scan(executor, source)
-    result = executor.execute({
-        "id": "c", "tool": "batch_classify",
-        "args": {"scan_id": scan_id, "dest_root": str(sandbox / "out"), "mode": "content"},
-    })["result"]
+    result = executor.execute(
+        {
+            "id": "c", "tool": "batch_classify",
+            "args": {"scan_id": scan_id, "dest_root": str(sandbox / "out"), "mode": "content"},
+        },
+        authorization_scope=scope_for(source, target_roots=[sandbox / "out"]),
+    )["result"]
     assert result["mode"] == "content"
     assert result["success"] == 2
     assert result["categories"] == {"财务": 2}
@@ -81,10 +85,13 @@ def test_content_mode_falls_back_with_reason(sandbox: Path) -> None:
     (source / "a.txt").write_text("正文", encoding="utf-8")
     executor = ToolExecutor(None)
     scan_id = _scan(executor, source)
-    result = executor.execute({
-        "id": "c", "tool": "batch_classify",
-        "args": {"scan_id": scan_id, "dest_root": str(sandbox / "out2"), "mode": "content"},
-    })["result"]
+    result = executor.execute(
+        {
+            "id": "c", "tool": "batch_classify",
+            "args": {"scan_id": scan_id, "dest_root": str(sandbox / "out2"), "mode": "content"},
+        },
+        authorization_scope=scope_for(source, target_roots=[sandbox / "out2"]),
+    )["result"]
     assert result["fallback"] == 1
     assert result["fallback_items"][0]["reason"] == "模型未配置"
     # 回退到扩展名分类，仍移动到明确目录

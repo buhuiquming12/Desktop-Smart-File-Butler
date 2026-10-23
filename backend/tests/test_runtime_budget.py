@@ -20,6 +20,7 @@ from app.agent import graph as graph_module
 from app.agent import tracing
 from app.agent.state import PlanOutput, PlanStep, ReflectionOutput
 from app.config import get_settings
+from scopes import scope_for
 
 
 @pytest.fixture()
@@ -200,10 +201,13 @@ def test_failed_write_is_not_retried_automatically(
     monkeypatch.setattr("app.tools.filesystem.move_file", _boom)
     from app.agent.tool_executor import ToolExecutor
 
-    result = ToolExecutor().execute({
-        "id": "mv", "description": "移动", "tool": "move_file",
-        "args": {"src": str(sandbox / "a.txt"), "dest_dir": str(sandbox / "out")},
-    })
+    result = ToolExecutor().execute(
+        {
+            "id": "mv", "description": "移动", "tool": "move_file",
+            "args": {"src": str(sandbox / "a.txt"), "dest_dir": str(sandbox / "out")},
+        },
+        authorization_scope=scope_for(sandbox),
+    )
     assert result["status"] == "failed"
     assert len(calls) == 1, f"失败操作被重试了 {len(calls)} 次"
 

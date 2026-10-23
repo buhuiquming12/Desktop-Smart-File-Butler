@@ -23,6 +23,7 @@ from app.agent.state import PlanOutput, PlanStep, ReflectionOutput
 from app.agent.tool_executor import ToolExecutor
 from app.config import get_settings
 from app.policy.engine import explicit_intent_effects, intent_effects
+from scopes import scope_for
 
 
 @pytest.fixture()
@@ -201,12 +202,18 @@ def test_missing_independent_directory_in_mixed_request_is_partial(sandbox: Path
 def test_mixed_request_succeeds_when_make_dir_runs(sandbox: Path) -> None:
     executor = ToolExecutor()
     target = sandbox / "backup"
-    made = executor.execute({"id": "mk", "tool": "make_dir", "args": {"path": str(target)}})
+    made = executor.execute(
+        {"id": "mk", "tool": "make_dir", "args": {"path": str(target)}},
+        authorization_scope=scope_for(sandbox),
+    )
     (sandbox / "a.txt").write_text("x", encoding="utf-8")
-    moved = executor.execute({
-        "id": "mv", "tool": "move_file",
-        "args": {"src": str(sandbox / "a.txt"), "dest_dir": str(target)},
-    })
+    moved = executor.execute(
+        {
+            "id": "mv", "tool": "move_file",
+            "args": {"src": str(sandbox / "a.txt"), "dest_dir": str(target)},
+        },
+        authorization_scope=scope_for(sandbox),
+    )
     completion = evaluate_completion({
         "observations": [made, moved],
         "plan": [
@@ -249,18 +256,24 @@ def test_large_batch_chain_is_not_truncated(sandbox: Path) -> None:
     scan_src = executor.execute(
         {"id": "s1", "tool": "scan_directory", "args": {"directory": str(source)}}
     )
-    moved = executor.execute({
-        "id": "m", "tool": "batch_move",
-        "args": {"scan_id": scan_src["result"]["scan_id"],
-                 "filter": {"extensions": ["pdf"]}, "dest_dir": str(stage)},
-    })
+    moved = executor.execute(
+        {
+            "id": "m", "tool": "batch_move",
+            "args": {"scan_id": scan_src["result"]["scan_id"],
+                     "filter": {"extensions": ["pdf"]}, "dest_dir": str(stage)},
+        },
+        authorization_scope=scope_for(source, target_roots=[stage]),
+    )
     scan_stage = executor.execute(
         {"id": "s2", "tool": "scan_directory", "args": {"directory": str(stage)}}
     )
-    classified = executor.execute({
-        "id": "c", "tool": "batch_classify",
-        "args": {"scan_id": scan_stage["result"]["scan_id"], "dest_root": str(final)},
-    })
+    classified = executor.execute(
+        {
+            "id": "c", "tool": "batch_classify",
+            "args": {"scan_id": scan_stage["result"]["scan_id"], "dest_root": str(final)},
+        },
+        authorization_scope=scope_for(stage, target_roots=[final]),
+    )
 
     assert moved["result"]["success"] == count
     assert classified["result"]["success"] == count

@@ -166,12 +166,39 @@ flowchart TD
 Agent state 显式区分：
 
 - trusted_user_intent：原始用户请求，是当前实现中的授权依据。
+- authorization_scope：由原始用户请求在后端生成的强类型授权范围（副作用、源/目标根目录、过滤条件、数量上限、递归、过期时间、请求指纹）；随请求保存，重规划不重置。
 - untrusted_file_data：文件名、OCR、文档正文、扫描结果等。
 - tool_observations：工具返回的受限摘要。
 - mutations：当前请求累计执行的 move / rename / delete 数量。
 - approved_mutation_limit：已经获得人工批准的累计变更额度。
+- approved_batch：本次累计审批绑定的执行集合（源文件 / 目标 / 工具）与逐文件已执行状态。
+- consumed_approvals / rejected_approval_signatures：已使用过的审批与已被拒绝的审批指纹。
 
 文件内容即使包含“忽略之前指令”“删除所有文件”等文字，也只能作为普通数据，不能自动扩展用户授权。
+
+### 本地密钥存储（SecretStore）
+
+`app/security/secrets.py` 把 API Key 从 SQLite 明文里彻底挪走，抽象为可注入的 `SecretStore`：
+
+~~~text
+llm_config.resolve_api_key()
+        │  按需读取（不缓存明文）
+        ▼
+SecretStore
+   ├── WindowsDpapiSecretStore   Windows：DPAPI 当前用户加密文件，写入后回读校验
+   ├── MemorySecretStore         测试 / 开发替身，不触碰系统凭据管理器
+   └── UnavailableSecretStore    非 Windows 默认：读=未配置，写=明确报错（fail closed）
+~~~
+
+设计要点：
+
+- **迁移先写后删**：历史 `llm_config.openai_api_key` 明文只有在“写入 SecretStore 且回读一致”后才删除；任何异常都保留旧值并返回脱敏诊断。
+- **不进入其他通道**：API 只返回 `api_key_set` 与存储元信息；日志 handler、WebSocket 事件、REST thread 快照统一走 `redact_text` / `redact_payload`。
+- **落盘前脱敏**：REST/WS 出口脱敏保护不了 checkpoint。模型异常、工具异常或观察里带着密钥时，它们会随节点返回值写进 `checkpoints.sqlite`，因此每个节点返回值（`_timed_node` / 审批节点）、初始状态与 `cancel()` 的 `update_state` 在交给 LangGraph 之前统一过一遍 `redact_payload`；异常文本单独用 `redact_text` 处理 `error` 与 `final_response`。`redact_text` 在没有登记密钥也不含 `sk-` 前缀时走快路径，`redact_payload` 未改写内容时返回原对象，避免长任务在每个节点重复复制整份观察列表。
+- **校验错误不回显输入**：FastAPI 的 422 默认带上 `input`，超长的 `openai_api_key` 会随响应体进入前端错误记录。`main.py` 统一注册 `RequestValidationError` 处理器，去掉 `input` / `ctx` / `url`，只保留错误位置与原因。
+- **不做进程级明文缓存**：每次按需读取，避免完整密钥长期停留在全局状态或 checkpoint 中。
+- **平台探测在调用时进行**：模块导入不触发 Windows 专用 API，Ubuntu CI 可以正常导入并注入替身。
+- **删除/轮换是一等操作**：`clear_api_key` / `rotate_api_key` 有独立入口（`DELETE /api/settings/llm/key`），清除时同时清理历史明文残留。
 
 ### Sandbox
 
@@ -206,13 +233,66 @@ mutation 数量保存在整个 user request 的状态中，不因为重新规划
 - 未知工具、缺少契约、参数校验失败都显式失败（fail closed），不会“默认放行”；
 - 参数在进入文件系统前由 Pydantic 校验，未知字段直接拒绝。
 
+### 强类型授权范围（AuthorizationScope）
+
+`policy/authorization.py` 把“用户到底授权了什么”从自由文本词法判断升级为可校验的对象：
+
+| 字段 | 含义 |
+|---|---|
+| request_id / thread_id | 绑定到具体请求与会话 |
+| allowed_effects | 允许的副作用集合；read 始终允许 |
+| source_roots / target_roots | 允许读取/写入的根目录（越界拒绝） |
+| filter | 已授权的过滤条件；请求只能收紧 |
+| file_whitelist | 用户点名的具体文件；非空时变更类工具只能作用于这些文件 |
+| max_items / recursive | 数量上限与递归许可 |
+| destructive / expires_at | 是否包含删除、范围有效期 |
+| request_digest | 请求指纹（thread + request_id + 原始意图） |
+
+执行前有两道独立校验，任何一道失败都不会触达文件系统：
+
+1. `PolicyEngine.evaluate(tool, args=...)`：契约 → scope 存在性/指纹/过期 → 副作用 → 路径/过滤/数量 → 累计阈值审批；
+2. `ToolExecutor.execute(authorization_scope=...)`：按同一 `authorize_tool_call` 再校验一次，防止调用方绕过图直接执行。
+
+第 2 道防线对**变更类工具**是强制的：`None` / `{}` / 无法解析的 scope 一律 fail closed（只读工具才允许不带 scope 直接调用）。
+
+判定规则：
+
+- 未知工具、scope 缺失、scope 与请求指纹不匹配、scope 过期 → 拒绝；
+- 副作用不在 `allowed_effects` 内 → 拒绝（`batch_classify` 属于 move；`delete` 必须显式授权）；
+- `src` / `dest_dir` / `dest_root` / 预览目录越出对应根目录 → 拒绝；
+- 过滤条件放宽（例如用户只授权 pdf，请求却未限制扩展名或包含 jpg）→ 拒绝；
+- **单文件工具同样受过滤约束**：`move_file` / `rename_file` / `delete_file` / `write_summary` 没有 `filter` 参数，因此把范围里的扩展名/文件名/大小逐条落到那个源文件上（`path_filter_decision`），“只移动 PDF”不能用 `move_file` 搬走 JPG；
+- **点名文件的精确白名单**：用户说“删除 `D:\a\a.pdf`”时，父目录仍留在 `source_roots` 供扫描/摘要等只读与派生操作使用，但该文件同时进入 `file_whitelist`；移动/重命名/删除（含批量工具匹配到的清单项）必须落在白名单内，同目录其它文件仍被拒绝（`file_not_authorized`）；
+- 批量匹配数超过 `max_items`、或不允许递归却请求递归 → 拒绝。
+
+授权范围的唯一来源是原始用户意图。澄清回答只能补充同一任务缺失的信息：副作用集合沿用上一轮，`max_items`、`file_whitelist` 与有效期只减不增（交集为空时保留上一轮，绝不退化成“不限制”）；换任务、只读请求、已完成请求都不继承上一轮 mutation 授权。文件名、OCR、正文、工具输出与模型生成内容永远不会进入范围推导。
+
+### 审批绑定
+
+`policy/approval.py` 把一次性确认钉死在具体执行内容上：
+
+~~~text
+approval_id / token / thread_id / request_id
+request_digest / authorization_scope_digest
+selected_item_digest / mutation_count / target_paths
+expires_at / selected_items(size, mtime)
+~~~
+
+恢复执行（`POST /api/approvals/respond`）前调用 `verify_pending_approval`，以下情况返回 409 且不执行任何文件操作：token 不匹配、审批已用/过期、请求或授权范围变化、选中集合扩大、工具或参数变化、目标路径变化、累计 mutation 变化、源文件大小/mtime 变化、目标被占用。
+
+**累计审批绑定整条执行集合。** 21 个单文件移动触发“21 项变更”审批时，弹窗只描述当前这一步，但获批的是整条计划，因此 `build_pending_approval(coverage=...)` 会把剩余计划里的全部源文件（`execution_sources`）、目标落点与操作类型一起绑定：快照覆盖每个文件（审批期间修改第 2 个文件同样会让审批失效），恢复执行前重新计算集合并比对（`selection_changed` / `targets_changed` / `operation_changed`）。批准后状态里保留 `approved_batch`（源文件集合 + 目标 + 工具 + 已执行项），后续每一步都逐项核验：文件不在集合内、或该文件已在本轮审批下执行过，都会被拒绝并要求重新确认，旧的批准无法用来执行没获批的文件。
+
+被拒绝的审批会以“工具 + 参数 + 授权范围 + 请求指纹”的稳定指纹记入 `rejected_approval_signatures`；重规划遇到同一份审批内容时直接记为 rejected，不会反复弹窗。`consumed_approvals` 记录已经使用过的 approval_id，保证同一审批只能执行一次。
+
+操作预览（`tools/preview.py`）复用同一套绑定思路：`confirm` 写入一次性 `token`、`request_digest`、`authorization_scope_digest`、`selected_item_digest`、`mutation_count`、`target_paths` 与 `expires_at`；`execute` 逐项比对，任何不一致都 409。预览本身是只读的，因此只读范围也能生成预览；**确认与执行两步都会调用 `authorize_preview_selection`**，重新校验具体副作用（move/rename/delete 是否被授权）、源文件是否在范围内（含白名单与过滤条件）、目标目录是否在范围内、条目数是否超过 `max_items` —— 只核对指纹不足以保证副作用仍被许可。
+
 ## 6. 完成判定与运行追踪
 
 流程终止与目标完成是两件事，状态里用不同字段分别表达：
 
 - `status`：流程在哪终止（completed / failed / cancelled / needs_clarification / waiting_approval）。
-- `outcome`：目标完成度（success / partial / failed / rejected / cancelled / budget_exhausted / needs_clarification）。
-- `stop_reason`：为什么停（goal_verified / model_done / replan_limit / user_rejected / budget_exhausted / tool_failed / exception）。
+- `outcome`：目标完成度（success / partial / goal_unmet / failed / rejected / cancelled / budget_exhausted / needs_clarification）。
+- `stop_reason`：为什么停（goal_verified / model_done / goal_unmet / replan_limit / user_rejected / budget_exhausted / tool_failed / exception）。
 
 模型可以提出 `done`，但“是否成功”由 `agent/outcome.py` 的确定性校验决定：它只读取已确认计划与真实工具结果，检查文件是否存在、批量计数是否自洽、扫描是否截断、是否还有未执行步骤。校验只读元数据，不产生新的文件变更；任何部分完成、拒绝、预算耗尽都会覆盖模型“全部成功”的措辞。
 
@@ -220,7 +300,7 @@ mutation 数量保存在整个 user request 的状态中，不因为重新规划
 
 - 后置条件在**工具刚执行完时**记录到 observation（`verification`），收尾时再复核最终状态；只有被后续成功变更消费掉的路径（`A→B` 再 `B→C` 的 B）才跳过复核。这样既不会把合法链路判成失败，也不会让“文件在任务结束前消失”被缓存结果掩盖。批量工具的参数里只有 `scan_id`，因此结果额外记录被消费的源路径 `sources`，`batch_move → batch_classify` 这类链同样按正常链路处理。`sources` **不能截断**：链式判断按全部匹配项比对，截断会让大批量链的后半段被误判成“结果消失”；其长度上界由扫描清单本身决定（`filesystem._MAX_SCAN_ITEMS`）。
 - 空计划（规划器没有生成任何步骤）没有可验证的后置条件，结论是 `unknown`，不是 `success`；纯问答也按此处理。模型在空计划里给出的“全部完成”措辞不会作为正文，正文使用后端生成的“未执行任何文件操作，无法验证目标”。
-- 目标要求来自用户原话：`intent_effects()` 从 `trusted_user_intent` 推导用户要求的副作用（移动/重命名/删除/摘要/偏好/定时），并跳过被否定的词（“不要移动”）。**扫描不算完成“移动”**：用户要求移动而只做了扫描时，`outcome=partial`、`stop_reason=goal_unmet`，并列出 `unmet_effects`。
+- 目标要求来自用户原话：`intent_effects()` 从 `trusted_user_intent` 推导用户要求的副作用（移动/重命名/删除/摘要/偏好/定时），并跳过被否定的词（“不要移动”）。**扫描不算完成“移动”**：用户要求移动而只做了扫描时，`outcome=goal_unmet`、`stop_reason=goal_unmet`，并列出 `unmet_effects`。只有 move / rename / delete 这类“目标性”变更完全没发生时才归为 `goal_unmet`；部分完成、扫描截断等仍为 `partial`。
 - `create` 平时是移动/整理的从属授权（移动前可能要建目标目录，`move_file` 自己也会建），因此默认不算目标；但请求里**明确要求**“新建目录/文件夹”时它是独立目标（`explicit_intent_effects()`），混合请求（“新建一个备份文件夹，然后把 PDF 移动进去”）同样要求 `make_dir` 真的成功。定语用法（“移动到新建的 out 文件夹”）不算目标；`创建摘要文件` 属于写入，也不算建目录目标。
 
 统计口径分开：`ok/failed/skipped` 是工具调用次数，`files_ok/files_failed/files_skipped/matched` 是文件级结果。
@@ -234,6 +314,8 @@ mutation 数量保存在整个 user request 的状态中，不因为重新规划
 | `agent_execution_budget_seconds` | 600 | 单次运行的执行时间预算（按节点耗时累计，等待审批/用户输入不计入） |
 | `agent_model_timeout_seconds` | 60 | 单次模型请求超时（支持的 provider） |
 | `batch_approval_threshold` | 20 | 请求级累计审批阈值 |
+| `authorization_max_items` | 500 | 单个授权范围允许处理的最大条目数 |
+| `authorization_scope_ttl_seconds` | 3600 | 授权范围有效期（秒） |
 
 取消与超时的边界一致：只在节点/步骤边界生效，已完成的步骤保留，其后不再产生文件变更；失败的工具调用不会自动重试，避免重复写入。
 
@@ -382,7 +464,11 @@ CI 不只验证代码和单元测试，也验证 Windows 桌面交付链能够�
 | agent/checkpoints.py | Checkpoint 创建与保留策略 |
 | agent/outcome.py | 确定性完成判定：文件级计数、后置条件校验、outcome/stop_reason |
 | agent/tracing.py | 运行追踪：Token 用量采集（不可获得时标记 unknown） |
-| policy/engine.py | 后端授权与累计 mutation 策略 |
+| policy/engine.py | 后端授权与累计 mutation 策略，执行路径强制校验授权契约 |
+| policy/authorization.py | 强类型授权范围：由原始用户意图推导并校验工具参数 |
+| policy/approval.py | 审批绑定：一次性 token、请求/范围/选中条目指纹、执行前重检 |
+| security/__init__.py | 路径沙箱校验（resolve_in_sandbox / SandboxViolation） |
+| security/secrets.py | 本地密钥存储（Windows DPAPI / 内存替身 / fail-closed）与出口脱敏 |
 | tools/contracts.py | 工具契约：参数模型、副作用、权限登记（唯一来源） |
 | tools/manifests.py | 完整扫描清单与确定性过滤 |
 | tools/path_locks.py | 目录级 mutation 锁 |
@@ -432,10 +518,11 @@ LangGraph、文档解析和 OCR 生态集中在 Python；Electron 更适合桌�
 
 1. WebSocket 尚未实现 event sequence replay。
 2. scan manifest 需要 TTL、容量配额和清理策略。
-3. 原始意图授权仍是保守词法策略，可演进为强类型 Intent Contract。
+3. 原始意图授权已升级为强类型 `AuthorizationScope`，但范围推导仍是“保守词法 + 路径解析”，尚不能真正理解语义；后续可在保持 fail-closed 的前提下引入更强的关系抽取。
 4. 已建立统一的工具契约登记（`tools/contracts.py`）；后续可把处理器注册表本身也迁入该模块。
 5. main.py、graph.py、App.tsx 已开始拆分，但仍可继续抽出 workflow service、Agent transport 和 conversation controller。
-6. API Key 当前不回传 Renderer，但本地 SQLite 仍是明文；正式产品可接系统 Keychain 或 Credential Manager。
+6. API Key 已迁移到本地 SecretStore（Windows DPAPI），SQLite 不再保存明文；DPAPI 只隔离其他 Windows 用户，不防御同一登录用户下的恶意进程，后续可评估 Credential Manager + 生物识别/系统解锁绑定。
 7. 正式发布还需要代码签名、品牌图标与全新 Windows VM 的安装级验证。
 7.1 内容检索目前是关键词后端（中文按单字短语匹配），语义检索只预留 `SearchBackend` 接口；重复扫描结果与索引任务状态保存在进程内存，重启后需重新扫描/建索引；自动整理是进程内轮询，应用退出即停止。
 8. 长期偏好目前是键值列表（可查看/更新/删除），还没有按语义检索；跨会话只隔离 thread 状态，不隔离偏好（偏好本就是全局设置）。
+9. 审批与授权范围过期依赖本机时钟；没有硬件令牌或逐条签收，无法证明用户逐行看过预览内容。

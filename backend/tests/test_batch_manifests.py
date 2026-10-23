@@ -9,6 +9,7 @@ from app.agent import graph as graph_module
 from app.config import get_settings
 from app.policy import PolicyEngine
 from app.tools import filesystem
+from scopes import scope_for
 
 
 @pytest.fixture()
@@ -44,10 +45,14 @@ def test_manifest_batch_moves_every_match_not_only_preview(sandbox: Path) -> Non
     assert result["total"] == 235
     assert len(result["preview"]) == 20
 
-    moved = runtime._execute_step({
-        "id": "m", "tool": "batch_move",
-        "args": {"scan_id": result["scan_id"], "filter": {"extensions": ["pdf"]}, "dest_dir": str(sandbox / "PDF")},
-    })["result"]
+    moved = runtime._tools().execute(
+        {
+            "id": "m", "tool": "batch_move",
+            "args": {"scan_id": result["scan_id"], "filter": {"extensions": ["pdf"]},
+                     "dest_dir": str(sandbox / "PDF")},
+        },
+        authorization_scope=scope_for(source, target_roots=[sandbox / "PDF"]),
+    )["result"]
     assert moved == {**moved, "matched": 230, "success": 230, "failed": 0, "skipped": 0}
     assert len(list((sandbox / "PDF").glob("*.pdf"))) == 230
     assert len(list(source.glob("*.jpg"))) == 5

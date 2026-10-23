@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 import uuid
 from typing import Any, Dict, Iterable, Literal, Optional
@@ -20,8 +21,18 @@ from langgraph.types import Command, interrupt
 from .. import db
 from ..logging_conf import get_logger
 from ..security import resolve_in_sandbox
+from ..security.secrets import redact_payload, redact_text
 from ..tools import manifests
 from ..policy import PolicyEngine
+from ..policy.approval import (
+    approval_signature,
+    build_pending_approval,
+    execution_sources,
+    execution_targets,
+    execution_tools,
+    verify_pending_approval,
+)
+from ..policy.authorization import AuthorizationScope, build_scope
 from ..policy.engine import intent_effects, is_task_switch
 from . import tracing
 from .checkpoints import (
@@ -73,6 +84,31 @@ def _is_clarification_answer(message: str) -> bool:
     return not intent_effects(text)
 
 
+def resolve_authorization_scope(
+    *,
+    thread_id: str,
+    request_id: str,
+    intent: str,
+    previous: Optional[Dict[str, Any]] = None,
+    inherit: bool = False,
+) -> AuthorizationScope:
+    """由原始用户意图生成授权范围；只有澄清续问才允许合并上一轮范围。
+
+    合并只发生在 ``inherit=True`` 时（上一轮停在 needs_clarification 且本轮只是
+    补充信息）：副作用集合沿用上一轮、max_items 只减不增、过期时间取更早者。
+    已完成/失败/取消的请求，或换任务、只读请求，都不会继承 mutation 授权。
+    """
+    prior = None
+    if inherit and isinstance(previous, dict):
+        prior = AuthorizationScope.from_dict(previous.get("authorization_scope"))
+    return build_scope(
+        intent,
+        request_id=request_id,
+        thread_id=thread_id,
+        prior=prior,
+    )
+
+
 def _recursion_limit() -> int:
     """按计划上限与允许的重规划次数推导安全的 recursion_limit。
 
@@ -85,6 +121,24 @@ def _recursion_limit() -> int:
     return 1 + cycles * per_cycle + margin
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def _norm(path: str) -> str:
+    """路径比较用的规范化形式（大小写/相对路径不敏感）。"""
+    try:
+        return os.path.normcase(os.path.abspath(str(path)))
+    except (OSError, ValueError):
+        return str(path)
+
+
+def _redact_state(update: Any) -> Any:
+    """持久化前脱敏：checkpoint 落盘的数据流只有一个出口，就在这里兜底。
+
+    REST/WS 出口的脱敏保护不了**落盘**数据：模型异常、工具异常或观察里带着密钥时，
+    它们会随节点返回值写进 checkpoints.sqlite。因此所有节点返回值在交给
+    LangGraph（也就是写进 checkpoint）之前统一过一遍 ``redact_payload``。
+    """
+    return redact_payload(update)
 
 
 _PLANNER_SAMPLE = 20        # 回灌给规划器的扫描样本条数
@@ -264,7 +318,7 @@ class AgentRuntime:
         workflow.add_node("planning", self._node("planning", self._plan))
         workflow.add_node("act", self._node("act", self._act))
         # 审批节点内部使用 interrupt 暂停；等待时间不计入执行预算。
-        workflow.add_node("approval", self._approval)
+        workflow.add_node("approval", self._approval_node)
         workflow.add_node("reflecting", self._node("reflecting", self._reflect))
 
         workflow.add_edge(START, "perceive")
@@ -331,6 +385,7 @@ class AgentRuntime:
             "completion": {},
             "batch_approved": False,
             "batch_rejected": False,
+            "approved_batch": None,
             # 授权文本由 start_stream 决定（澄清续问会合并上一轮意图），perceive
             # 不能再把它重置成“本轮最后一条消息”，否则澄清后的授权会被抹掉。
             "trusted_user_intent": state.get("trusted_user_intent") or state.get("user_request", ""),
@@ -466,7 +521,7 @@ class AgentRuntime:
             reason = self._budget_exceeded(state)
             if reason:
                 logger.info("运行预算耗尽 thread=%s reason=%s", state.get("thread_id"), reason)
-                return self._budget_stop(state, reason)
+                return _redact_state(self._budget_stop(state, reason))
         started = time.monotonic()
         result = handler(state)
         elapsed_ms = int((time.monotonic() - started) * 1000)
@@ -487,6 +542,7 @@ class AgentRuntime:
                     "stop_reason",
                     "tool_failed" if final_status == "failed" else "model_done",
                 )
+            result = _redact_state(result)
         return result
 
     @staticmethod
@@ -596,12 +652,14 @@ class AgentRuntime:
             )
             return {
                 "status": "failed",
-                "error": str(exc),
+                # 异常文本可能带着供应商返回的密钥片段：进入状态（并写 checkpoint）前脱敏。
+                "error": redact_text(str(exc)),
                 "outcome": "failed",
                 "stop_reason": "planning_error",
                 "completion": completion,
                 "run_trace": self._trace_update(state, model_calls=1),
-                "final_response": f"规划失败：{exc}" + (f"。{completion['message']}" if completion.get("message") else ""),
+                "final_response": f"规划失败：{redact_text(str(exc))}"
+                + (f"。{completion['message']}" if completion.get("message") else ""),
                 "plan": [],
             }
 
@@ -678,6 +736,25 @@ class AgentRuntime:
                 "status": "running",
             }
 
+        if tool in _CUMULATIVE_TOOLS and state.get("batch_approved"):
+            # 累计审批只对“已经在审批里绑定的那份执行集合”生效：当前步骤的源文件
+            # 逐个核验，不在集合内（或已经执行过）就必须重新审批，不能借旧批准扩大执行。
+            violation = self._approved_batch_violation(
+                state, tool, args, requires_approval=decision.requires_approval
+            )
+            if violation:
+                observation = self._observation(step, "rejected", result=violation)
+                db.log_operation(
+                    tool, str(args.get("src") or args.get("scan_id") or ""), "rejected",
+                    detail=violation[:500], thread_id=state.get("thread_id"),
+                )
+                return {
+                    "current_step": current,
+                    "observations": [*state.get("observations", []), observation],
+                    "step_index": index + 1,
+                    "status": "running",
+                }
+
         # 引用旧扫描时必须在使用前核验：manifest 不存在、目录已消失都明确失败，
         # 不能拿过期清单继续移动文件。
         if tool in {"batch_move", "batch_rename", "batch_classify"}:
@@ -693,18 +770,52 @@ class AgentRuntime:
 
         if tool != "delete_file" and decision.requires_approval:
             cumulative = self._cumulative_mutations(state)
-            approval = {
-                "approval_id": uuid.uuid4().hex,
+            scope = AuthorizationScope.from_dict(state.get("authorization_scope"))
+            request = str(
+                state.get("trusted_user_intent") or state.get("user_request") or ""
+            )
+            signature = approval_signature(
+                tool,
+                args,
+                scope=scope,
+                request_digest=str(state.get("request_digest") or ""),
+            )
+            # 用户拒绝过同一份审批内容后，重规划不得再次弹出同样的审批。
+            if signature in {
+                str(item) for item in (state.get("rejected_approval_signatures") or [])
+            }:
+                observation = self._observation(
+                    step, "rejected", result="该操作此前已被用户拒绝，未再次请求审批"
+                )
+                return {
+                    "current_step": current,
+                    "observations": [*state.get("observations", []), observation],
+                    "step_index": index + 1,
+                    "status": "running",
+                }
+            approval = build_pending_approval(
                 # 审批标题必须反映实际工具：batch_classify 也是移动，但它不是 batch_move。
-                "action": tool if tool.startswith("batch_") else f"batch_{decision.mutation_kind}",
-                "target": f"累计 {cumulative + proposed} 项文件变更",
-                "detail": decision.reason,
-                "count": proposed,
-                "approved_limit": cumulative + proposed,
-                "batch": True,
-                "tool": tool,
-                "args": args,
-            }
+                approval_id=uuid.uuid4().hex,
+                tool=tool,
+                args=args,
+                scope=scope,
+                request=request,
+                state=state,
+                action=tool if tool.startswith("batch_") else f"batch_{decision.mutation_kind}",
+                target=f"累计 {cumulative + proposed} 项文件变更",
+                detail=decision.reason,
+                count=proposed,
+                cumulative_before=cumulative,
+                batch=True,
+                # 累计审批绑定“整条计划”的执行集合，而不是当前这一步：审批弹窗只写
+                # 第 1 个文件，但获批的是后面所有步骤，所以集合与逐文件快照都要绑上。
+                coverage={
+                    "sources": execution_sources(plan[index:]),
+                    "targets": execution_targets(plan[index:]),
+                    "tools": execution_tools(plan[index:]),
+                },
+            )
+            approval["signature"] = signature
             return {"current_step": current, "pending_approval": approval, "status": "waiting_approval"}
 
         if tool == "delete_file":
@@ -721,7 +832,11 @@ class AgentRuntime:
                     "status": "running",
                 }
 
-            delete_decision = self.policy.evaluate(tool, state=state, proposed_count=1)
+            # 带真实参数再走一次策略：缺少授权范围 / 越界 / 未授权 delete 都拒绝。
+            delete_args = {**args, "path": validated}
+            delete_decision = self.policy.evaluate(
+                tool, state=state, proposed_count=1, args=delete_args
+            )
             if not delete_decision.allowed:
                 observation = self._observation(step, "failed", error=delete_decision.reason)
                 return {
@@ -731,16 +846,45 @@ class AgentRuntime:
                     "status": "running",
                 }
 
-            approval = {
-                "approval_id": uuid.uuid4().hex,
-                "action": "delete",
-                "target": validated,
-                "detail": step.get("description", "删除文件或目录"),
-                "tool": tool,
-                "args": {**args, "path": validated},
-            }
+            scope = AuthorizationScope.from_dict(state.get("authorization_scope"))
+            request = str(
+                state.get("trusted_user_intent") or state.get("user_request") or ""
+            )
+            signature = approval_signature(
+                tool,
+                delete_args,
+                scope=scope,
+                request_digest=str(state.get("request_digest") or ""),
+            )
+            if signature in {
+                str(item) for item in (state.get("rejected_approval_signatures") or [])
+            }:
+                observation = self._observation(
+                    step, "rejected", result="该删除操作此前已被用户拒绝，未再次请求审批"
+                )
+                return {
+                    "current_step": current,
+                    "observations": [*state.get("observations", []), observation],
+                    "step_index": index + 1,
+                    "status": "running",
+                }
+            approval = build_pending_approval(
+                approval_id=uuid.uuid4().hex,
+                tool=tool,
+                args=delete_args,
+                scope=scope,
+                request=request,
+                state=state,
+                action="delete",
+                target=validated,
+                detail=step.get("description", "删除文件或目录"),
+                count=1,
+                cumulative_before=self._cumulative_mutations(state),
+                batch=False,
+            )
+            approval["signature"] = signature
             return {
-                "current_step": current,
+                "current_step": {**current, "args": delete_args},
                 "pending_approval": approval,
                 "status": "waiting_approval",
             }
@@ -748,7 +892,11 @@ class AgentRuntime:
         with db.operation_thread(state.get("thread_id")):
             executor = self._tools()
             observation = record_verification(
-                executor.execute(step, model_call_limit=self._remaining_model_calls(state))
+                executor.execute(
+                    step,
+                    model_call_limit=self._remaining_model_calls(state),
+                    authorization_scope=state.get("authorization_scope"),
+                )
             )
             # 摘要/分类工具内部也会调用模型，必须计入本次运行预算。
             inner_model_calls = executor.consume_model_calls()
@@ -771,7 +919,13 @@ class AgentRuntime:
             if latest_scan:
                 update["last_scan"] = latest_scan
         self._apply_mutation_count(update, state, tool, observation)
+        # 记下已执行的源文件：同一份累计审批下不得对同一个文件重复执行。
+        self._mark_batch_done(update, state, tool, args)
         return update
+
+    def _approval_node(self, state: AgentState) -> Dict[str, Any]:
+        """审批节点的持久化出口：返回值写 checkpoint 前统一脱敏。"""
+        return _redact_state(self._approval(state))
 
     def _approval(self, state: AgentState) -> Dict[str, Any]:
         pending = state.get("pending_approval")
@@ -781,15 +935,28 @@ class AgentRuntime:
         decision = interrupt(
             {
                 "approval_id": pending["approval_id"],
+                # 一次性确认 token：默认与 approval_id 相同，客户端可显式回传校验。
+                "token": pending.get("token") or pending["approval_id"],
                 "action": pending["action"],
                 "target": pending["target"],
                 "detail": pending.get("detail", ""),
+                "request_digest": pending.get("request_digest", ""),
+                "authorization_scope_digest": pending.get("scope_digest", ""),
+                "selected_item_digest": pending.get("selected_item_digest", ""),
+                "mutation_count": pending.get("mutation_count", 0),
+                "target_paths": pending.get("target_paths", []),
+                "expires_at": pending.get("expires_at", 0),
             }
         )
         approved = (
             decision is True
             or decision == "approve"
             or (isinstance(decision, dict) and decision.get("decision") == "approve")
+        )
+        token = (
+            str(decision.get("token") or "")
+            if isinstance(decision, dict)
+            else ""
         )
         step = {
             "id": state.get("current_step", {}).get("id", "approval"),
@@ -798,13 +965,64 @@ class AgentRuntime:
             "args": pending["args"],
         }
         thread_id = state.get("thread_id")
+        approval_id = str(pending.get("approval_id") or "")
+        consumed = [*state.get("consumed_approvals", [])]
+        if approval_id and approval_id not in consumed:
+            consumed.append(approval_id)
+        rejected_signatures = [
+            *state.get("rejected_approval_signatures", [])
+        ]
+        signature = str(pending.get("signature") or "")
         inner_model_calls = 0
+        # 执行前重新校验：审批绑定的请求/范围/选择/源文件/目标都必须仍然成立。
+        check = (
+            verify_pending_approval(
+                pending, state=state, confirm_token=token or approval_id
+            )
+            if approved
+            else None
+        )
+        if approved and check is not None and not check.ok:
+            logger.warning(
+                "审批后执行前校验失败 thread=%s code=%s", thread_id, check.code
+            )
+            db.log_operation(
+                pending["action"], pending["target"], "rejected",
+                detail=f"审批后校验失败（{check.code}）：{check.message}"[:500],
+                thread_id=thread_id,
+            )
+            observation = self._observation(
+                step,
+                "rejected",
+                result=f"审批后校验失败（{check.code}）：{check.message}",
+            )
+            if pending.get("batch"):
+                result_batch_rejected = True
+            else:
+                result_batch_rejected = False
+            if signature and signature not in rejected_signatures:
+                rejected_signatures.append(signature)
+            result: Dict[str, Any] = {
+                "pending_approval": None,
+                "observations": [*state.get("observations", []), observation],
+                "step_index": state.get("step_index", 0) + 1,
+                "status": "running",
+                "consumed_approvals": consumed,
+                "rejected_approval_signatures": rejected_signatures,
+                "run_trace": self._trace_update(state),
+            }
+            if result_batch_rejected:
+                result["batch_rejected"] = True
+            return result
+
         if approved:
             with db.operation_thread(thread_id):
                 executor = self._tools()
                 observation = record_verification(
                     executor.execute(
-                        step, model_call_limit=self._remaining_model_calls(state)
+                        step,
+                        model_call_limit=self._remaining_model_calls(state),
+                        authorization_scope=state.get("authorization_scope"),
                     )
                 )
                 inner_model_calls = executor.consume_model_calls()
@@ -816,12 +1034,16 @@ class AgentRuntime:
             observation = self._observation(
                 step, "rejected", result="用户拒绝了危险操作，未修改文件"
             )
+            if signature and signature not in rejected_signatures:
+                rejected_signatures.append(signature)
 
-        result: Dict[str, Any] = {
+        result = {
             "pending_approval": None,
             "observations": [*state.get("observations", []), observation],
             "step_index": state.get("step_index", 0) + 1,
             "status": "running",
+            "consumed_approvals": consumed,
+            "rejected_approval_signatures": rejected_signatures,
             "run_trace": self._trace_update(
                 state,
                 tool_calls=1 if approved else 0,
@@ -836,9 +1058,26 @@ class AgentRuntime:
                     int(state.get("approved_mutation_limit") or 0),
                     int(pending.get("approved_limit") or 0),
                 )
+                # 绑定这一份审批覆盖的完整执行集合：后续每一步都要逐项核验。
+                coverage = dict(pending.get("coverage") or {})
+                result["approved_batch"] = {
+                    "approval_id": approval_id,
+                    "sources": [
+                        str(item) for item in coverage.get("sources") or []
+                    ],
+                    "targets": [
+                        str(item) for item in coverage.get("targets") or []
+                    ],
+                    "tools": [str(item) for item in coverage.get("tools") or []],
+                    "done": [],
+                }
             else:
                 result["batch_rejected"] = True
         self._apply_mutation_count(result, state, str(step.get("tool", "")), observation)
+        if approved:
+            self._mark_batch_done(
+                result, state, str(step.get("tool", "")), dict(step.get("args") or {})
+            )
         return result
 
     def _reflect(self, state: AgentState) -> Dict[str, Any]:
@@ -923,12 +1162,12 @@ class AgentRuntime:
             )
             return {
                 "status": "failed",
-                "error": str(exc),
+                "error": redact_text(str(exc)),
                 "outcome": "failed",
                 "stop_reason": "reflection_error",
                 "completion": completion,
                 "run_trace": self._trace_update(state, model_calls=1),
-                "final_response": f"文件操作已停止：反思阶段失败（{exc}）。"
+                "final_response": f"文件操作已停止：反思阶段失败（{redact_text(str(exc))}）。"
                 + completion.get("message", "")
                 + "请查看任务记录确认已完成部分。",
             }
@@ -981,6 +1220,58 @@ class AgentRuntime:
     def _cumulative_mutations(state: AgentState) -> int:
         mutations = state.get("mutations") or {}
         return sum(int(mutations.get(name, 0)) for name in ("move", "rename"))
+
+    @staticmethod
+    def _approved_batch_violation(
+        state: AgentState, tool: str, args: Dict[str, Any], *, requires_approval: bool
+    ) -> str:
+        """累计审批的逐项核验：当前步骤只能处理已获批执行集合里的文件。
+
+        返回空串表示放行；否则返回必须记入观察的拒绝原因。
+        - 没有绑定（旧 checkpoint / 直接调用）→ 拒绝，要求重新确认；
+        - 当前步骤的源文件不在绑定集合内 → 拒绝（审批被用来执行没获批的文件）；
+        - 该文件已在本次审批中处理过 → 拒绝（防止重复执行）。
+        需要新的审批（``requires_approval``）时不在这里拦，让上层重新走审批。
+        """
+        if requires_approval:
+            return ""
+        batch = state.get("approved_batch") or {}
+        approved = [str(item) for item in (batch.get("sources") or [])]
+        if not approved:
+            return "累计审批缺少绑定信息，请重新确认该操作"
+        sources = execution_sources([{"tool": tool, "args": dict(args or {})}])
+        if not sources:
+            # 批量步骤匹配到 0 个文件时没有副作用可发生：不拦截，也不需要核验。
+            return ""
+        allowed = {_norm(item) for item in approved}
+        outside = [item for item in sources if _norm(item) not in allowed]
+        if outside:
+            return (
+                "文件不在已审批的执行集合内，请重新确认："
+                + str(outside[0])
+            )
+        done = {_norm(str(item)) for item in (batch.get("done") or [])}
+        repeated = [item for item in sources if _norm(item) in done]
+        if repeated:
+            return "该文件已在本次审批中处理过，拒绝重复执行：" + str(repeated[0])
+        return ""
+
+    @staticmethod
+    def _mark_batch_done(
+        update: Dict[str, Any], state: AgentState, tool: str, args: Dict[str, Any]
+    ) -> None:
+        """记录“这个文件已经在本次审批下执行过”，供后续步骤逐项核验。"""
+        if tool not in _CUMULATIVE_TOOLS:
+            return
+        # 审批节点会在同一份返回值里新建绑定，因此先看本次增量再看既有状态。
+        batch = update.get("approved_batch") or state.get("approved_batch") or {}
+        if not batch.get("sources"):
+            return
+        done = [str(item) for item in (batch.get("done") or [])]
+        for item in execution_sources([{"tool": tool, "args": dict(args or {})}]):
+            if item not in done:
+                done.append(item)
+        update["approved_batch"] = {**batch, "done": done}
 
     @staticmethod
     def _apply_mutation_count(update: Dict[str, Any], state: AgentState, tool: str, observation: Dict[str, Any]) -> None:
@@ -1070,14 +1361,25 @@ class AgentRuntime:
         # 只有上一轮确实停在 needs_clarification、且这轮既不是改口也不是新任务时
         # 才沿用原授权；已完成/失败/取消的请求不延伸授权。
         prior_intent = ""
+        inherit_scope = False
         if previous.get("status") == "needs_clarification":
             prior_intent = str(previous.get("trusted_user_intent") or "").strip()
+            inherit_scope = bool(prior_intent)
         if prior_intent and not _is_clarification_answer(message):
             prior_intent = ""
+            inherit_scope = False
         trusted_intent = (
             f"{prior_intent}\n{message}".strip()
             if prior_intent and prior_intent != message.strip()
             else message
+        )
+        # 授权范围只由可信意图生成；文件正文/工具输出/模型输出不会进入这里。
+        scope = resolve_authorization_scope(
+            thread_id=thread_id,
+            request_id=run_id,
+            intent=trusted_intent,
+            previous=previous,
+            inherit=inherit_scope,
         )
         conversation = list(previous.get("conversation") or [])
         conversation.append({"role": "user", "content": message, "run_id": run_id})
@@ -1105,11 +1407,17 @@ class AgentRuntime:
             "reflection": {},
             "batch_approved": False,
             "batch_rejected": False,
+            "approved_batch": None,
             "trusted_user_intent": trusted_intent,
             "untrusted_file_data": [],
             "tool_observations": [],
             "mutations": {"move": 0, "rename": 0, "delete": 0},
             "approved_mutation_limit": 0,
+            "authorization_scope": scope.to_dict(),
+            "request_id": run_id,
+            "request_digest": scope.request_digest,
+            "consumed_approvals": [],
+            "rejected_approval_signatures": [],
             "conversation": conversation,
             "last_scan": last_scan,
             "run_trace": {
@@ -1120,15 +1428,24 @@ class AgentRuntime:
             },
         }
         # updates：逐节点状态增量；messages：LLM token 流（点亮 P1-4 的 token 事件）。
+        # 初始状态同样会写进 checkpoint（用户可能把密钥粘进消息里），落盘前统一脱敏；
+        # 授权范围与指纹在此之前已经生成，脱敏不影响授权判定。
         return self.graph.stream(
-            initial, self.config(thread_id), stream_mode=["updates", "messages"]
+            _redact_state(initial), self.config(thread_id), stream_mode=["updates", "messages"]
         )
 
     def resume_stream(
-        self, thread_id: str, decision: Literal["approve", "reject"]
+        self,
+        thread_id: str,
+        decision: Literal["approve", "reject"],
+        *,
+        confirm_token: str = "",
     ) -> Iterable[Dict[str, Any]]:
+        payload: Dict[str, Any] = {"decision": decision}
+        if confirm_token:
+            payload["token"] = confirm_token
         return self.graph.stream(
-            Command(resume={"decision": decision}),
+            Command(resume=payload),
             self.config(thread_id),
             stream_mode=["updates", "messages"],
         )
@@ -1148,12 +1465,12 @@ class AgentRuntime:
         )
         self.graph.update_state(
             self.config(thread_id),
-            {
+            _redact_state({
                 "status": "cancelled",
                 "pending_approval": None,
                 "outcome": "cancelled",
                 "stop_reason": "cancelled",
                 "completion": completion,
                 "final_response": completion["message"],
-            },
+            }),
         )

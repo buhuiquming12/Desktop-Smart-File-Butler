@@ -221,6 +221,16 @@ export class ApiClient {
     return this.request('/api/settings/llm', { method: 'PUT', body: JSON.stringify(update) });
   }
 
+  /** 显式清除本地 API Key（SecretStore + 历史明文残留）。响应仍然只含布尔状态。 */
+  clearLLMKey(): Promise<LLMSettings & { cleared: boolean }> {
+    return this.request('/api/settings/llm/key', { method: 'DELETE' });
+  }
+
+  /** 重试“历史明文 Key → 本地 SecretStore”的迁移，返回脱敏诊断。 */
+  retrySecretMigration(): Promise<{ migration: { status: string; message: string }; api_key_storage: unknown }> {
+    return this.request('/api/settings/llm/key/migrate', { method: 'POST' });
+  }
+
   listLLMModels(request: LLMModelsRequest): Promise<LLMModelsResponse> {
     return this.request('/api/settings/llm/models', { method: 'POST', body: JSON.stringify(request) });
   }

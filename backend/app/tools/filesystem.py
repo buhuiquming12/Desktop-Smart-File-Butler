@@ -52,6 +52,7 @@ from ..db import log_operation
 from ..logging_conf import get_logger
 from ..models import FileMeta, OperationLog
 from ..security import SandboxViolation, resolve_in_sandbox, sandbox_root_for
+from ..security.secrets import redact_text
 from .path_locks import path_locks
 
 logger = get_logger(__name__)
@@ -290,7 +291,8 @@ def move_file(
             _note_index_move(str(src_path), str(dest))
             return str(dest)
         except OSError as exc:
-            log_operation("move", str(src_path), "failed", dest=str(dest), detail=str(exc))
+            # 审计记录同样落盘：异常文本先脱敏，避免密钥随 OSError 进入数据库。
+            log_operation("move", str(src_path), "failed", dest=str(dest), detail=redact_text(str(exc)))
             raise
 
 
@@ -315,7 +317,7 @@ def rename_file(src: str, new_name: str, *, ensure_unique: bool = True) -> str:
             _note_index_move(str(src_path), str(dest))
             return str(dest)
         except OSError as exc:
-            log_operation("rename", str(src_path), "failed", dest=str(dest), detail=str(exc))
+            log_operation("rename", str(src_path), "failed", dest=str(dest), detail=redact_text(str(exc)))
             raise
 
 
@@ -338,7 +340,7 @@ def delete_file(path: str) -> str:
         _note_index_removed(str(target))
         return str(dest)
     except OSError as exc:
-        log_operation("delete", str(target), "failed", detail=str(exc))
+        log_operation("delete", str(target), "failed", detail=redact_text(str(exc)))
         raise
 
 

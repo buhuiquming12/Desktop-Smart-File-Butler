@@ -39,6 +39,9 @@ class Settings(BaseSettings):
     # 存储
     db_path: str = "./data/butler.db"
     log_dir: str = "./logs"
+    # 本地密钥（Windows DPAPI 密文）目录；留空时跟随数据库目录下的 secrets/。
+    # 密钥永远不会写进 SQLite 明文，见 app/security/secrets.py。
+    secret_store_dir: str = ""
 
     # 服务
     host: str = "127.0.0.1"

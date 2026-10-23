@@ -8,6 +8,7 @@ from typing import Any, Awaitable, Callable, Dict, Iterable, Optional, Tuple
 
 from ..agent import tracing
 from ..models import WSEvent, WSEventType
+from ..security.secrets import redact_payload
 
 
 def next_update(iterator: Iterable[Dict[str, Any]]) -> Tuple[bool, Optional[Dict[str, Any]]]:
@@ -18,7 +19,12 @@ def next_update(iterator: Iterable[Dict[str, Any]]) -> Tuple[bool, Optional[Dict
 
 
 def event(event_type: WSEventType, thread_id: str, **payload: Any) -> WSEvent:
-    return WSEvent(type=event_type, thread_id=thread_id, payload=payload)
+    # 统一出口脱敏；事件里不应出现密钥，这里是最后一道防线。
+    return WSEvent(
+        type=event_type,
+        thread_id=thread_id,
+        payload=redact_payload(payload),
+    )
 
 
 async def emit_update(
@@ -103,6 +109,7 @@ _OUTCOME_LABELS = {
     "failed": "失败",
     "rejected": "已拒绝",
     "cancelled": "已取消",
+    "goal_unmet": "目标未达成",
     "budget_exhausted": "预算耗尽",
     "needs_clarification": "待补充信息",
     "unknown": "无法确认",

@@ -13,9 +13,10 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from .. import db
 from ..logging_conf import get_logger
 from ..models import ScheduledJob
+from ..policy.authorization import AuthorizationScope, authorize_tool_call
 from ..security import resolve_in_sandbox
 from ..tools import categories, classify, extract, filesystem, indexer, manifests, naming, preview, scheduler
-from ..tools.contracts import validate_tool_args
+from ..tools.contracts import TOOL_CONTRACTS, validate_tool_args
 from ..tools.path_locks import path_locks
 
 logger = get_logger(__name__)
@@ -72,7 +73,11 @@ class ToolExecutor:
         return calls
 
     def execute(
-        self, step: Dict[str, Any], *, model_call_limit: Optional[int] = None
+        self,
+        step: Dict[str, Any],
+        *,
+        model_call_limit: Optional[int] = None,
+        authorization_scope: Optional[Any] = None,
     ) -> Dict[str, Any]:
         tool = str(step.get("tool", ""))
         # 每次执行都重设额度：limit=None 表示不限制（测试与直接调用）。
@@ -87,6 +92,28 @@ class ToolExecutor:
             logger.warning("工具参数校验失败 tool=%s error=%s args=%s", tool, argument_error, raw_args)
             return self.observation(step, "failed", error=argument_error)
         args = normalized_args or {}
+        # 纵深防御：即使调用方绕过 PolicyEngine，带 scope 的执行也会再次校验授权契约。
+        scope: Optional[AuthorizationScope] = None
+        if authorization_scope:
+            scope = (
+                authorization_scope
+                if isinstance(authorization_scope, AuthorizationScope)
+                else AuthorizationScope.from_dict(authorization_scope)
+            )
+        contract = TOOL_CONTRACTS.get(tool)
+        # 变更类工具必须携带**有效**授权范围：此前 ``if authorization_scope`` 会让
+        # None / {} 直接跳过校验，直接调用执行器就能删文件，第二层防线等于不存在。
+        if contract is not None and contract.side_effect != "read" and scope is None:
+            logger.warning("工具执行被拒绝 tool=%s code=missing_scope", tool)
+            return self.observation(
+                step, "failed", error="缺少授权范围（authorization_scope），未授权该工具执行"
+            )
+        if scope is not None:
+            proposed = self._proposed_count(tool, args)
+            check = authorize_tool_call(scope, tool, args, proposed_count=proposed)
+            if not check.allowed:
+                logger.warning("工具执行被授权契约拒绝 tool=%s code=%s", tool, check.code)
+                return self.observation(step, "failed", error=check.reason)
         try:
             if tool == "scan_directory":
                 scan = filesystem.scan_directory(
@@ -141,7 +168,7 @@ class ToolExecutor:
                     "reason": str(args.get("reason") or ""),
                 }
             elif tool == "preview_batch":
-                result = self.preview_batch(args)
+                result = self.preview_batch(args, authorization_scope=authorization_scope)
             elif tool == "search_content":
                 result = indexer.search(
                     str(args["query"]),
@@ -156,6 +183,20 @@ class ToolExecutor:
         except Exception as exc:  # noqa: BLE001
             logger.exception("工具执行失败 tool=%s args=%s", tool, args)
             return self.observation(step, "failed", error=str(exc))
+
+    @staticmethod
+    def _proposed_count(tool: str, args: Dict[str, Any]) -> int:
+        """本次工具将影响的条目数；查询失败时按 1 处理（只会更保守地触发限制）。"""
+        if tool in {"batch_move", "batch_rename", "batch_classify"}:
+            try:
+                return len(
+                    manifests.match(
+                        str(args.get("scan_id") or ""), dict(args.get("filter") or {})
+                    )
+                )
+            except Exception:  # noqa: BLE001 - 无效 scan_id 由后续流程明确失败
+                return 1
+        return 1
 
     @staticmethod
     def batch_result(
@@ -337,7 +378,9 @@ class ToolExecutor:
         })
         return result
 
-    def preview_batch(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    def preview_batch(
+        self, args: Dict[str, Any], *, authorization_scope: Optional[Any] = None
+    ) -> Dict[str, Any]:
         """生成预览（只读）并把 preview_id 交给界面处理。"""
         op = str(args.get("op"))
         spec: Dict[str, Any] = {
@@ -374,7 +417,18 @@ class ToolExecutor:
             content_budget = preview.DEFAULT_CONTENT_BUDGET
         else:
             content_budget = max(0, min(preview.DEFAULT_CONTENT_BUDGET, int(limit) - used))
-        page = preview.create(spec, llm=self.llm, content_budget=content_budget)
+        page = preview.create(
+            spec,
+            llm=self.llm,
+            content_budget=content_budget,
+            authorization_scope=(
+                authorization_scope
+                if isinstance(authorization_scope, dict)
+                else authorization_scope.to_dict()
+                if isinstance(authorization_scope, AuthorizationScope)
+                else None
+            ),
+        )
         model_calls = int(page["counts"].get("model_calls", 0))
         self._model_usage.calls = used + model_calls
         return {

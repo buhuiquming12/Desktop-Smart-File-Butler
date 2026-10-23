@@ -17,6 +17,7 @@ from app.agent.outcome import collect_stats, evaluate_completion
 from app.agent.state import PlanOutput, PlanStep, ReflectionOutput
 from app.config import get_settings
 from app.tools import manifests
+from scopes import scope_for
 
 
 def _batch_obs(matched: int, success: int, failed: int = 0, skipped: int = 0) -> dict:
@@ -244,11 +245,14 @@ def test_real_skipped_files_are_reported_as_partial(
     scan_id = scan["result"]["scan_id"]
     (source / "f-8.pdf").unlink()
     (source / "f-9.pdf").unlink()
-    moved = graph_module.ToolExecutor().execute({
-        "id": "m", "tool": "batch_move",
-        "args": {"scan_id": scan_id, "filter": {"extensions": ["pdf"]},
-                 "dest_dir": str(tmp_path / "out")},
-    })
+    moved = graph_module.ToolExecutor().execute(
+        {
+            "id": "m", "tool": "batch_move",
+            "args": {"scan_id": scan_id, "filter": {"extensions": ["pdf"]},
+                     "dest_dir": str(tmp_path / "out")},
+        },
+        authorization_scope=scope_for(source, target_roots=[tmp_path / "out"]),
+    )
     completion = evaluate_completion({
         "observations": [scan, moved],
         "plan": [{"id": "m", "tool": "batch_move", "description": "移动全部"}],

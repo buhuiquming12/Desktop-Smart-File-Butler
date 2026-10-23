@@ -11,6 +11,7 @@ from app import db
 from app.agent.tool_executor import ToolExecutor
 from app.config import get_settings
 from app.tools import filesystem, naming, preview
+from scopes import scope_for
 
 
 @pytest.fixture()
@@ -188,13 +189,16 @@ def test_batch_rename_tool_matches_preview(sandbox: Path) -> None:
         "find": "a", "replace": "A", "use_sequence": True, "sequence_padding": 2,
     })
     expected = sorted(item["target_name"] for item in page["items"])
-    result = executor.execute({
-        "id": "r", "tool": "batch_rename",
-        "args": {
-            "scan_id": scan_id, "find": "a", "replace": "A",
-            "sequence_start": 1, "sequence_padding": 2,
+    result = executor.execute(
+        {
+            "id": "r", "tool": "batch_rename",
+            "args": {
+                "scan_id": scan_id, "find": "a", "replace": "A",
+                "sequence_start": 1, "sequence_padding": 2,
+            },
         },
-    })["result"]
+        authorization_scope=scope_for(source),
+    )["result"]
     assert result["success"] == 2, result
     actual = sorted(path.name for path in source.iterdir())
     assert actual == expected

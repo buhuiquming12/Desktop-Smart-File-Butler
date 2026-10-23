@@ -264,7 +264,8 @@ export function PreviewPanel({ api, notify, onBack, initialPreviewId }: PreviewP
       // 否则 approval_required 刚弹出的确认框会被立刻清掉（超阈值批量永远点不下去）。
       setPending(null);
       const execution = await api.executePreview(
-        page.preview_id, ids, approval.approval_id, approval.overrides ?? appliedOverrides,
+        page.preview_id, ids, approval.confirm_token ?? approval.approval_id,
+        approval.overrides ?? appliedOverrides,
       );
       setResult(execution);
       setSelected(new Set());

@@ -81,8 +81,16 @@ class AgentState(TypedDict, total=False):
     ]
     replan_count: int
     error: str
+    # 强类型授权契约：只由后端根据原始用户意图生成，重规划不会重置。
+    authorization_scope: Dict[str, Any]
+    request_id: str
+    request_digest: str
+    consumed_approvals: List[str]
+    rejected_approval_signatures: List[str]
     batch_approved: bool          # 本计划的批量 move/rename 已获审批（P1-2）
     batch_rejected: bool          # 本计划的批量 move/rename 被拒绝，全部跳过
+    # 累计审批绑定的完整执行集合（源文件 / 目标 / 工具 / 已执行项），逐项核验用。
+    approved_batch: Optional[Dict[str, Any]]
     mutations: Dict[str, int]
     approved_mutation_limit: int
     # 独立于流程状态的“目标完成度”；status 表示流程在哪终止，outcome 表示目标结果。

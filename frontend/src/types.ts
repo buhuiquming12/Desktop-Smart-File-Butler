@@ -125,10 +125,25 @@ export interface LLMSettings {
   provider: LLMProvider;
   openai_base_url: string;
   openai_model: string;
+  /** 兼容字段：与 api_key_set 同义，只表示“是否已配置”，永远不含明文。 */
   openai_api_key_set: boolean;
+  /** 仅布尔状态：API Key 已保存到本地 SecretStore（DPAPI）。 */
+  api_key_set?: boolean;
+  /** 本地密钥存储元信息（后端类型/是否持久化/迁移诊断），绝不含密钥。 */
+  api_key_storage?: ApiKeyStorage;
   ollama_base_url: string;
   ollama_model: string;
   structured_output_mode: StructuredOutputMode;
+}
+
+/** 本地密钥存储状态：只描述后端与迁移结果，绝不包含密钥本身。 */
+export interface ApiKeyStorage {
+  configured: boolean;
+  source: 'secret_store' | 'env' | 'migration_failed' | 'unavailable' | 'unset' | string;
+  backend: string;
+  persistent: boolean;
+  migration?: { status: string; message: string; attempted: boolean };
+  diagnostic?: string;
 }
 
 export interface LLMSettingsUpdate {
@@ -435,10 +450,17 @@ export interface PreviewCreateInput {
 export interface PreviewConfirmResult {
   preview_id: string;
   approval_id: string;
+  /** 一次性确认 token（与 approval_id 同权限，执行时必须原样回传）。 */
+  confirm_token?: string;
   count: number;
   requires_approval: boolean;
   threshold: number;
   selection_digest: string;
+  /** 审批绑定：请求指纹、授权范围指纹、选中条目指纹与过期时间。 */
+  request_digest?: string;
+  authorization_scope_digest?: string;
+  selected_item_digest?: string;
+  expires_at?: number;
   /** 确认时绑定的最终落点（item_id → 目标路径）。 */
   targets?: Record<string, string>;
   /** 确认时提交并绑定的类别覆盖；执行时必须原样沿用。 */

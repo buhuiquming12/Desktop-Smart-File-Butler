@@ -18,6 +18,7 @@ from ..tools.contracts import (
     TOOL_CONTRACTS,
     validate_tool_args,
 )
+from .authorization import AuthorizationScope, authorize_tool_call
 
 
 _NEGATION_MARKERS = (
@@ -517,21 +518,76 @@ class PolicyEngine:
         proposed_count: int = 1,
         args: Optional[dict[str, Any]] = None,
     ) -> PolicyDecision:
-        kind = MUTATION_KIND.get(tool)
         contract = TOOL_CONTRACTS.get(tool)
         if contract is None:
             return PolicyDecision(False, False, f"未知工具或缺少工具契约: {tool}")
+        kind = MUTATION_KIND.get(tool)
         if kind is None:
             kind = contract.side_effect
 
-        # 参数校验发生在任何文件系统操作之前；无效参数不获得执行权限。
+        # ------------------------------------------------------------------
+        # 执行路径（带真实参数）：必须先通过强类型授权契约。
+        # 没有 scope = 没有授权，直接拒绝；未知工具/非法参数同样先于任何副作用。
+        # ------------------------------------------------------------------
         if args is not None:
-            _, error = validate_tool_args(tool, args)
+            normalized, error = validate_tool_args(tool, args)
             if error:
                 return PolicyDecision(
                     False, False, error, kind, max(0, int(proposed_count)), kind
                 )
+            scope = AuthorizationScope.from_dict(state.get("authorization_scope"))
+            expected_digest = str(state.get("request_digest") or "")
+            if scope is None:
+                return PolicyDecision(
+                    False,
+                    False,
+                    "缺少授权范围（authorization_scope），未授权该工具执行",
+                    kind,
+                    max(0, int(proposed_count)),
+                    kind,
+                )
+            if expected_digest and scope.request_digest != expected_digest:
+                return PolicyDecision(
+                    False,
+                    False,
+                    "授权范围与当前请求不匹配，拒绝执行该工具",
+                    kind,
+                    max(0, int(proposed_count)),
+                    kind,
+                )
+            check = authorize_tool_call(
+                scope,
+                tool,
+                normalized or {},
+                proposed_count=max(0, int(proposed_count)),
+            )
+            if not check.allowed:
+                return PolicyDecision(
+                    False, False, check.reason, kind, max(0, int(proposed_count)), kind
+                )
+            count = max(0, int(proposed_count))
+            if kind == "delete":
+                return PolicyDecision(True, True, "删除操作始终需要审批", kind, count, kind)
+            if kind not in CUMULATIVE_SIDE_EFFECTS:
+                return PolicyDecision(True, False, "", kind, count, kind)
+            total = self._cumulative_mutations(state) + count
+            approved_limit = int(state.get("approved_mutation_limit") or 0)
+            needs = total > self.batch_threshold and total > approved_limit
+            return PolicyDecision(
+                True,
+                needs,
+                f"本次请求累计文件变更将达到 {total} 项（阈值 {self.batch_threshold}）"
+                if needs
+                else "",
+                kind,
+                count,
+                kind,
+            )
 
+        # ------------------------------------------------------------------
+        # 仅策略探测（args 为 None）：保留给既有单测/离线判定的兼容路径。
+        # 真正执行文件的调用方（Agent 图、工具执行器）一律带 args 走上面的强校验。
+        # ------------------------------------------------------------------
         if kind == "read":
             return PolicyDecision(True, False, "", kind, max(0, int(proposed_count)), kind)
 

@@ -9,6 +9,7 @@ from app.agent.outcome import evaluate_completion, record_verification
 from app.agent.tool_executor import ToolExecutor
 from app.config import get_settings
 from app.policy.engine import intent_effects
+from scopes import scope_for
 
 
 @pytest.mark.parametrize("message", [
@@ -68,7 +69,9 @@ def test_implicit_creation_satisfies_linked_goal(sandbox: Path, tool: str, user_
     else:
         scan = executor.execute({"tool": "scan_directory", "args": {"directory": str(source)}})
         args = {"scan_id": scan["result"]["scan_id"], "dest_dir": str(target)}
-    moved = record_verification(executor.execute({"tool": tool, "args": args}))
+    moved = record_verification(
+        executor.execute({"tool": tool, "args": args}, authorization_scope=scope_for(sandbox))
+    )
     assert moved["status"] == "ok"
     assert target.is_dir() and (target / "a.pdf").is_file()
     completion = evaluate_completion({"trusted_user_intent": user_intent, "observations": [moved]})
@@ -84,9 +87,10 @@ def test_implicit_creation_satisfies_linked_goal(sandbox: Path, tool: str, user_
 def test_other_directory_cannot_satisfy_create_goal(sandbox: Path, user_intent: str) -> None:
     pdf = sandbox / "a.pdf"
     pdf.write_text("pdf", encoding="utf-8")
-    moved = record_verification(ToolExecutor().execute({
-        "tool": "move_file", "args": {"src": str(pdf), "dest_dir": str(sandbox / "out")},
-    }))
+    moved = record_verification(ToolExecutor().execute(
+        {"tool": "move_file", "args": {"src": str(pdf), "dest_dir": str(sandbox / "out")}},
+        authorization_scope=scope_for(sandbox),
+    ))
     completion = evaluate_completion({"trusted_user_intent": user_intent, "observations": [moved]})
     assert completion["unmet_effects"] == ["create"]
     assert completion["outcome"] == "partial"
@@ -96,9 +100,10 @@ def test_disappeared_implicit_directory_is_not_completed(sandbox: Path) -> None:
     pdf = sandbox / "a.pdf"
     pdf.write_text("pdf", encoding="utf-8")
     target = sandbox / "backup"
-    moved = record_verification(ToolExecutor().execute({
-        "tool": "move_file", "args": {"src": str(pdf), "dest_dir": str(target)},
-    }))
+    moved = record_verification(ToolExecutor().execute(
+        {"tool": "move_file", "args": {"src": str(pdf), "dest_dir": str(target)}},
+        authorization_scope=scope_for(sandbox),
+    ))
     (target / "a.pdf").rename(sandbox / "elsewhere.pdf")
     target.rmdir()
     completion = evaluate_completion({
@@ -116,9 +121,10 @@ def test_explicit_directory_path_must_match(sandbox: Path, correct_target: bool,
     pdf.write_text("pdf", encoding="utf-8")
     requested = sandbox / ("backup folder" if quoted else "backup")
     actual = requested if correct_target else sandbox / "other"
-    moved = record_verification(ToolExecutor().execute({
-        "tool": "move_file", "args": {"src": str(pdf), "dest_dir": str(actual)},
-    }))
+    moved = record_verification(ToolExecutor().execute(
+        {"tool": "move_file", "args": {"src": str(pdf), "dest_dir": str(actual)}},
+        authorization_scope=scope_for(sandbox),
+    ))
     target_text = f'"{requested}"' if quoted else str(requested)
     completion = evaluate_completion({
         "trusted_user_intent": f"新建 {target_text} 文件夹，然后把 PDF 移动进去",

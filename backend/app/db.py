@@ -356,23 +356,88 @@ def delete_preference(key: str) -> bool:
 
 
 def all_preferences() -> List[Preference]:
-    """返回用户偏好。以 __ 开头的保留键（如内部沙箱配置）不对外暴露、也不喂给规划器。"""
+    """返回用户偏好。以 __ 开头的保留键（如内部沙箱配置）不对外暴露、也不喂给规划器。
+
+    密钥类键（历史版本可能误存）同样不返回：密钥只能存在于 SecretStore。
+    """
+    from .security.secrets import is_secret_name
+
     with _conn() as c:
         rows = c.execute("SELECT key, value FROM preferences").fetchall()
     return [
         Preference(key=r["key"], value=r["value"])
         for r in rows
-        if not r["key"].startswith("__")
+        if not r["key"].startswith("__") and not is_secret_name(str(r["key"]))
     ]
 
 
 # ---------- 模型配置（前端可写，覆盖 .env 默认值） ----------
 
 def get_llm_config() -> dict[str, str]:
-    """返回所有已保存的模型配置覆盖项（键值对）。"""
+    """返回所有可安全展示的模型配置覆盖项（键值对）。
+
+    **绝不返回密钥类字段**：历史版本曾把 API Key 明文写进 ``llm_config``，
+    这里统一过滤，避免任何调用方（接口、日志、诊断、规划器）顺手把明文带出去。
+    迁移逻辑通过 ``get_llm_config_value`` 单独读取旧值。
+    """
+    from .security.secrets import is_secret_name
+
     with _conn() as c:
         rows = c.execute("SELECT key, value FROM llm_config").fetchall()
-    return {r["key"]: r["value"] for r in rows}
+    return {
+        r["key"]: r["value"]
+        for r in rows
+        if not is_secret_name(str(r["key"]))
+    }
+
+
+def get_llm_config_value(key: str) -> Optional[str]:
+    """读取单个配置原始值（含历史明文密钥），仅供受控迁移代码使用。"""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT value FROM llm_config WHERE key=?", (key,)
+        ).fetchone()
+    return row["value"] if row else None
+
+
+def delete_llm_config_key(key: str) -> bool:
+    """删除单个配置覆盖项，返回是否确有删除（用于迁移成功后清理明文）。"""
+    with _conn() as c:
+        cursor = c.execute("DELETE FROM llm_config WHERE key=?", (key,))
+    return cursor.rowcount > 0
+
+
+def scrub_llm_config_plaintext(keys: tuple[str, ...] = ("openai_api_key",)) -> None:
+    """彻底抹掉 ``llm_config`` 里历史明文密钥的残留字节。
+
+    仅 ``DELETE`` 行是不够的：SQLite 只把页标记为空闲，旧内容仍留在数据库文件
+    （以及 WAL）里，用文本搜索就能捞回密钥。因此这里：
+
+    1. 用 ``PRAGMA secure_delete=ON`` 的连接删除残留行（删除时把内容清零）；
+    2. 执行 ``VACUUM`` 重写整库，丢弃空闲页；
+    3. ``wal_checkpoint(TRUNCATE)`` 清空 WAL，避免旧页仍留在旁文件里。
+
+    该函数必须在没有活动事务的独立连接上执行（VACUUM 不能在事务内运行）。
+    任何失败都只记警告：清理失败不应阻止迁移成功后的正常使用，但会留下诊断。
+    """
+    import sqlite3 as _sqlite3
+
+    settings = get_settings()
+    try:
+        conn = _sqlite3.connect(settings.db_path, timeout=10, isolation_level=None)
+    except _sqlite3.Error as exc:
+        logger.warning("无法打开数据库以清理历史明文密钥残留: %s", type(exc).__name__)
+        return
+    try:
+        conn.execute("PRAGMA secure_delete=ON")
+        for key in keys:
+            conn.execute("DELETE FROM llm_config WHERE key=?", (key,))
+        conn.execute("VACUUM")
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except _sqlite3.Error as exc:
+        logger.warning("清理历史明文密钥残留失败（不影响已完成的迁移）: %s", type(exc).__name__)
+    finally:
+        conn.close()
 
 
 def set_llm_config(values: dict[str, str]) -> None:

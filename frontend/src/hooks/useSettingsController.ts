@@ -94,6 +94,19 @@ export function useSettingsController(
     [api],
   );
 
+  /** 清除本地 API Key（后端写入 SecretStore 的那一份，同时清理历史明文）。 */
+  const clearLLMKey = useCallback(async (): Promise<void> => {
+    setError(null);
+    try {
+      const saved = await api.clearLLMKey();
+      setLLMSettings(saved);
+      void refreshSetupCheck();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '清除本地密钥失败');
+      throw reason;
+    }
+  }, [api, refreshSetupCheck]);
+
   const saveSandbox = useCallback(async (roots: string[]): Promise<void> => {
     setError(null);
     try {
@@ -220,6 +233,7 @@ export function useSettingsController(
     show,
     load,
     saveLLM,
+    clearLLMKey,
     fetchModels,
     saveSandbox,
     saveWorkspace,

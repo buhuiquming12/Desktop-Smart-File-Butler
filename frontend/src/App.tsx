@@ -342,6 +342,7 @@ export function App() {
     show: openSettings,
     load: loadSettingsData,
     saveLLM,
+    clearLLMKey,
     fetchModels,
     saveSandbox,
     saveWorkspace,
@@ -722,6 +723,7 @@ export function App() {
         onClose={closeSettings}
         onSaveEndpoints={saveEndpoints}
         onSaveLLM={saveLLM}
+        onClearLLMKey={clearLLMKey}
         onSaveSandbox={saveSandbox}
         onSaveWorkspace={saveWorkspace}
         onSaveTools={saveTools}

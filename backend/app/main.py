@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
@@ -34,6 +35,7 @@ from .agent.graph import AgentRuntime
 from .agent import tracing
 from .config import get_settings
 from .logging_conf import get_logger, setup_logging
+from .security.secrets import redact_payload, redact_text
 from .models import (
     ApprovalResponse,
     ChatRequest,
@@ -42,6 +44,7 @@ from .models import (
 )
 from .runtime import threads as thread_registry
 from .tools import scheduler, watcher
+from .policy.approval import verify_pending_approval
 
 settings = get_settings()
 setup_logging(settings.log_dir)
@@ -125,6 +128,14 @@ def _scheduled_runner(directory: str, instruction: str) -> None:
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     global _main_loop
     db.init_db()
+    # 历史版本可能把 API Key 明文写进 SQLite：启动时尝试一次迁移。失败只保留
+    # 诊断（密钥不落日志），不会删除旧值，也不会阻止服务启动。
+    try:
+        from . import llm_config
+
+        llm_config.migrate_legacy_api_key()
+    except Exception:  # noqa: BLE001 - 迁移失败不能拖垮启动
+        logger.exception("本地密钥迁移初始化失败")
     _main_loop = asyncio.get_running_loop()
     _write_session_file()
     scheduler.init_scheduler(_scheduled_runner)
@@ -189,6 +200,24 @@ async def _auth_guard(request: Request, call_next: Any) -> Any:
 app.include_router(build_management_router(reset_runtime))
 
 
+# 参数校验错误的默认响应会把 ``input``（用户原始输入）原样回显：提交一个超长的
+# openai_api_key 时，密钥会出现在 422 响应体、前端错误记录与日志里。这里统一在出口
+# 去掉 input / ctx / url，只保留错误位置与原因。
+@app.exception_handler(RequestValidationError)
+async def _validation_error_handler(
+    _request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    cleaned = [
+        {
+            key: value
+            for key, value in error.items()
+            if key not in {"input", "ctx", "url"}
+        }
+        for error in exc.errors()
+    ]
+    return JSONResponse(status_code=422, content={"detail": cleaned})
+
+
 def _preview_llm() -> Any:
     """预览的内容分类使用当前运行时模型；模型未配置时返回 None（自动回退到扩展名）。"""
     try:
@@ -209,7 +238,9 @@ def _next_update(iterator: Iterable[Dict[str, Any]]) -> Tuple[bool, Optional[Dic
 
 
 def _event(event_type: WSEventType, thread_id: str, **payload: Any) -> WSEvent:
-    return WSEvent(type=event_type, thread_id=thread_id, payload=payload)
+    # 所有 WebSocket 事件统一出口脱敏：即使某处误把密钥放进 payload（工具参数、
+    # 异常文本、诊断信息），也不会推送到前端。
+    return WSEvent(type=event_type, thread_id=thread_id, payload=redact_payload(payload))
 
 
 async def _fail_terminal(
@@ -235,8 +266,8 @@ async def _fail_terminal(
             status="failed",
             outcome="failed",
             stop_reason="exception",
-            message=message,
-            error=detail or message,
+            message=redact_text(message),
+            error=redact_text(detail or message),
             summary=ws_events.build_task_summary([]),
         )
         if broadcast:
@@ -463,7 +494,36 @@ async def _resume_approval(
 
             cancelling = cancelling or response.thread_id in _cancel_requested
             decision = "reject" if cancelling else response.decision.value
-            iterator = runtime.resume_stream(response.thread_id, decision)
+            token = (response.confirm_token or response.approval_id or "").strip()
+            if decision == "approve":
+                # 审批绑定：请求/范围/选择/源文件/目标冲突任何一项变化都返回 409，
+                # 绝不继续执行“看起来差不多”的操作。
+                check = verify_pending_approval(
+                    pending, state=state, confirm_token=token
+                )
+                if not check.ok:
+                    db.log_operation(
+                        str(pending.get("action") or "approval"),
+                        str(pending.get("target") or ""),
+                        "rejected",
+                        detail=f"审批执行前校验失败（{check.code}）：{check.message}"[:500],
+                        thread_id=response.thread_id,
+                    )
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "message": check.message,
+                            "code": check.code,
+                            **check.detail,
+                        },
+                    )
+            iterator = (
+                runtime.resume_stream(
+                    response.thread_id, decision, confirm_token=token
+                )
+                if decision == "approve"
+                else runtime.resume_stream(response.thread_id, decision)
+            )
         except HTTPException as exc:
             if fallback_client is None:
                 raise
@@ -536,11 +596,11 @@ def thread_state(thread_id: str) -> Dict[str, Any]:
     state = get_runtime().state(thread_id)
     if not state:
         raise HTTPException(status_code=404, detail="会话不存在")
-    return {
+    return redact_payload({
         **state,
         "summary": ws_events.build_task_summary(state.get("observations", []), state),
         "usage": tracing.usage_for(thread_id),
-    }
+    })
 
 
 @app.post("/api/threads/{thread_id}/cancel", status_code=status.HTTP_202_ACCEPTED)
@@ -552,6 +612,10 @@ async def cancel_thread(thread_id: str) -> Dict[str, str]:
     return {"thread_id": thread_id, "status": "cancelling"}
 
 
+def _approval_conflict_detail(check: Any) -> Dict[str, Any]:
+    return {"message": check.message, "code": check.code, **check.detail}
+
+
 @app.post("/api/approvals/respond", status_code=status.HTTP_202_ACCEPTED)
 async def approval(response: ApprovalResponse) -> Dict[str, str]:
     # REST 调用没有可靠的客户端映射；调用方可随后查询 thread 状态。
@@ -561,6 +625,24 @@ async def approval(response: ApprovalResponse) -> Dict[str, str]:
         raise HTTPException(status_code=409, detail="该会话没有待审批操作")
     if pending.get("approval_id") != response.approval_id:
         raise HTTPException(status_code=409, detail="审批已过期或不匹配")
+    if response.decision.value == "approve":
+        # 同步校验审批绑定：REST 是 202 + 后台执行，若只在后台校验，调用方拿不到 409。
+        check = verify_pending_approval(
+            pending,
+            state=state,
+            confirm_token=(response.confirm_token or response.approval_id),
+        )
+        if not check.ok:
+            db.log_operation(
+                str(pending.get("action") or "approval"),
+                str(pending.get("target") or ""),
+                "rejected",
+                detail=f"审批执行前校验失败（{check.code}）：{check.message}"[:500],
+                thread_id=response.thread_id,
+            )
+            raise HTTPException(
+                status_code=409, detail=_approval_conflict_detail(check)
+            )
     _track(_resume_approval(response))
     return {"thread_id": response.thread_id, "status": "accepted"}
 
@@ -616,6 +698,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str) -> None:
                         thread_id=message.get("thread_id", ""),
                         approval_id=message.get("approval_id", ""),
                         decision=message.get("decision", ""),
+                        confirm_token=message.get("confirm_token"),
                     )
                     state = get_runtime().state(response.thread_id)
                     pending = state.get("pending_approval") or {}
@@ -629,7 +712,31 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str) -> None:
                             ),
                         )
                     else:
-                        _track(_resume_approval(response, client_id))
+                        check = (
+                            verify_pending_approval(
+                                pending,
+                                state=state,
+                                confirm_token=(
+                                    response.confirm_token or response.approval_id
+                                ),
+                            )
+                            if response.decision.value == "approve"
+                            else None
+                        )
+                        if check is not None and not check.ok:
+                            # 与 REST 一致：审批绑定失效时明确报错，绝不继续执行。
+                            await connections.send(
+                                client_id,
+                                _event(
+                                    WSEventType.error,
+                                    response.thread_id,
+                                    message=check.message,
+                                    code=check.code,
+                                    **check.detail,
+                                ),
+                            )
+                        else:
+                            _track(_resume_approval(response, client_id))
                 elif message_type == "cancel":
                     cancel_thread_id = message.get("thread_id", "")
                     if cancel_thread_id and _request_cancel(cancel_thread_id):

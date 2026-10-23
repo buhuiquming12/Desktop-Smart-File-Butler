@@ -2,13 +2,15 @@
 
 所有文件工具在触碰磁盘前，必须先经过 ``resolve_in_sandbox`` 校验，
 确保目标路径落在用户授权的根目录内，越界立即抛出 ``SandboxViolation``。
+
+本地密钥存储见子模块 ``app.security.secrets``（Windows DPAPI / 可注入测试替身）。
 """
 from __future__ import annotations
 
 from pathlib import Path
 from typing import List
 
-from .logging_conf import get_logger
+from ..logging_conf import get_logger
 
 logger = get_logger(__name__)
 
@@ -19,7 +21,7 @@ class SandboxViolation(Exception):
 
 def _sandbox_roots() -> List[Path]:
     # 有效根目录 = DB 覆盖（前端界面可配）优先，否则 .env 默认（见 P1-3）。
-    from .sandbox_config import effective_roots
+    from ..sandbox_config import effective_roots
 
     roots = effective_roots()
     if not roots:

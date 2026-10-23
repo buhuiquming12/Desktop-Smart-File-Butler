@@ -9,6 +9,7 @@ from fastapi import APIRouter, HTTPException, Query, status
 
 from .. import db, external_tools_config, llm_config, sandbox_config, workspace_config
 from ..config import get_settings
+from ..security.secrets import SecretStoreError, SecretStoreUnavailable
 from ..models import (
     JobCreate,
     LLMModelsRequest,
@@ -41,10 +42,14 @@ def build_management_router(reset_runtime: Callable[[], None]) -> APIRouter:
     def public_config() -> Dict[str, Any]:
         config = llm_config.get_effective_config()
         ocr = extract.ocr_capability()
+        key_set = bool(config.openai_api_key)
         return {
             "model_provider": config.provider,
             "openai_model": config.openai_model,
-            "openai_api_key_set": bool(config.openai_api_key),
+            # 只暴露布尔状态：密钥本身永不进入 API 响应。
+            "api_key_set": key_set,
+            "openai_api_key_set": key_set,
+            "api_key_storage": llm_config.api_key_info(),
             "ollama_model": config.ollama_model,
             "ollama_base_url": config.ollama_base_url,
             "sandbox_roots": [str(path) for path in sandbox_config.effective_roots()],
@@ -130,11 +135,15 @@ def build_management_router(reset_runtime: Callable[[], None]) -> APIRouter:
     @router.get("/settings/llm")
     def get_llm_settings() -> Dict[str, Any]:
         config = llm_config.get_effective_config()
+        key_set = bool(config.openai_api_key)
         return {
             "provider": config.provider,
             "openai_base_url": config.openai_base_url,
             "openai_model": config.openai_model,
-            "openai_api_key_set": bool(config.openai_api_key),
+            "api_key_set": key_set,
+            # 兼容既有前端字段；两者语义相同，都只是布尔值。
+            "openai_api_key_set": key_set,
+            "api_key_storage": llm_config.api_key_info(),
             "ollama_base_url": config.ollama_base_url,
             "ollama_model": config.ollama_model,
             "structured_output_mode": config.structured_output_mode,
@@ -143,6 +152,8 @@ def build_management_router(reset_runtime: Callable[[], None]) -> APIRouter:
     @router.put("/settings/llm")
     def update_llm_settings(body: LLMSettingsUpdate) -> Dict[str, Any]:
         provided = body.model_dump(exclude_unset=True)
+        # 密钥单独处理：写入 SecretStore，绝不进入 llm_config 表。
+        api_key = provided.pop("openai_api_key", None)
         if "provider" in provided and provided["provider"]:
             provider = str(provided["provider"]).lower()
             if provider not in ("openai", "ollama"):
@@ -156,11 +167,48 @@ def build_management_router(reset_runtime: Callable[[], None]) -> APIRouter:
                     detail="structured_output_mode 仅支持 auto 或 prompt",
                 )
             provided["structured_output_mode"] = mode
-        llm_config.save_overrides({
-            key: value if value is not None else "" for key, value in provided.items()
-        })
+        if api_key is not None:
+            value = str(api_key).strip()
+            try:
+                if value:
+                    llm_config.set_api_key(value)
+                else:
+                    # 显式传空串 = 清除已保存的密钥（回退 .env / 未配置）。
+                    llm_config.clear_api_key()
+            except SecretStoreUnavailable as exc:
+                # 存储不可用时 fail closed：不写入任何明文，并返回可操作诊断。
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
+            except (SecretStoreError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=503, detail=f"本地密钥存储写入失败：{exc}"
+                ) from exc
+        try:
+            llm_config.save_overrides({
+                key: value if value is not None else "" for key, value in provided.items()
+            })
+        except SecretStoreError as exc:
+            raise HTTPException(status_code=503, detail=f"本地密钥存储不可用：{exc}") from exc
         reset_runtime()
         return get_llm_settings()
+
+    @router.delete("/settings/llm/key")
+    def clear_llm_api_key() -> Dict[str, Any]:
+        """显式清除本地 API Key（同时清理历史明文记录）。"""
+        try:
+            removed = llm_config.clear_api_key()
+        except SecretStoreUnavailable:
+            # 存储不可用时仍允许清理数据库中的历史明文；clear_api_key 已尝试过。
+            removed = False
+        except SecretStoreError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        reset_runtime()
+        return {"cleared": bool(removed), **get_llm_settings()}
+
+    @router.post("/settings/llm/key/migrate")
+    def retry_secret_migration() -> Dict[str, Any]:
+        """显式重试“历史明文 → 本地密钥存储”迁移，返回脱敏诊断。"""
+        status = llm_config.migrate_legacy_api_key(force=True)
+        return {"migration": status, "api_key_storage": llm_config.api_key_info()}
 
     @router.post("/settings/llm/models")
     async def list_llm_models(body: LLMModelsRequest) -> Dict[str, Any]:

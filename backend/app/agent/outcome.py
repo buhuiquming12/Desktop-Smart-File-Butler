@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
 from ..policy.engine import explicit_intent_effects, intent_effects
+from ..policy.authorization import extract_paths
 from ..tools.contracts import TOOL_CONTRACTS
 
 OUTCOMES = (
@@ -20,10 +21,15 @@ OUTCOMES = (
     "failed",
     "rejected",
     "cancelled",
+    "goal_unmet",
     "budget_exhausted",
     "needs_clarification",
     "unknown",
 )
+
+# 用户明确要求、但本次运行完全没有发生的“目标性”文件变更。扫描/摘要/只读查询
+# 只产生 read 副作用，永远不能满足这些目标（见 _unmet_effects）。
+_GOAL_EFFECTS = frozenset({"move", "rename", "delete"})
 
 _BATCH_TOOLS = {"batch_move", "batch_rename", "batch_classify"}
 _SINGLE_FILE_TOOLS = {"move_file", "rename_file", "delete_file", "write_summary", "make_dir"}
@@ -170,7 +176,9 @@ def _implicit_directory_goal_met(intent: str, observations: list) -> bool:
     index = creates[0]
     tail = " ".join(clauses[index + 1:])
     if "move" not in intent_effects(tail) or re.search(
-        r"进去|其中|该目录|该文件夹|这个目录|这个文件夹|里面|\b(?:into|to)\s+it\b",
+        r"进去|其中|该目录|该文件夹|这个目录|这个文件夹|里面"
+        r"|那里|那儿|这里|这儿|该位置"
+        r"|\b(?:into|to)\s+(?:it|there)\b|\bthere\b",
         tail, re.IGNORECASE,
     ) is None:
         return False
@@ -178,10 +186,11 @@ def _implicit_directory_goal_met(intent: str, observations: list) -> bool:
     # 引号或拉丁名称表示明确命名，不能用任意一个新目录冒充。
     quoted_name = r'["“\x27]([^"”\x27]+)["”\x27]'
     names = re.findall(quoted_name, clause)
-    names.extend(re.findall(
-        r"(?<!\w)(?:[A-Za-z]:[\\/]|\\\\|/|\.{1,2}[\\/])[^\s\"'，。；;,]+",
-        re.sub(quoted_name, " ", clause),
-    ))
+    # 路径里可能带空格（``D:\\My Backup\\backup``）：用与授权范围相同的路径解析，
+    # 不能按 ``\S+`` 截断，否则名称比对会退化成“D:\Desktop != 实际目标”。
+    names.extend(
+        raw for raw, _start, _end in extract_paths(re.sub(quoted_name, " ", clause))
+    )
     named = re.search(r"(?:新建|创建|建个)\s*(?:一个\s*)?([A-Za-z][\w .-]*?)\s*(?:文件夹|目录)", clause)
     if named:
         names.append(named.group(1).strip())
@@ -514,6 +523,11 @@ def completion_message(
 
     if outcome == "success":
         return f"任务完成：{files}；{calls}。所有可验证的文件后置条件均已通过。"
+    if outcome == "goal_unmet":
+        return (
+            f"任务目标未达成：{files}；{calls}{unmet_text}{pending}。"
+            "用户要求的文件变更没有发生（扫描、摘要或只读查询不等于移动/删除）。"
+        )
     if outcome == "partial":
         return (
             f"任务部分完成：{files}；{calls}{reason_text}{pending}{unmet_text}。"
@@ -581,6 +595,9 @@ def evaluate_completion(
     file_failed = _int(file_stats.get("failed"))
     tool_failed = _int(stats.get("tool_failed"))
     rejected = _int(stats.get("tool_rejected"))
+    # 目标性变更（move/rename/delete）完全没有发生：这不能算“部分完成”，
+    # 而是目标未达成。模型自称完成不能覆盖这个后端事实。
+    goal_unmet = any(effect in _GOAL_EFFECTS for effect in unmet_effects)
     incomplete = (
         any(status in {"failed", "incomplete", "unverified"} for status in check_statuses)
         or bool(stats.get("truncated_reasons"))
@@ -607,6 +624,9 @@ def evaluate_completion(
     ):
         outcome = "failed"
         stop_reason = "tool_failed"
+    elif goal_unmet:
+        outcome = "goal_unmet"
+        stop_reason = "goal_unmet"
     elif incomplete:
         outcome = "partial"
         if stop_reason in {"model_done", "goal_verified", "no_operations"}:

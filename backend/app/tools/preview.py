@@ -16,9 +16,11 @@
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import re
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,6 +28,7 @@ from typing import Any, Iterable, Optional
 
 from .. import db
 from ..logging_conf import get_logger
+from ..policy.authorization import AuthorizationScope, authorize_preview_selection
 from ..security import SandboxViolation, is_within_sandbox, resolve_in_sandbox
 from . import classify, extract, filesystem, manifests, naming
 from .path_locks import path_locks
@@ -39,6 +42,9 @@ DEFAULT_CONTENT_BUDGET = 30
 
 # 单个预览最多包含的条目数：一次预览几千行没有意义，也会拖慢界面。
 MAX_PREVIEW_ITEMS = 2000
+
+# 确认 token 的有效期：过期后必须重新生成预览并确认。
+PREVIEW_APPROVAL_TTL_SECONDS = 900
 
 
 class PreviewError(Exception):
@@ -344,23 +350,100 @@ def build_items(
     }
 
 
-def create(spec: dict, *, llm: Any = None, content_budget: int = DEFAULT_CONTENT_BUDGET) -> dict:
+def _scope_from_spec(spec: dict, directory: str) -> dict:
+    """为“界面直接发起的预览”生成授权范围快照。
+
+    这个请求本身就是原始用户意图（用户在预览面板里明确选择了 op / 目录 / 目标 /
+    过滤条件），因此授权范围直接由 spec 推导；Agent 发起的预览则必须传入它自己的
+    授权范围，二者不会互相放大。
+    """
+    op = str(spec.get("op") or "")
+    effect = {
+        "move": "move",
+        "classify": "move",
+        "rename": "rename",
+        "delete": "delete",
+    }.get(op, "")
+    target = str(spec.get("dest_dir") or spec.get("dest_root") or "")
+    targets: list[str] = []
+    if target:
+        try:
+            targets = [str(resolve_in_sandbox(target))]
+        except Exception:  # noqa: BLE001 - 越界目标在 build_items 里会明确拒绝
+            targets = []
+    filter_value = dict(spec.get("filter") or {})
+    # 只保留真正用于收窄的键，避免空值被当成“已授权”。
+    scope_filter = {
+        key: filter_value[key]
+        for key in ("extensions", "names", "name_contains", "min_size", "max_size")
+        if filter_value.get(key) not in (None, "", [])
+    }
+    scope = AuthorizationScope(
+        request_id=f"preview-{uuid.uuid4().hex}",
+        thread_id="",
+        allowed_effects=frozenset({effect} if effect else set()),
+        source_roots=(directory,) if directory else (),
+        target_roots=tuple(targets) if targets else ((directory,) if directory else ()),
+        filter=scope_filter,
+        max_items=MAX_PREVIEW_ITEMS,
+        recursive=bool(spec.get("recursive", True)),
+        destructive=(effect == "delete"),
+        expires_at=time.time() + PREVIEW_APPROVAL_TTL_SECONDS,
+        request_digest="",
+        origin="preview_spec",
+    )
+    # frozen dataclass：用 replace 生成带指纹的最终快照。
+    return dataclasses.replace(
+        scope, request_digest=_preview_request_digest(scope, spec)
+    ).to_dict()
+
+
+def _preview_request_digest(scope: AuthorizationScope, spec: dict) -> str:
+    payload = {
+        "op": str(spec.get("op") or ""),
+        "directory": str(spec.get("directory") or ""),
+        "scan_id": str(spec.get("scan_id") or ""),
+        "filter": dict(spec.get("filter") or {}),
+        "dest_dir": str(spec.get("dest_dir") or ""),
+        "dest_root": str(spec.get("dest_root") or ""),
+        "source_roots": list(scope.source_roots),
+        "target_roots": list(scope.target_roots),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def create(
+    spec: dict,
+    *,
+    llm: Any = None,
+    content_budget: int = DEFAULT_CONTENT_BUDGET,
+    authorization_scope: Optional[dict] = None,
+) -> dict:
     """生成并持久化预览。全过程只读（scan_directory 只读，内容提取只读）。"""
     built = build_items(spec, llm=llm, content_budget=content_budget)
     preview_id = uuid.uuid4().hex
+    stored_spec = dict(built["spec"])
+    # 授权范围随预览一起持久化，确认/执行阶段只认这份快照（不能被后来改大）。
+    stored_spec["authorization_scope"] = (
+        dict(authorization_scope)
+        if isinstance(authorization_scope, dict)
+        else _scope_from_spec(stored_spec, built["directory"])
+    )
     record = {
         "preview_id": preview_id,
         "created_at": _iso_now(),
         "op": built["op"],
         "directory": built["directory"],
-        "spec_json": json.dumps(built["spec"], ensure_ascii=False),
+        "spec_json": json.dumps(stored_spec, ensure_ascii=False),
         "items_json": json.dumps(built["items"], ensure_ascii=False),
         "digest": built["digest"],
         "approval_json": "",
         "thread_id": f"preview-{preview_id}",
         "status": "preview",
         # 真实的模型调用次数：内容分类达到预算后回退，这里记录的是“真的调用了几次”，
-        # 供运行预算对账（此前界面统计恒为 0，等于预算形同虚设）。
+        # 供运行预算对账（此前界面统计恒为 0，等于模型预算形同虚设）。
         "model_calls": int(built["counts"]["model_calls"]),
     }
     db.save_preview(record)
@@ -481,12 +564,51 @@ def confirm(
         item["item_id"]: _target_for(item, overrides.get(item["item_id"]))
         for item in selected
     }
+    scope = AuthorizationScope.from_dict((preview.get("spec") or {}).get("authorization_scope"))
+    if scope is None:
+        raise PreviewError(
+            "该预览缺少授权范围快照，请重新生成预览", code="missing_scope"
+        )
+    # 目标路径必须在预览创建时记录的目标根目录内：确认不能把落点改到范围外。
+    outside = [
+        target for target in targets.values()
+        if preview["op"] != "delete" and not _within_roots(target, scope.target_roots)
+    ]
+    if outside:
+        raise PreviewError(
+            "目标路径超出该预览的授权范围：" + "；".join(outside[:5]),
+            code="target_outside_scope",
+            detail={"targets": outside[:50]},
+        )
+    selected_paths = sorted(str(item["source"]) for item in selected)
+    # 确认阶段必须重新做“具体操作”的授权校验：预览本身是只读的，任何范围都能生成
+    # 预览，但确认意味着马上要落盘，因此要看操作类型是否被授权、源文件是否在范围内
+    # （含精确文件白名单与过滤条件）、目标目录是否在范围内、条目数是否超上限。
+    check = authorize_preview_selection(
+        scope,
+        op=preview["op"],
+        sources=selected_paths,
+        targets=list(targets.values()),
+    )
+    if not check.allowed:
+        raise PreviewError(check.reason, code=check.code or "scope_denied")
     approval = {
         "approval_id": uuid.uuid4().hex,
+        # 一次性确认 token：执行时必须原样回传，且只能使用一次。
+        "token": uuid.uuid4().hex,
         "item_ids": sorted(item["item_id"] for item in selected),
         "count": len(selected),
         "preview_digest": preview["digest"],
         "selection_digest": _selection_digest(preview["digest"], [item["item_id"] for item in selected]),
+        # 审批绑定：请求 / 授权范围 / 选中条目 / 变更数量 / 目标路径 / 过期时间。
+        "request_digest": scope.request_digest,
+        "authorization_scope_digest": scope.digest(),
+        "selected_item_digest": _selection_digest(preview["digest"], selected_paths),
+        "selected_paths": selected_paths,
+        "mutation_count": len(selected),
+        "op": preview["op"],
+        "target_paths": sorted(str(value) for value in targets.values()),
+        "expires_at": time.time() + PREVIEW_APPROVAL_TTL_SECONDS,
         "approved": bool(needs_approval and approve),
         # 落点绑定：执行时不再接受“临时改类别”，只承认这里记录的目标。
         "targets": targets,
@@ -498,13 +620,36 @@ def confirm(
     return {
         "preview_id": preview_id,
         "approval_id": approval["approval_id"],
+        "confirm_token": approval["token"],
         "count": approval["count"],
         "requires_approval": needs_approval,
         "threshold": limit,
         "selection_digest": approval["selection_digest"],
+        "selected_item_digest": approval["selected_item_digest"],
+        "request_digest": approval["request_digest"],
+        "authorization_scope_digest": approval["authorization_scope_digest"],
+        "expires_at": approval["expires_at"],
         "targets": targets,
         "overrides": overrides,
     }
+
+
+def _within_roots(value: str, roots: Iterable[str]) -> bool:
+    """路径是否落在给定授权根目录内（含根本身）。"""
+    import os
+
+    try:
+        target = os.path.normcase(os.path.abspath(str(value)))
+    except (OSError, ValueError):
+        return False
+    for root in roots or []:
+        try:
+            base = os.path.normcase(os.path.abspath(str(root)))
+        except (OSError, ValueError):
+            continue
+        if target == base or target.startswith(base + os.sep):
+            return True
+    return False
 
 
 def _verify_item(item: dict, target: str = "") -> str:
@@ -618,12 +763,20 @@ def execute(
     preview = load(preview_id)
     selected = _selected(preview, item_ids)
     approval = preview.get("approval") or {}
-    if not confirm_token or approval.get("approval_id") != confirm_token:
-        raise PreviewError("执行前需要确认本次选择（确认已过期）", code="confirm_required")
+    # 一次性确认 token：approval_id 与 token 都接受，但必须匹配确认记录。
+    accepted_tokens = {
+        str(value) for value in (approval.get("approval_id"), approval.get("token")) if value
+    }
+    if not confirm_token or str(confirm_token) not in accepted_tokens:
+        raise PreviewError(
+            "执行前需要确认本次选择（确认已过期或 token 不匹配）", code="confirm_required"
+        )
     if approval.get("used_at"):
         raise PreviewError(
             "这次确认已经用过了；再次执行需要重新确认", code="confirm_required"
         )
+    if float(approval.get("expires_at") or 0) and time.time() > float(approval["expires_at"]):
+        raise PreviewError("这次确认已过期，请重新确认", code="confirm_required")
     wanted = sorted(item["item_id"] for item in selected)
     if approval.get("item_ids") != wanted:
         raise PreviewError(
@@ -631,6 +784,38 @@ def execute(
         )
     if approval.get("preview_digest") != preview["digest"]:
         raise PreviewError("预览内容已变化，请刷新后重新确认", code="stale_preview")
+    if approval.get("op") and str(approval["op"]) != str(preview["op"]):
+        raise PreviewError(
+            "操作类型在确认后发生变化，原确认不再有效，请重新确认",
+            code="operation_changed",
+        )
+
+    # 审批绑定校验：授权范围、选中条目指纹与请求指纹都必须与确认时刻一致。
+    scope = AuthorizationScope.from_dict((preview.get("spec") or {}).get("authorization_scope"))
+    if scope is None:
+        raise PreviewError("该预览缺少授权范围快照，请重新生成预览", code="missing_scope")
+    if scope.expired():
+        raise PreviewError("授权范围已过期，请重新生成预览并确认", code="scope_expired")
+    if str(approval.get("request_digest") or "") != scope.request_digest:
+        raise PreviewError(
+            "请求内容与确认时不一致，原确认不再有效，请重新确认",
+            code="request_changed",
+        )
+    if str(approval.get("authorization_scope_digest") or "") != scope.digest():
+        raise PreviewError(
+            "授权范围已变化，原确认不再有效，请重新确认", code="scope_changed"
+        )
+    selected_paths = sorted(str(item["source"]) for item in selected)
+    if str(approval.get("selected_item_digest") or "") != _selection_digest(
+        preview["digest"], selected_paths
+    ):
+        raise PreviewError(
+            "审批绑定的条目集合与本次请求不一致，拒绝执行", code="selection_changed"
+        )
+    if int(approval.get("mutation_count") or 0) != len(selected):
+        raise PreviewError(
+            "审批后的变更数量与本次请求不一致，拒绝执行", code="selection_changed"
+        )
 
     # 落点绑定：请求里的类别覆盖必须与确认时提交的完全一致。
     approved_overrides = {str(k): str(v) for k, v in (approval.get("overrides") or {}).items()}
@@ -646,6 +831,22 @@ def execute(
         )
         for item in selected
     }
+    # 目标路径集合必须与确认时记录的完全一致：不能扩大目标范围。
+    approved_targets = sorted(str(value) for value in (approval.get("target_paths") or []))
+    if approved_targets and sorted(targets.values()) != approved_targets:
+        raise PreviewError(
+            "目标路径在确认后发生变化，原确认不再有效，请重新确认",
+            code="targets_changed",
+        )
+    # 授权校验放在落点确定之后：真正要写入的目录也必须仍在授权范围内。
+    check = authorize_preview_selection(
+        scope,
+        op=preview["op"],
+        sources=selected_paths,
+        targets=[] if preview["op"] == "delete" else list(targets.values()),
+    )
+    if not check.allowed:
+        raise PreviewError(check.reason, code=check.code or "scope_denied")
 
     # 一次性：状态只能从 preview 抢到 executing，抢不到说明已被执行/正在执行。
     if not db.claim_preview_execution(preview_id):

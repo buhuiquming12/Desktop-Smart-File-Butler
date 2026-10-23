@@ -36,6 +36,7 @@ interface SettingsProps {
   onClose: () => void;
   onSaveEndpoints: (apiBase: string, wsBase: string) => void;
   onSaveLLM: (update: LLMSettingsUpdate) => Promise<void>;
+  onClearLLMKey: () => Promise<void>;
   onSaveSandbox: (roots: string[]) => Promise<void>;
   onSaveWorkspace: (update: WorkspaceSettingsUpdate) => Promise<void>;
   onSaveTools: (update: ToolSettingsUpdate) => Promise<void>;
@@ -560,7 +561,7 @@ export function Settings(props: SettingsProps) {
 
           {tab === 'model' && (
             <div className="settings-section">
-              <div><h3>模型配置</h3><p>选择服务商，填写 API 地址与密钥，拉取可用模型后选择并保存。密钥仅保存在本地，不会显示。</p></div>
+              <div><h3>模型配置</h3><p>选择服务商，填写 API 地址与密钥，拉取可用模型后选择并保存。API Key 保存在本地加密存储（Windows DPAPI），不会写入数据库明文，也不会回传到界面。</p></div>
 
               <label>服务商
                 <select value={provider} onChange={(event) => { setProvider(event.target.value as LLMProvider); setAvailableModels([]); setModelStatus(null); }}>
@@ -573,6 +574,27 @@ export function Settings(props: SettingsProps) {
                 <>
                   <label>API 地址 (Base URL)<input value={openaiBaseUrl} onChange={(event) => setOpenaiBaseUrl(event.target.value)} placeholder="https://api.openai.com/v1" /></label>
                   <label>API Key<input type="password" value={openaiApiKey} onChange={(event) => setOpenaiApiKey(event.target.value)} placeholder={apiKeySet ? '已配置（留空则保留）' : 'sk-...'} /></label>
+                  {apiKeySet && (
+                    <button
+                      className="secondary-button"
+                      type="button"
+                      disabled={savingLLM}
+                      onClick={async () => {
+                        if (!window.confirm('确定要清除本地保存的 API Key 吗？清除后需要重新填写。')) return;
+                        setSavingLLM(true);
+                        setModelStatus(null);
+                        try {
+                          await props.onClearLLMKey();
+                          setOpenaiApiKey('');
+                          setModelStatus('已清除本地保存的密钥');
+                        } catch (error) {
+                          setModelStatus(error instanceof Error ? error.message : '清除失败');
+                        } finally {
+                          setSavingLLM(false);
+                        }
+                      }}
+                    >清除已保存的密钥</button>
+                  )}
                   <button className="secondary-button" type="button" disabled={fetchingModels} onClick={() => void fetchModels()}>{fetchingModels ? '获取中…' : '获取模型列表'}</button>
                   <label>模型
                     {availableModels.length > 0 ? (
